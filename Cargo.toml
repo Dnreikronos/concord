@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/concord-shared",
     "crates/concord-server",
+    "crates/concord-client",
 ]
 
 [workspace.package]

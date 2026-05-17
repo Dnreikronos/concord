@@ -72,6 +72,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "concord-client"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "concord-shared",
+ "serde",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "concord-server"
 version = "0.1.0"
 dependencies = [
