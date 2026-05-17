@@ -67,6 +67,7 @@ Current migrations:
 | ----------------------------- | ----------------------------------------------- |
 | `0000_extensions.sql`         | Enable `pgcrypto` (`gen_random_uuid()`) and `citext` (case-insensitive identifiers) |
 | `0001_initial_schema.sql`     | Tables, indexes, and CHECK constraints          |
+| `0002_review_feedback.sql`    | Non-empty `password_hash` guard and indexes on nullable `ON DELETE SET NULL` FKs |
 
 ### Conventions
 
