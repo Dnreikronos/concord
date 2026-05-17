@@ -1,0 +1,18 @@
+[package]
+name = "concord-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "concord-server"
+path = "src/main.rs"
+
+[dependencies]
+concord-shared = { path = "../concord-shared" }
+serde.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tokio.workspace = true
