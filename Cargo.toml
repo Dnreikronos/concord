@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/concord-shared",
+    "crates/concord-server",
+    "crates/concord-client",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Dnreikronos"]
+repository = "https://github.com/Dnreikronos/concord"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[workspace.lints.rust]
+unused = "warn"

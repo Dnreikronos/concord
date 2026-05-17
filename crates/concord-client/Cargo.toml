@@ -1,0 +1,17 @@
+[package]
+name = "concord-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "concord-client"
+path = "src/main.rs"
+
+[dependencies]
+concord-shared = { path = "../concord-shared" }
+
+[lints]
+workspace = true
