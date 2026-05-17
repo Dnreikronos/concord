@@ -10,3 +10,6 @@ repository.workspace = true
 serde.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+
+[lints]
+workspace = true
