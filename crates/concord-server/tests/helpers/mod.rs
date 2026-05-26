@@ -43,7 +43,8 @@ pub async fn test_app() -> Router {
 }
 
 pub fn random_username() -> String {
-    format!("user_{}", Uuid::new_v4().simple())
+    let id = Uuid::new_v4().simple().to_string();
+    format!("u{}", &id[..12])
 }
 
 pub fn random_email() -> String {
