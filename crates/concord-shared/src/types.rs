@@ -1,3 +1,6 @@
+use std::fmt;
+use std::str::FromStr;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -12,11 +15,59 @@ pub enum UserStatus {
     Offline,
 }
 
+impl fmt::Display for UserStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::Online => "online",
+            Self::Idle => "idle",
+            Self::Dnd => "dnd",
+            Self::Offline => "offline",
+        };
+        f.write_str(s)
+    }
+}
+
+impl FromStr for UserStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "online" => Ok(Self::Online),
+            "idle" => Ok(Self::Idle),
+            "dnd" => Ok(Self::Dnd),
+            "offline" => Ok(Self::Offline),
+            other => Err(format!("unknown user status: {other}")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OAuthProvider {
     Google,
     Github,
+}
+
+impl fmt::Display for OAuthProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::Google => "google",
+            Self::Github => "github",
+        };
+        f.write_str(s)
+    }
+}
+
+impl FromStr for OAuthProvider {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "google" => Ok(Self::Google),
+            "github" => Ok(Self::Github),
+            other => Err(format!("unknown oauth provider: {other}")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
