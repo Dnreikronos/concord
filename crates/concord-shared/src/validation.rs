@@ -9,6 +9,8 @@ pub const CHANNEL_NAME_MIN: usize = 1;
 pub const CHANNEL_NAME_MAX: usize = 100;
 pub const CATEGORY_NAME_MIN: usize = 1;
 pub const CATEGORY_NAME_MAX: usize = 100;
+pub const PASSWORD_MIN: usize = 8;
+pub const PASSWORD_MAX: usize = 128;
 pub const MESSAGE_CONTENT_MIN: usize = 1;
 pub const MESSAGE_CONTENT_MAX: usize = 4000;
 
@@ -77,6 +79,17 @@ pub fn validate_email(s: &str) -> Result<(), ValidationError> {
         return Err(ValidationError::InvalidEmail);
     }
 
+    Ok(())
+}
+
+pub fn validate_password(s: &str) -> Result<(), ValidationError> {
+    let len = s.chars().count();
+    if len < PASSWORD_MIN {
+        return Err(ValidationError::TooShort { field: "password", min: PASSWORD_MIN });
+    }
+    if len > PASSWORD_MAX {
+        return Err(ValidationError::TooLong { field: "password", max: PASSWORD_MAX });
+    }
     Ok(())
 }
 
@@ -171,5 +184,14 @@ mod tests {
         assert!(validate_server_name("").is_err());
         assert!(validate_server_name("   ").is_err());
         assert!(validate_server_name(&"a".repeat(101)).is_err());
+    }
+
+    #[test]
+    fn password_length_boundaries() {
+        assert!(validate_password("short").is_err());
+        assert!(validate_password("1234567").is_err());
+        assert!(validate_password("12345678").is_ok());
+        assert!(validate_password(&"a".repeat(128)).is_ok());
+        assert!(validate_password(&"a".repeat(129)).is_err());
     }
 }
