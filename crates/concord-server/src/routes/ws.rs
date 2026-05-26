@@ -20,26 +20,14 @@ pub async fn ws_handler(
     ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 
+type Sink = Arc<tokio::sync::Mutex<SplitSink<WebSocket, Message>>>;
+
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let (sender, mut receiver) = socket.split();
-    let sender = Arc::new(tokio::sync::Mutex::new(sender));
+    let sender: Sink = Arc::new(tokio::sync::Mutex::new(sender));
 
     let mut user_id: Option<Uuid> = None;
-    let mut broadcast_rx = state.tx.subscribe();
-
-    let fwd_sender = Arc::clone(&sender);
-    let fwd_handle = tokio::spawn(async move {
-        while let Ok((_, msg)) = broadcast_rx.recv().await {
-            let text = match serde_json::to_string(&msg) {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            let mut sink = fwd_sender.lock().await;
-            if sink.send(Message::Text(text.into())).await.is_err() {
-                break;
-            }
-        }
-    });
+    let mut fwd_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     while let Some(Ok(frame)) = receiver.next().await {
         let text = match frame {
@@ -71,6 +59,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                             &ServerMsg::Authenticated { user_id: uid },
                         )
                         .await;
+
+                        if fwd_handle.is_none() {
+                            fwd_handle =
+                                Some(spawn_forwarder(state.clone(), Arc::clone(&sender)));
+                        }
                     }
                     Err(msg) => {
                         let _ =
@@ -100,14 +93,20 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     continue;
                 }
 
-                let author = match db::get_message_author(&state.pool, message_id).await
+                let channel_id = match db::update_message_if_author(
+                    &state.pool,
+                    message_id,
+                    uid,
+                    &content,
+                )
+                .await
                 {
-                    Ok(Some(a)) => a,
+                    Ok(Some(ch)) => ch,
                     Ok(None) => {
                         let _ = send_error(
                             &sender,
-                            ErrorCode::NotFound,
-                            "message not found",
+                            ErrorCode::Forbidden,
+                            "message not found or not the author",
                         )
                         .await;
                         continue;
@@ -121,33 +120,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         .await;
                         continue;
                     }
-                };
-
-                if author != uid {
-                    let _ = send_error(
-                        &sender,
-                        ErrorCode::Forbidden,
-                        "not the message author",
-                    )
-                    .await;
-                    continue;
-                }
-
-                if db::update_message_content(&state.pool, message_id, &content)
-                    .await
-                    .is_err()
-                {
-                    let _ =
-                        send_error(&sender, ErrorCode::Internal, "internal error")
-                            .await;
-                    continue;
-                }
-
-                let channel_id =
-                    db::get_message_channel(&state.pool, message_id).await;
-                let channel_id = match channel_id {
-                    Ok(Some(id)) => id,
-                    _ => continue,
                 };
 
                 let _ = state.tx.send((
@@ -170,78 +142,21 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     continue;
                 };
 
-                let channel_id =
-                    match db::get_message_channel(&state.pool, message_id).await {
-                        Ok(Some(id)) => id,
-                        Ok(None) => {
-                            let _ = send_error(
-                                &sender,
-                                ErrorCode::NotFound,
-                                "message not found",
-                            )
-                            .await;
-                            continue;
-                        }
-                        Err(_) => {
-                            let _ = send_error(
-                                &sender,
-                                ErrorCode::Internal,
-                                "internal error",
-                            )
-                            .await;
-                            continue;
-                        }
-                    };
-
-                let is_author =
-                    match db::get_message_author(&state.pool, message_id).await {
-                        Ok(Some(a)) => a == uid,
-                        Ok(None) => false,
-                        Err(_) => {
-                            let _ = send_error(
-                                &sender,
-                                ErrorCode::Internal,
-                                "internal error",
-                            )
-                            .await;
-                            continue;
-                        }
-                    };
-
-                let is_admin = if !is_author {
-                    match db::get_channel_server(&state.pool, channel_id).await {
-                        Ok(Some(server_id)) => {
-                            db::is_server_admin(&state.pool, uid, server_id)
-                                .await
-                                .unwrap_or(false)
-                        }
-                        _ => false,
-                    }
+                if let Some(channel_id) =
+                    try_delete_message(&state, message_id, uid).await
+                {
+                    let _ = state.tx.send((
+                        channel_id,
+                        ServerMsg::MessageDeleted { message_id },
+                    ));
                 } else {
-                    false
-                };
-
-                if !is_author && !is_admin {
                     let _ = send_error(
                         &sender,
                         ErrorCode::Forbidden,
-                        "not the author or an admin",
+                        "message not found, or not the author/admin",
                     )
                     .await;
-                    continue;
                 }
-
-                if db::delete_message(&state.pool, message_id).await.is_err() {
-                    let _ =
-                        send_error(&sender, ErrorCode::Internal, "internal error")
-                            .await;
-                    continue;
-                }
-
-                let _ = state.tx.send((
-                    channel_id,
-                    ServerMsg::MessageDeleted { message_id },
-                ));
             }
 
             _ => {
@@ -255,7 +170,67 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         }
     }
 
-    fwd_handle.abort();
+    if let Some(h) = fwd_handle {
+        h.abort();
+    }
+}
+
+/// Try author-delete first; on failure check admin privileges and force-delete.
+async fn try_delete_message(
+    state: &AppState,
+    message_id: Uuid,
+    user_id: Uuid,
+) -> Option<Uuid> {
+    if let Ok(Some(channel_id)) =
+        db::delete_message_if_author(&state.pool, message_id, user_id).await
+    {
+        return Some(channel_id);
+    }
+
+    let channel_id = db::get_message_channel(&state.pool, message_id)
+        .await
+        .ok()??;
+    let server_id = db::get_channel_server(&state.pool, channel_id)
+        .await
+        .ok()??;
+
+    if !db::is_server_admin(&state.pool, user_id, server_id)
+        .await
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    db::delete_message(&state.pool, message_id).await.ok()?
+}
+
+fn spawn_forwarder(state: Arc<AppState>, sender: Sink) -> tokio::task::JoinHandle<()> {
+    let mut rx = state.tx.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok((_, msg)) => {
+                    let text = match serde_json::to_string(&msg) {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    };
+                    let mut sink = sender.lock().await;
+                    if sink.send(Message::Text(text.into())).await.is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    let _ = send_error(
+                        &sender,
+                        ErrorCode::Internal,
+                        &format!("missed {n} messages"),
+                    )
+                    .await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
 }
 
 async fn authenticate(_state: &AppState, _token: &str) -> Result<Uuid, String> {
@@ -263,10 +238,7 @@ async fn authenticate(_state: &AppState, _token: &str) -> Result<Uuid, String> {
     Err("authentication not yet implemented".into())
 }
 
-async fn send_msg(
-    sender: &Arc<tokio::sync::Mutex<SplitSink<WebSocket, Message>>>,
-    msg: &ServerMsg,
-) -> Result<(), ()> {
+async fn send_msg(sender: &Sink, msg: &ServerMsg) -> Result<(), ()> {
     let text = serde_json::to_string(msg).map_err(|_| ())?;
     sender
         .lock()
@@ -276,11 +248,7 @@ async fn send_msg(
         .map_err(|_| ())
 }
 
-async fn send_error(
-    sender: &Arc<tokio::sync::Mutex<SplitSink<WebSocket, Message>>>,
-    code: ErrorCode,
-    message: &str,
-) -> Result<(), ()> {
+async fn send_error(sender: &Sink, code: ErrorCode, message: &str) -> Result<(), ()> {
     send_msg(
         sender,
         &ServerMsg::Error {

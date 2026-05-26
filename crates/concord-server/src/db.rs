@@ -42,20 +42,6 @@ struct UserRow {
     updated_at: DateTime<Utc>,
 }
 
-pub async fn get_message_author(
-    pool: &PgPool,
-    message_id: Uuid,
-) -> Result<Option<Uuid>, AppError> {
-    let row = sqlx::query_scalar::<_, Option<Uuid>>(
-        "SELECT author_id FROM messages WHERE id = $1",
-    )
-    .bind(message_id)
-    .fetch_optional(pool)
-    .await?;
-
-    Ok(row.flatten())
-}
-
 pub async fn get_message_channel(
     pool: &PgPool,
     message_id: Uuid,
@@ -69,29 +55,81 @@ pub async fn get_message_channel(
     Ok(row)
 }
 
-pub async fn update_message_content(
+/// Atomically update content only if author_id matches. Returns the
+/// channel_id on success, None if the message doesn't exist or the
+/// caller isn't the author.
+pub async fn update_message_if_author(
     pool: &PgPool,
     message_id: Uuid,
+    author_id: Uuid,
     content: &str,
-) -> Result<(), AppError> {
-    sqlx::query(
-        "UPDATE messages SET content = $2, edited_at = now() WHERE id = $1",
+) -> Result<Option<Uuid>, AppError> {
+    let row = sqlx::query_scalar::<_, Uuid>(
+        "UPDATE messages SET content = $2, edited_at = now() \
+         WHERE id = $1 AND author_id = $3 \
+         RETURNING channel_id",
     )
     .bind(message_id)
     .bind(content)
-    .execute(pool)
+    .bind(author_id)
+    .fetch_optional(pool)
     .await?;
 
-    Ok(())
+    Ok(row)
 }
 
-pub async fn delete_message(pool: &PgPool, message_id: Uuid) -> Result<(), AppError> {
-    sqlx::query("DELETE FROM messages WHERE id = $1")
-        .bind(message_id)
-        .execute(pool)
-        .await?;
+/// Delete message only if author matches. Returns channel_id on success.
+pub async fn delete_message_if_author(
+    pool: &PgPool,
+    message_id: Uuid,
+    author_id: Uuid,
+) -> Result<Option<Uuid>, AppError> {
+    let row = sqlx::query_scalar::<_, Uuid>(
+        "DELETE FROM messages WHERE id = $1 AND author_id = $2 \
+         RETURNING channel_id",
+    )
+    .bind(message_id)
+    .bind(author_id)
+    .fetch_optional(pool)
+    .await?;
 
-    Ok(())
+    Ok(row)
+}
+
+/// Delete message unconditionally (admin path). Returns channel_id on success.
+pub async fn delete_message(
+    pool: &PgPool,
+    message_id: Uuid,
+) -> Result<Option<Uuid>, AppError> {
+    let row = sqlx::query_scalar::<_, Uuid>(
+        "DELETE FROM messages WHERE id = $1 RETURNING channel_id",
+    )
+    .bind(message_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row)
+}
+
+pub async fn is_server_admin(
+    pool: &PgPool,
+    user_id: Uuid,
+    server_id: Uuid,
+) -> Result<bool, AppError> {
+    let result = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(\
+             SELECT 1 FROM servers WHERE id = $1 AND owner_id = $2 \
+             UNION ALL \
+             SELECT 1 FROM server_members \
+             WHERE server_id = $1 AND user_id = $2 AND role = 'admin'\
+         )",
+    )
+    .bind(server_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(result)
 }
 
 pub async fn get_channel_server(
@@ -105,34 +143,6 @@ pub async fn get_channel_server(
             .await?;
 
     Ok(row)
-}
-
-pub async fn is_server_admin(
-    pool: &PgPool,
-    user_id: Uuid,
-    server_id: Uuid,
-) -> Result<bool, AppError> {
-    let is_owner = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM servers WHERE id = $1 AND owner_id = $2)",
-    )
-    .bind(server_id)
-    .bind(user_id)
-    .fetch_one(pool)
-    .await?;
-
-    if is_owner {
-        return Ok(true);
-    }
-
-    let role = sqlx::query_scalar::<_, String>(
-        "SELECT role FROM server_members WHERE server_id = $1 AND user_id = $2",
-    )
-    .bind(server_id)
-    .bind(user_id)
-    .fetch_optional(pool)
-    .await?;
-
-    Ok(role.as_deref() == Some("admin"))
 }
 
 impl UserRow {
