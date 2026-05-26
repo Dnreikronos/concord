@@ -42,6 +42,99 @@ struct UserRow {
     updated_at: DateTime<Utc>,
 }
 
+pub async fn get_message_author(
+    pool: &PgPool,
+    message_id: Uuid,
+) -> Result<Option<Uuid>, AppError> {
+    let row = sqlx::query_scalar::<_, Option<Uuid>>(
+        "SELECT author_id FROM messages WHERE id = $1",
+    )
+    .bind(message_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.flatten())
+}
+
+pub async fn get_message_channel(
+    pool: &PgPool,
+    message_id: Uuid,
+) -> Result<Option<Uuid>, AppError> {
+    let row =
+        sqlx::query_scalar::<_, Uuid>("SELECT channel_id FROM messages WHERE id = $1")
+            .bind(message_id)
+            .fetch_optional(pool)
+            .await?;
+
+    Ok(row)
+}
+
+pub async fn update_message_content(
+    pool: &PgPool,
+    message_id: Uuid,
+    content: &str,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "UPDATE messages SET content = $2, edited_at = now() WHERE id = $1",
+    )
+    .bind(message_id)
+    .bind(content)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn delete_message(pool: &PgPool, message_id: Uuid) -> Result<(), AppError> {
+    sqlx::query("DELETE FROM messages WHERE id = $1")
+        .bind(message_id)
+        .execute(pool)
+        .await?;
+
+    Ok(())
+}
+
+pub async fn get_channel_server(
+    pool: &PgPool,
+    channel_id: Uuid,
+) -> Result<Option<Uuid>, AppError> {
+    let row =
+        sqlx::query_scalar::<_, Uuid>("SELECT server_id FROM channels WHERE id = $1")
+            .bind(channel_id)
+            .fetch_optional(pool)
+            .await?;
+
+    Ok(row)
+}
+
+pub async fn is_server_admin(
+    pool: &PgPool,
+    user_id: Uuid,
+    server_id: Uuid,
+) -> Result<bool, AppError> {
+    let is_owner = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM servers WHERE id = $1 AND owner_id = $2)",
+    )
+    .bind(server_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+
+    if is_owner {
+        return Ok(true);
+    }
+
+    let role = sqlx::query_scalar::<_, String>(
+        "SELECT role FROM server_members WHERE server_id = $1 AND user_id = $2",
+    )
+    .bind(server_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(role.as_deref() == Some("admin"))
+}
+
 impl UserRow {
     fn into_user(self) -> Result<User, AppError> {
         let status = self
