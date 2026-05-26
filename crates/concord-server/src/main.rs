@@ -2,10 +2,15 @@ mod config;
 mod db;
 mod error;
 mod routes;
+mod state;
+
+use std::sync::Arc;
 
 use sqlx::postgres::PgPoolOptions;
+use tokio::sync::broadcast;
 
 use crate::config::Config;
+use crate::state::AppState;
 
 #[tokio::main]
 async fn main() {
@@ -17,7 +22,10 @@ async fn main() {
         .await
         .expect("failed to connect to database");
 
-    let app = routes::all_routes().with_state(pool);
+    let (tx, _) = broadcast::channel(256);
+    let state = Arc::new(AppState { pool, tx });
+
+    let app = routes::all_routes().with_state(state);
 
     let listener = tokio::net::TcpListener::bind(cfg.addr)
         .await
