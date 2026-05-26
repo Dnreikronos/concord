@@ -66,7 +66,7 @@ pub fn validate_email(s: &str) -> Result<(), ValidationError> {
         return Err(ValidationError::InvalidEmail);
     }
 
-    if local.bytes().any(|b| b.is_ascii_control() || b == b' ') {
+    if local.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(ValidationError::InvalidEmail);
     }
 
@@ -195,6 +195,7 @@ mod tests {
         assert!(validate_email("ali ce@example.com").is_err());
         assert!(validate_email(" alice@example.com").is_err());
         assert!(validate_email("alice @example.com").is_err());
+        assert!(validate_email("ali\u{00A0}ce@example.com").is_err());
     }
 
     #[test]
