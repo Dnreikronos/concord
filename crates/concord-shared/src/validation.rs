@@ -66,6 +66,10 @@ pub fn validate_email(s: &str) -> Result<(), ValidationError> {
         return Err(ValidationError::InvalidEmail);
     }
 
+    if local.bytes().any(|b| b.is_ascii_control() || b == b' ') {
+        return Err(ValidationError::InvalidEmail);
+    }
+
     if domain.starts_with('.') || domain.ends_with('.') || domain.contains("..") {
         return Err(ValidationError::InvalidEmail);
     }
@@ -184,6 +188,20 @@ mod tests {
         assert!(validate_server_name("").is_err());
         assert!(validate_server_name("   ").is_err());
         assert!(validate_server_name(&"a".repeat(101)).is_err());
+    }
+
+    #[test]
+    fn email_rejects_whitespace_in_local_part() {
+        assert!(validate_email("ali ce@example.com").is_err());
+        assert!(validate_email(" alice@example.com").is_err());
+        assert!(validate_email("alice @example.com").is_err());
+    }
+
+    #[test]
+    fn email_rejects_control_chars_in_local_part() {
+        assert!(validate_email("ali\x00ce@example.com").is_err());
+        assert!(validate_email("ali\tce@example.com").is_err());
+        assert!(validate_email("ali\nce@example.com").is_err());
     }
 
     #[test]
