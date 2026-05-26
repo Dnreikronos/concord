@@ -31,8 +31,11 @@ async fn register(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RegisterRequest>,
 ) -> Result<(StatusCode, Json<User>), AppError> {
-    validate_username(&req.username)?;
-    validate_email(&req.email)?;
+    let username = req.username.trim();
+    let email = req.email.trim();
+
+    validate_username(username)?;
+    validate_email(email)?;
     validate_password(&req.password)?;
 
     let salt = SaltString::generate(&mut OsRng);
@@ -42,7 +45,7 @@ async fn register(
         .to_string();
 
     let user =
-        db::insert_user(&state.pool, &req.username, &req.email, &password_hash).await?;
+        db::insert_user(&state.pool, username, email, &password_hash).await?;
 
     Ok((StatusCode::CREATED, Json(user)))
 }

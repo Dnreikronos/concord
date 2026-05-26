@@ -1,16 +1,11 @@
-mod config;
-mod db;
-mod error;
-mod routes;
-mod state;
-
 use std::sync::Arc;
 
 use sqlx::postgres::PgPoolOptions;
 use tokio::sync::broadcast;
 
-use crate::config::Config;
-use crate::state::AppState;
+use concord_server::config::Config;
+use concord_server::routes;
+use concord_server::state::AppState;
 
 #[tokio::main]
 async fn main() {
