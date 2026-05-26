@@ -18,6 +18,9 @@ serde = { version = "1", features = ["derive"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+axum = "0.8"
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono"] }
+argon2 = "0.5"
 
 [workspace.lints.rust]
 unused = "warn"
