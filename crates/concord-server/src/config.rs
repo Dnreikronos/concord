@@ -25,12 +25,35 @@ impl GitHubOAuthConfig {
     }
 }
 
+pub struct GoogleOAuthConfig {
+    pub client_id: String,
+    pub client_secret: SecretString,
+    pub redirect_url: String,
+}
+
+impl GoogleOAuthConfig {
+    fn from_env() -> Option<Self> {
+        let client_id = env::var("GOOGLE_OAUTH_CLIENT_ID").unwrap_or_default();
+        if client_id.is_empty() {
+            return None;
+        }
+
+        let client_secret = env::var("GOOGLE_OAUTH_CLIENT_SECRET")
+            .expect("GOOGLE_OAUTH_CLIENT_SECRET must be set when GOOGLE_OAUTH_CLIENT_ID is set");
+        let redirect_url = env::var("GOOGLE_OAUTH_REDIRECT_URL")
+            .expect("GOOGLE_OAUTH_REDIRECT_URL must be set when GOOGLE_OAUTH_CLIENT_ID is set");
+
+        Some(Self { client_id, client_secret: client_secret.into(), redirect_url })
+    }
+}
+
 pub struct Config {
     pub database_url: String,
     pub addr: SocketAddr,
     pub max_connections: u32,
     pub jwt_secret: String,
     pub github_oauth: Option<GitHubOAuthConfig>,
+    pub google_oauth: Option<GoogleOAuthConfig>,
 }
 
 impl Config {
@@ -61,7 +84,8 @@ impl Config {
         );
 
         let github_oauth = GitHubOAuthConfig::from_env();
+        let google_oauth = GoogleOAuthConfig::from_env();
 
-        Self { database_url, addr, max_connections, jwt_secret, github_oauth }
+        Self { database_url, addr, max_connections, jwt_secret, github_oauth, google_oauth }
     }
 }

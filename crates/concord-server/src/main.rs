@@ -31,12 +31,27 @@ async fn main() {
             .set_redirect_uri(RedirectUrl::new(gh.redirect_url).unwrap())
     });
 
+    let google_oauth = cfg.google_oauth.map(|g| {
+        use oauth2::{basic::BasicClient, AuthUrl, ClientId, ClientSecret, RedirectUrl, TokenUrl};
+        use secrecy::ExposeSecret;
+        BasicClient::new(ClientId::new(g.client_id))
+            .set_client_secret(ClientSecret::new(g.client_secret.expose_secret().to_string()))
+            .set_auth_uri(
+                AuthUrl::new("https://accounts.google.com/o/oauth2/v2/auth".into()).unwrap(),
+            )
+            .set_token_uri(
+                TokenUrl::new("https://oauth2.googleapis.com/token".into()).unwrap(),
+            )
+            .set_redirect_uri(RedirectUrl::new(g.redirect_url).unwrap())
+    });
+
     let (tx, _) = broadcast::channel(256);
     let state = Arc::new(AppState {
         pool,
         tx,
         jwt_secret: cfg.jwt_secret.into(),
         github_oauth,
+        google_oauth,
         http_client: reqwest::Client::new(),
     });
 
