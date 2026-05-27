@@ -19,7 +19,7 @@ use crate::jwt;
 use crate::routes::auth::LoginResponse;
 use crate::state::AppState;
 
-const CSRF_COOKIE_NAME: &str = "__Host-oauth_state";
+const CSRF_COOKIE_NAME: &str = "__Secure-oauth_state";
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
