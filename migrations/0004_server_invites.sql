@@ -4,7 +4,8 @@ CREATE TABLE server_invites (
     creator_id  UUID NOT NULL REFERENCES users(id)   ON DELETE CASCADE,
     -- 8-char alphanumeric code, unique across all invites.
     code        TEXT NOT NULL UNIQUE
-                    CHECK (char_length(code) BETWEEN 6 AND 16),
+                    CHECK (char_length(code) BETWEEN 6 AND 16)
+                    CHECK (code ~ '^[A-Za-z0-9]+$'),
     max_uses    INTEGER,
     uses        INTEGER NOT NULL DEFAULT 0,
     expires_at  TIMESTAMPTZ,
