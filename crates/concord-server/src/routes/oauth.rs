@@ -147,7 +147,7 @@ async fn find_or_create_oauth_user(
         match db::insert_oauth_user(pool, &candidate, email, avatar_url, provider, subject).await {
             Ok(user) => return Ok(user),
             Err(AppError::UsernameExists) => continue,
-            Err(AppError::Internal(ref msg)) if msg.contains("users_oauth_identity_idx") => {
+            Err(AppError::OAuthIdentityExists) => {
                 return db::get_user_by_oauth(pool, provider, subject)
                     .await?
                     .ok_or_else(|| AppError::Internal("oauth user vanished".into()));
