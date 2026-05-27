@@ -16,18 +16,18 @@ use crate::extractors::AuthUser;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
-pub struct CreateServerRequest {
-    pub name: String,
+struct CreateServerRequest {
+    name: String,
     #[serde(default)]
-    pub icon_url: Option<String>,
+    icon_url: Option<String>,
 }
 
 #[derive(Deserialize)]
-pub struct UpdateServerRequest {
+struct UpdateServerRequest {
     #[serde(default)]
-    pub name: Option<String>,
+    name: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_field")]
-    pub icon_url: Option<Option<String>>,
+    icon_url: Option<Option<String>>,
 }
 
 fn deserialize_optional_field<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
