@@ -78,6 +78,38 @@ pub async fn insert_refresh_token(
     Ok(())
 }
 
+#[derive(sqlx::FromRow)]
+pub struct RefreshTokenRow {
+    pub user_id: Uuid,
+    pub expires_at: DateTime<Utc>,
+}
+
+pub async fn get_refresh_token(
+    pool: &PgPool,
+    token_hash: &str,
+) -> Result<Option<RefreshTokenRow>, AppError> {
+    let row = sqlx::query_as::<_, RefreshTokenRow>(
+        "SELECT user_id, expires_at FROM refresh_tokens WHERE token_hash = $1",
+    )
+    .bind(token_hash)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row)
+}
+
+pub async fn delete_refresh_token(
+    pool: &PgPool,
+    token_hash: &str,
+) -> Result<(), AppError> {
+    sqlx::query("DELETE FROM refresh_tokens WHERE token_hash = $1")
+        .bind(token_hash)
+        .execute(pool)
+        .await?;
+
+    Ok(())
+}
+
 pub async fn get_message_channel(
     pool: &PgPool,
     message_id: Uuid,
