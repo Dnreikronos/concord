@@ -125,16 +125,13 @@ async fn refresh(
 ) -> Result<Json<RefreshResponse>, AppError> {
     let old_hash = hex::encode(Sha256::digest(req.refresh_token.as_bytes()));
 
-    let row = db::get_refresh_token(&state.pool, &old_hash)
+    let row = db::take_refresh_token(&state.pool, &old_hash)
         .await?
         .ok_or(AppError::InvalidToken)?;
 
     if row.expires_at < Utc::now() {
-        db::delete_refresh_token(&state.pool, &old_hash).await?;
         return Err(AppError::InvalidToken);
     }
-
-    db::delete_refresh_token(&state.pool, &old_hash).await?;
 
     let access_token =
         jwt::encode_access_token(row.user_id, state.jwt_secret.expose_secret())
