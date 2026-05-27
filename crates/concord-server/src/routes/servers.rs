@@ -78,12 +78,7 @@ async fn get_server(
     auth: AuthUser,
     Path(server_id): Path<Uuid>,
 ) -> Result<Json<Server>, AppError> {
-    let is_member = db::is_server_member(&state.pool, server_id, auth.user_id).await?;
-    if !is_member {
-        return Err(AppError::NotFound);
-    }
-
-    let server = db::get_server(&state.pool, server_id)
+    let server = db::get_server_for_member(&state.pool, server_id, auth.user_id)
         .await?
         .ok_or(AppError::NotFound)?;
 

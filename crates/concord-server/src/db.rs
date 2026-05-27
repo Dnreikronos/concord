@@ -404,20 +404,23 @@ pub async fn get_server(
     Ok(row.map(ServerRow::into_server))
 }
 
-pub async fn is_server_member(
+pub async fn get_server_for_member(
     pool: &PgPool,
     server_id: Uuid,
     user_id: Uuid,
-) -> Result<bool, AppError> {
-    let result = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2)",
+) -> Result<Option<Server>, AppError> {
+    let row = sqlx::query_as::<_, ServerRow>(
+        "SELECT s.id, s.name, s.icon_url, s.owner_id, s.created_at \
+         FROM servers s \
+         JOIN server_members sm ON sm.server_id = s.id \
+         WHERE s.id = $1 AND sm.user_id = $2",
     )
     .bind(server_id)
     .bind(user_id)
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await?;
 
-    Ok(result)
+    Ok(row.map(ServerRow::into_server))
 }
 
 pub async fn update_server_if_admin(
