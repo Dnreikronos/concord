@@ -9,6 +9,9 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
+use chrono::Utc;
+use sha2::{Digest, Sha256};
+
 use concord_shared::types::User;
 use concord_shared::validation::{validate_email, validate_password, validate_username};
 
@@ -32,6 +35,11 @@ pub struct LoginRequest {
     pub password: String,
 }
 
+#[derive(Deserialize)]
+pub struct RefreshRequest {
+    pub refresh_token: String,
+}
+
 #[derive(Serialize)]
 pub struct LoginResponse {
     pub access_token: String,
@@ -39,10 +47,17 @@ pub struct LoginResponse {
     pub user: User,
 }
 
+#[derive(Serialize)]
+pub struct RefreshResponse {
+    pub access_token: String,
+    pub refresh_token: String,
+}
+
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/register", post(register))
         .route("/login", post(login))
+        .route("/refresh", post(refresh))
 }
 
 async fn register(
@@ -101,5 +116,38 @@ async fn login(
         access_token,
         refresh_token: refresh.raw,
         user,
+    }))
+}
+
+async fn refresh(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RefreshRequest>,
+) -> Result<Json<RefreshResponse>, AppError> {
+    let old_hash = hex::encode(Sha256::digest(req.refresh_token.as_bytes()));
+
+    let row = db::take_refresh_token(&state.pool, &old_hash)
+        .await?
+        .ok_or(AppError::InvalidToken)?;
+
+    if row.expires_at < Utc::now() {
+        return Err(AppError::InvalidToken);
+    }
+
+    let access_token =
+        jwt::encode_access_token(row.user_id, state.jwt_secret.expose_secret())
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let new_refresh = jwt::generate_refresh_token();
+    db::insert_refresh_token(
+        &state.pool,
+        row.user_id,
+        &new_refresh.hash,
+        new_refresh.expires_at,
+    )
+    .await?;
+
+    Ok(Json(RefreshResponse {
+        access_token,
+        refresh_token: new_refresh.raw,
     }))
 }
