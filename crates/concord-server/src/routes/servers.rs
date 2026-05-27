@@ -225,6 +225,10 @@ async fn join_server(
         return Err(AppError::NotFound);
     }
 
+    if db::is_server_member(&state.pool, server_id, auth.user_id).await? {
+        return Err(AppError::AlreadyMember);
+    }
+
     let mut tx = state.pool.begin().await.map_err(|e| AppError::Internal(e.to_string()))?;
 
     db::claim_invite(&mut *tx, server_id, &req.invite_code)
