@@ -111,11 +111,16 @@ fn sanitize_username(raw: &str, prefix: &str) -> String {
         .take(28)
         .collect();
 
-    if base.len() < 3 {
+    let mut name = if base.len() < 3 {
         format!("{prefix}_{base}")
     } else {
         base
+    };
+
+    while name.len() < 3 {
+        name.push('0');
     }
+    name
 }
 
 async fn find_or_create_oauth_user(
