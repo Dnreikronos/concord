@@ -11,6 +11,8 @@ pub enum AppError {
     UsernameExists,
     EmailExists,
     InvalidCredentials,
+    Unauthorized,
+    InvalidToken,
     Internal(String),
 }
 
@@ -31,6 +33,12 @@ impl IntoResponse for AppError {
             }
             Self::InvalidCredentials => {
                 (StatusCode::UNAUTHORIZED, "invalid email or password".into())
+            }
+            Self::Unauthorized => {
+                (StatusCode::UNAUTHORIZED, "missing or invalid authorization".into())
+            }
+            Self::InvalidToken => {
+                (StatusCode::UNAUTHORIZED, "invalid or expired token".into())
             }
             Self::Internal(msg) => {
                 eprintln!("internal error: {msg}");
