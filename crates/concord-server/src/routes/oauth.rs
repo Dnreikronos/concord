@@ -122,6 +122,8 @@ async fn github_callback(
         .send()
         .await
         .map_err(|e| AppError::OAuthFailed(format!("user fetch: {e}")))?
+        .error_for_status()
+        .map_err(|e| AppError::OAuthFailed(format!("user fetch: {e}")))?
         .json()
         .await
         .map_err(|e| AppError::OAuthFailed(format!("user parse: {e}")))?;
@@ -178,6 +180,8 @@ async fn fetch_primary_email(
         .header("User-Agent", "concord-server")
         .send()
         .await
+        .map_err(|e| AppError::OAuthFailed(format!("email fetch: {e}")))?
+        .error_for_status()
         .map_err(|e| AppError::OAuthFailed(format!("email fetch: {e}")))?
         .json()
         .await
