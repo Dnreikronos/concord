@@ -6,6 +6,10 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[lib]
+name = "concord_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "concord-server"
 path = "src/main.rs"
@@ -20,7 +24,18 @@ serde = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 serde_json = { workspace = true }
+jsonwebtoken = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+secrecy = { workspace = true }
 futures-util = { workspace = true }
+oauth2 = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [lints]
 workspace = true

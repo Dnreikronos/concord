@@ -10,6 +10,12 @@ pub enum AppError {
     Validation(ValidationError),
     UsernameExists,
     EmailExists,
+    InvalidCredentials,
+    Unauthorized,
+    InvalidToken,
+    OAuthIdentityExists,
+    OAuthNotConfigured,
+    OAuthFailed(String),
     Internal(String),
 }
 
@@ -27,6 +33,25 @@ impl IntoResponse for AppError {
             }
             Self::EmailExists => {
                 (StatusCode::CONFLICT, "email already exists".into())
+            }
+            Self::InvalidCredentials => {
+                (StatusCode::UNAUTHORIZED, "invalid email or password".into())
+            }
+            Self::Unauthorized => {
+                (StatusCode::UNAUTHORIZED, "missing or invalid authorization".into())
+            }
+            Self::InvalidToken => {
+                (StatusCode::UNAUTHORIZED, "invalid or expired token".into())
+            }
+            Self::OAuthIdentityExists => {
+                (StatusCode::CONFLICT, "OAuth identity already linked".into())
+            }
+            Self::OAuthNotConfigured => {
+                (StatusCode::NOT_FOUND, "OAuth provider is not configured".into())
+            }
+            Self::OAuthFailed(msg) => {
+                eprintln!("oauth error: {msg}");
+                (StatusCode::BAD_GATEWAY, "OAuth authentication failed".into())
             }
             Self::Internal(msg) => {
                 eprintln!("internal error: {msg}");
@@ -53,6 +78,9 @@ impl From<sqlx::Error> for AppError {
                 }
                 if constraint.contains("email") {
                     return Self::EmailExists;
+                }
+                if constraint.contains("oauth_identity") {
+                    return Self::OAuthIdentityExists;
                 }
             }
         }

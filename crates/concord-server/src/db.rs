@@ -42,6 +42,63 @@ struct UserRow {
     updated_at: DateTime<Utc>,
 }
 
+pub async fn get_user_by_email(
+    pool: &PgPool,
+    email: &str,
+) -> Result<Option<User>, AppError> {
+    let row = sqlx::query_as::<_, UserRow>(
+        "SELECT id, username, email, password_hash, avatar_url, \
+                status, oauth_provider, oauth_subject, \
+                created_at, updated_at \
+         FROM users WHERE email = $1",
+    )
+    .bind(email)
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(|r| r.into_user()).transpose()
+}
+
+pub async fn insert_refresh_token(
+    pool: &PgPool,
+    user_id: Uuid,
+    token_hash: &str,
+    expires_at: DateTime<Utc>,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) \
+         VALUES ($1, $2, $3)",
+    )
+    .bind(user_id)
+    .bind(token_hash)
+    .bind(expires_at)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+#[derive(sqlx::FromRow)]
+pub struct RefreshTokenRow {
+    pub user_id: Uuid,
+    pub expires_at: DateTime<Utc>,
+}
+
+pub async fn take_refresh_token(
+    pool: &PgPool,
+    token_hash: &str,
+) -> Result<Option<RefreshTokenRow>, AppError> {
+    let row = sqlx::query_as::<_, RefreshTokenRow>(
+        "DELETE FROM refresh_tokens WHERE token_hash = $1 \
+         RETURNING user_id, expires_at",
+    )
+    .bind(token_hash)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row)
+}
+
 pub async fn get_message_channel(
     pool: &PgPool,
     message_id: Uuid,
@@ -143,6 +200,51 @@ pub async fn get_channel_server(
             .await?;
 
     Ok(row)
+}
+
+pub async fn get_user_by_oauth(
+    pool: &PgPool,
+    provider: &str,
+    subject: &str,
+) -> Result<Option<User>, AppError> {
+    let row = sqlx::query_as::<_, UserRow>(
+        "SELECT id, username, email, password_hash, avatar_url, \
+                status, oauth_provider, oauth_subject, \
+                created_at, updated_at \
+         FROM users WHERE oauth_provider = $1 AND oauth_subject = $2",
+    )
+    .bind(provider)
+    .bind(subject)
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(|r| r.into_user()).transpose()
+}
+
+pub async fn insert_oauth_user(
+    pool: &PgPool,
+    username: &str,
+    email: Option<&str>,
+    avatar_url: Option<&str>,
+    oauth_provider: &str,
+    oauth_subject: &str,
+) -> Result<User, AppError> {
+    let row = sqlx::query_as::<_, UserRow>(
+        "INSERT INTO users (username, email, avatar_url, oauth_provider, oauth_subject) \
+         VALUES ($1, $2, $3, $4, $5) \
+         RETURNING id, username, email, password_hash, avatar_url, \
+                   status, oauth_provider, oauth_subject, \
+                   created_at, updated_at",
+    )
+    .bind(username)
+    .bind(email)
+    .bind(avatar_url)
+    .bind(oauth_provider)
+    .bind(oauth_subject)
+    .fetch_one(pool)
+    .await?;
+
+    row.into_user()
 }
 
 impl UserRow {
