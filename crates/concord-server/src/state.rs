@@ -7,4 +7,5 @@ use concord_shared::protocol::ServerMsg;
 pub struct AppState {
     pub pool: PgPool,
     pub tx: broadcast::Sender<(Uuid, ServerMsg)>,
+    pub jwt_secret: String,
 }
