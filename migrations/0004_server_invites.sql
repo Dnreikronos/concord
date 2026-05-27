@@ -16,4 +16,3 @@ CREATE TABLE server_invites (
 );
 
 CREATE INDEX server_invites_server_id_idx ON server_invites (server_id);
-CREATE INDEX server_invites_code_idx ON server_invites (code);
