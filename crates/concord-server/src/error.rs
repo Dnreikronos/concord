@@ -43,7 +43,7 @@ impl IntoResponse for AppError {
                 (StatusCode::UNAUTHORIZED, "invalid or expired token".into())
             }
             Self::OAuthNotConfigured => {
-                (StatusCode::NOT_FOUND, "GitHub OAuth is not configured".into())
+                (StatusCode::NOT_FOUND, "OAuth provider is not configured".into())
             }
             Self::OAuthFailed(msg) => {
                 eprintln!("oauth error: {msg}");
