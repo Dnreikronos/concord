@@ -1,11 +1,36 @@
 use std::env;
 use std::net::SocketAddr;
 
+use secrecy::SecretString;
+
+pub struct GitHubOAuthConfig {
+    pub client_id: String,
+    pub client_secret: SecretString,
+    pub redirect_url: String,
+}
+
+impl GitHubOAuthConfig {
+    fn from_env() -> Option<Self> {
+        let client_id = env::var("GITHUB_OAUTH_CLIENT_ID").unwrap_or_default();
+        if client_id.is_empty() {
+            return None;
+        }
+
+        let client_secret = env::var("GITHUB_OAUTH_CLIENT_SECRET")
+            .expect("GITHUB_OAUTH_CLIENT_SECRET must be set when GITHUB_OAUTH_CLIENT_ID is set");
+        let redirect_url = env::var("GITHUB_OAUTH_REDIRECT_URL")
+            .expect("GITHUB_OAUTH_REDIRECT_URL must be set when GITHUB_OAUTH_CLIENT_ID is set");
+
+        Some(Self { client_id, client_secret: client_secret.into(), redirect_url })
+    }
+}
+
 pub struct Config {
     pub database_url: String,
     pub addr: SocketAddr,
     pub max_connections: u32,
     pub jwt_secret: String,
+    pub github_oauth: Option<GitHubOAuthConfig>,
 }
 
 impl Config {
@@ -35,6 +60,8 @@ impl Config {
             "JWT_SECRET must be at least 32 bytes"
         );
 
-        Self { database_url, addr, max_connections, jwt_secret }
+        let github_oauth = GitHubOAuthConfig::from_env();
+
+        Self { database_url, addr, max_connections, jwt_secret, github_oauth }
     }
 }

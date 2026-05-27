@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod oauth;
 pub mod ws;
 
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use crate::state::AppState;
 pub fn all_routes() -> Router<Arc<AppState>> {
     Router::new()
         .nest("/api/auth", auth::router())
+        .nest("/api/auth/oauth", oauth::router())
         .route("/ws", get(ws::ws_handler))
         .layer(DefaultBodyLimit::max(1024 * 1024))
 }
