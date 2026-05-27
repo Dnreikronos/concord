@@ -127,15 +127,16 @@ async fn delete_server(
     auth: AuthUser,
     Path(server_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
-    let server = db::get_server(&state.pool, server_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let deleted = db::delete_server_if_owner(&state.pool, server_id, auth.user_id).await?;
 
-    if server.owner_id != auth.user_id {
-        return Err(AppError::Forbidden);
+    if deleted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        let exists = db::get_server(&state.pool, server_id).await?.is_some();
+        if exists {
+            Err(AppError::Forbidden)
+        } else {
+            Err(AppError::NotFound)
+        }
     }
-
-    db::delete_server(&state.pool, server_id).await?;
-
-    Ok(StatusCode::NO_CONTENT)
 }

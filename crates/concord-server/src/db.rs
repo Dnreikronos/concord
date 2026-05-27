@@ -449,12 +449,14 @@ pub async fn update_server_if_admin(
     Ok(row.map(ServerRow::into_server))
 }
 
-pub async fn delete_server(
+pub async fn delete_server_if_owner(
     pool: &PgPool,
     server_id: Uuid,
+    owner_id: Uuid,
 ) -> Result<bool, AppError> {
-    let result = sqlx::query("DELETE FROM servers WHERE id = $1")
+    let result = sqlx::query("DELETE FROM servers WHERE id = $1 AND owner_id = $2")
         .bind(server_id)
+        .bind(owner_id)
         .execute(pool)
         .await?;
 
