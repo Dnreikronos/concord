@@ -82,10 +82,15 @@ fn clear_csrf_cookie(callback_path: &str) -> Result<HeaderMap, AppError> {
 
 fn verify_csrf(headers: &HeaderMap, query_state: &str, jwt_secret: &str) -> Result<(), AppError> {
     let cookie_state = extract_csrf_cookie(headers).ok_or(AppError::InvalidToken)?;
-    if cookie_state != query_state {
+
+    let cookie_claims =
+        jwt::decode_oauth_state(&cookie_state, jwt_secret).map_err(|_| AppError::InvalidToken)?;
+    let query_claims =
+        jwt::decode_oauth_state(query_state, jwt_secret).map_err(|_| AppError::InvalidToken)?;
+
+    if cookie_claims.nonce != query_claims.nonce {
         return Err(AppError::InvalidToken);
     }
-    jwt::decode_oauth_state(query_state, jwt_secret).map_err(|_| AppError::InvalidToken)?;
     Ok(())
 }
 
