@@ -191,16 +191,15 @@ async fn join_server(
         return Err(AppError::NotFound);
     }
 
-    if db::is_server_member(&state.pool, server_id, auth.user_id).await? {
-        return Err(AppError::AlreadyMember);
-    }
+    let mut tx = state.pool.begin().await.map_err(|e| AppError::Internal(e.to_string()))?;
 
-    let invite = db::get_valid_invite(&state.pool, server_id, &req.invite_code)
+    db::claim_invite(&mut *tx, server_id, &req.invite_code)
         .await?
         .ok_or(AppError::InvalidInviteCode)?;
 
-    db::insert_server_member(&state.pool, server_id, auth.user_id, "member").await?;
-    db::increment_invite_uses(&state.pool, invite.id).await?;
+    db::insert_server_member(&mut *tx, server_id, auth.user_id, "member").await?;
+
+    tx.commit().await.map_err(|e| AppError::Internal(e.to_string()))?;
 
     Ok(StatusCode::NO_CONTENT)
 }

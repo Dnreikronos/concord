@@ -502,35 +502,27 @@ pub async fn create_invite(
     Ok(row.into_invite())
 }
 
-pub async fn get_valid_invite(
-    pool: &PgPool,
+pub async fn claim_invite<'e, E>(
+    executor: E,
     server_id: Uuid,
     code: &str,
-) -> Result<Option<ServerInvite>, AppError> {
+) -> Result<Option<ServerInvite>, AppError>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     let row = sqlx::query_as::<_, InviteRow>(
-        "SELECT id, server_id, creator_id, code, max_uses, uses, expires_at, created_at \
-         FROM server_invites \
+        "UPDATE server_invites SET uses = uses + 1 \
          WHERE server_id = $1 AND code = $2 \
            AND (expires_at IS NULL OR expires_at > now()) \
-           AND (max_uses IS NULL OR uses < max_uses)",
+           AND (max_uses IS NULL OR uses < max_uses) \
+         RETURNING id, server_id, creator_id, code, max_uses, uses, expires_at, created_at",
     )
     .bind(server_id)
     .bind(code)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
 
     Ok(row.map(InviteRow::into_invite))
-}
-
-pub async fn increment_invite_uses(
-    pool: &PgPool,
-    invite_id: Uuid,
-) -> Result<(), AppError> {
-    sqlx::query("UPDATE server_invites SET uses = uses + 1 WHERE id = $1")
-        .bind(invite_id)
-        .execute(pool)
-        .await?;
-    Ok(())
 }
 
 pub async fn is_server_member(
