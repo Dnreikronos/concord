@@ -14,6 +14,8 @@ pub const PASSWORD_MAX: usize = 128;
 pub const MESSAGE_CONTENT_MIN: usize = 1;
 pub const MESSAGE_CONTENT_MAX: usize = 4000;
 pub const ICON_URL_MAX: usize = 2048;
+pub const INVITE_CODE_MIN: usize = 6;
+pub const INVITE_CODE_MAX: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
@@ -22,6 +24,7 @@ pub enum ValidationError {
     InvalidEmail,
     InvalidChars { field: &'static str },
     BlankContent { field: &'static str },
+    InvalidValue { field: &'static str, reason: &'static str },
 }
 
 impl fmt::Display for ValidationError {
@@ -39,6 +42,9 @@ impl fmt::Display for ValidationError {
             }
             Self::BlankContent { field } => {
                 write!(f, "{field} must not be blank")
+            }
+            Self::InvalidValue { field, reason } => {
+                write!(f, "{field}: {reason}")
             }
         }
     }
@@ -130,6 +136,20 @@ pub fn validate_channel_name(s: &str) -> Result<(), ValidationError> {
 
 pub fn validate_category_name(s: &str) -> Result<(), ValidationError> {
     validate_name(s, "category name", CATEGORY_NAME_MIN, CATEGORY_NAME_MAX)
+}
+
+pub fn validate_invite_code(s: &str) -> Result<(), ValidationError> {
+    let len = s.len();
+    if len < INVITE_CODE_MIN {
+        return Err(ValidationError::TooShort { field: "invite code", min: INVITE_CODE_MIN });
+    }
+    if len > INVITE_CODE_MAX {
+        return Err(ValidationError::TooLong { field: "invite code", max: INVITE_CODE_MAX });
+    }
+    if !s.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(ValidationError::InvalidChars { field: "invite code" });
+    }
+    Ok(())
 }
 
 fn validate_name(

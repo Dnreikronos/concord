@@ -173,3 +173,27 @@ pub struct DmMember {
     pub user_id: Uuid,
     pub joined_at: DateTime<Utc>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerInvite {
+    pub id: Uuid,
+    pub server_id: Uuid,
+    pub creator_id: Uuid,
+    pub code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<i32>,
+    pub uses: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemberInfo {
+    pub user_id: Uuid,
+    pub username: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
+    pub role: String,
+    pub joined_at: DateTime<Utc>,
+}

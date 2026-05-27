@@ -16,6 +16,9 @@ pub enum AppError {
     OAuthIdentityExists,
     OAuthNotConfigured,
     OAuthFailed(String),
+    AlreadyMember,
+    InviteCodeCollision,
+    InvalidInviteCode,
     NotFound,
     Forbidden,
     Internal(String),
@@ -55,6 +58,15 @@ impl IntoResponse for AppError {
                 eprintln!("oauth error: {msg}");
                 (StatusCode::BAD_GATEWAY, "OAuth authentication failed".into())
             }
+            Self::AlreadyMember => {
+                (StatusCode::CONFLICT, "already a member of this server".into())
+            }
+            Self::InviteCodeCollision => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".into())
+            }
+            Self::InvalidInviteCode => {
+                (StatusCode::BAD_REQUEST, "invalid or expired invite code".into())
+            }
             Self::NotFound => {
                 (StatusCode::NOT_FOUND, "not found".into())
             }
@@ -89,6 +101,12 @@ impl From<sqlx::Error> for AppError {
                 }
                 if constraint.contains("oauth_identity") {
                     return Self::OAuthIdentityExists;
+                }
+                if constraint.contains("server_members_pkey") {
+                    return Self::AlreadyMember;
+                }
+                if constraint.contains("server_invites_code_key") {
+                    return Self::InviteCodeCollision;
                 }
             }
         }
