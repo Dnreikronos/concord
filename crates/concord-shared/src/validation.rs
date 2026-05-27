@@ -118,6 +118,9 @@ pub fn validate_icon_url(s: &str) -> Result<(), ValidationError> {
     if s.len() > ICON_URL_MAX {
         return Err(ValidationError::TooLong { field: "icon_url", max: ICON_URL_MAX });
     }
+    if !s.starts_with("https://") && !s.starts_with("http://") {
+        return Err(ValidationError::InvalidChars { field: "icon_url" });
+    }
     Ok(())
 }
 
