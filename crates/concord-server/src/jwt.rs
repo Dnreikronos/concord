@@ -32,6 +32,14 @@ impl fmt::Display for JwtError {
     }
 }
 
+impl std::error::Error for JwtError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Encode(e) | Self::Decode(e) => Some(e),
+        }
+    }
+}
+
 pub fn encode_access_token(user_id: Uuid, secret: &str) -> Result<String, JwtError> {
     let now = Utc::now();
     let claims = Claims {
