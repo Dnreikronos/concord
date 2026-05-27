@@ -27,53 +27,14 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/github/callback", get(github_callback))
 }
 
-async fn github_redirect(
-    State(state): State<Arc<AppState>>,
-) -> Result<Response, AppError> {
-    let client = state.github_oauth.as_ref().ok_or(AppError::OAuthNotConfigured)?;
-
-    let csrf_state =
-        jwt::encode_oauth_state(state.jwt_secret.expose_secret())
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    let cookie = format!(
-        "{CSRF_COOKIE_NAME}={csrf_state}; HttpOnly; Secure; SameSite=Lax; Path=/api/auth/oauth/github/callback; Max-Age=300"
-    );
-
-    let (auth_url, _) = client
-        .authorize_url(|| oauth2::CsrfToken::new(csrf_state))
-        .add_scope(oauth2::Scope::new("read:user".into()))
-        .add_scope(oauth2::Scope::new("user:email".into()))
-        .url();
-
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        SET_COOKIE,
-        cookie.parse().map_err(|_| AppError::Internal("invalid cookie header".into()))?,
-    );
-
-    Ok((headers, Redirect::temporary(auth_url.as_str())).into_response())
-}
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 struct CallbackQuery {
     code: String,
     state: String,
-}
-
-#[derive(Deserialize)]
-struct GitHubUser {
-    id: u64,
-    login: String,
-    email: Option<String>,
-    avatar_url: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct GitHubEmail {
-    email: String,
-    primary: bool,
-    verified: bool,
 }
 
 fn extract_csrf_cookie(headers: &HeaderMap) -> Option<String> {
@@ -93,6 +54,138 @@ fn extract_csrf_cookie(headers: &HeaderMap) -> Option<String> {
         })
 }
 
+fn set_csrf_cookie(csrf_state: &str, callback_path: &str) -> Result<HeaderMap, AppError> {
+    let cookie = format!(
+        "{CSRF_COOKIE_NAME}={csrf_state}; HttpOnly; Secure; SameSite=Lax; Path={callback_path}; Max-Age=300"
+    );
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        SET_COOKIE,
+        cookie.parse().map_err(|_| AppError::Internal("invalid cookie header".into()))?,
+    );
+    Ok(headers)
+}
+
+fn clear_csrf_cookie(callback_path: &str) -> Result<HeaderMap, AppError> {
+    let cookie = format!(
+        "{CSRF_COOKIE_NAME}=; HttpOnly; Secure; SameSite=Lax; Path={callback_path}; Max-Age=0"
+    );
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        SET_COOKIE,
+        cookie.parse().map_err(|_| AppError::Internal("invalid cookie header".into()))?,
+    );
+    Ok(headers)
+}
+
+fn verify_csrf(headers: &HeaderMap, query_state: &str, jwt_secret: &str) -> Result<(), AppError> {
+    let cookie_state = extract_csrf_cookie(headers).ok_or(AppError::InvalidToken)?;
+    if cookie_state != query_state {
+        return Err(AppError::InvalidToken);
+    }
+    jwt::decode_oauth_state(query_state, jwt_secret).map_err(|_| AppError::InvalidToken)?;
+    Ok(())
+}
+
+fn issue_tokens(
+    state: &AppState,
+    user: &User,
+) -> Result<(String, jwt::RefreshToken), AppError> {
+    let access_token = jwt::encode_access_token(user.id, state.jwt_secret.expose_secret())
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let refresh = jwt::generate_refresh_token();
+    Ok((access_token, refresh))
+}
+
+fn sanitize_username(raw: &str, prefix: &str) -> String {
+    let base: String = raw
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_')
+        .take(28)
+        .collect();
+
+    if base.len() < 3 {
+        format!("{prefix}_{base}")
+    } else {
+        base
+    }
+}
+
+async fn find_or_create_oauth_user(
+    pool: &PgPool,
+    provider: &str,
+    subject: &str,
+    display_name: &str,
+    email: Option<&str>,
+    avatar_url: Option<&str>,
+    username_prefix: &str,
+) -> Result<User, AppError> {
+    if let Some(user) = db::get_user_by_oauth(pool, provider, subject).await? {
+        return Ok(user);
+    }
+
+    let base = sanitize_username(display_name, username_prefix);
+    let candidates =
+        std::iter::once(base.clone()).chain((1..=999).map(|i| format!("{base}_{i}")));
+
+    for candidate in candidates {
+        if candidate.len() > 32 {
+            continue;
+        }
+        match db::insert_oauth_user(pool, &candidate, email, avatar_url, provider, subject).await {
+            Ok(user) => return Ok(user),
+            Err(AppError::UsernameExists) => continue,
+            Err(AppError::Internal(ref msg)) if msg.contains("users_oauth_identity_idx") => {
+                return db::get_user_by_oauth(pool, provider, subject)
+                    .await?
+                    .ok_or_else(|| AppError::Internal("oauth user vanished".into()));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(AppError::Internal("could not generate unique username".into()))
+}
+
+// ---------------------------------------------------------------------------
+// GitHub
+// ---------------------------------------------------------------------------
+
+async fn github_redirect(
+    State(state): State<Arc<AppState>>,
+) -> Result<Response, AppError> {
+    let client = state.github_oauth.as_ref().ok_or(AppError::OAuthNotConfigured)?;
+
+    let csrf_state =
+        jwt::encode_oauth_state(state.jwt_secret.expose_secret())
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let headers = set_csrf_cookie(&csrf_state, "/api/auth/oauth/github/callback")?;
+
+    let (auth_url, _) = client
+        .authorize_url(|| oauth2::CsrfToken::new(csrf_state))
+        .add_scope(oauth2::Scope::new("read:user".into()))
+        .add_scope(oauth2::Scope::new("user:email".into()))
+        .url();
+
+    Ok((headers, Redirect::temporary(auth_url.as_str())).into_response())
+}
+
+#[derive(Deserialize)]
+struct GitHubUser {
+    id: u64,
+    login: String,
+    email: Option<String>,
+    avatar_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GitHubEmail {
+    email: String,
+    primary: bool,
+    verified: bool,
+}
+
 async fn github_callback(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -100,12 +193,7 @@ async fn github_callback(
 ) -> Result<(HeaderMap, Json<LoginResponse>), AppError> {
     let client = state.github_oauth.as_ref().ok_or(AppError::OAuthNotConfigured)?;
 
-    let cookie_state = extract_csrf_cookie(&headers).ok_or(AppError::InvalidToken)?;
-    if cookie_state != query.state {
-        return Err(AppError::InvalidToken);
-    }
-    jwt::decode_oauth_state(&query.state, state.jwt_secret.expose_secret())
-        .map_err(|_| AppError::InvalidToken)?;
+    verify_csrf(&headers, &query.state, state.jwt_secret.expose_secret())?;
 
     let token_response = client
         .exchange_code(oauth2::AuthorizationCode::new(query.code))
@@ -130,35 +218,24 @@ async fn github_callback(
 
     let email = match github_user.email {
         Some(ref e) if !e.is_empty() => Some(e.clone()),
-        _ => fetch_primary_email(&state.http_client, gh_access_token).await?,
+        _ => fetch_github_primary_email(&state.http_client, gh_access_token).await?,
     };
 
-    let github_subject = github_user.id.to_string();
-    let user = find_or_create_github_user(
+    let user = find_or_create_oauth_user(
         &state.pool,
-        &github_subject,
+        "github",
+        &github_user.id.to_string(),
         &github_user.login,
         email.as_deref(),
         github_user.avatar_url.as_deref(),
+        "gh",
     )
     .await?;
 
-    let access_token =
-        jwt::encode_access_token(user.id, state.jwt_secret.expose_secret())
-            .map_err(|e| AppError::Internal(e.to_string()))?;
+    let (access_token, refresh) = issue_tokens(&state, &user)?;
+    db::insert_refresh_token(&state.pool, user.id, &refresh.hash, refresh.expires_at).await?;
 
-    let refresh = jwt::generate_refresh_token();
-    db::insert_refresh_token(&state.pool, user.id, &refresh.hash, refresh.expires_at)
-        .await?;
-
-    let clear_cookie = format!(
-        "{CSRF_COOKIE_NAME}=; HttpOnly; Secure; SameSite=Lax; Path=/api/auth/oauth/github/callback; Max-Age=0"
-    );
-    let mut resp_headers = HeaderMap::new();
-    resp_headers.insert(
-        SET_COOKIE,
-        clear_cookie.parse().map_err(|_| AppError::Internal("invalid cookie header".into()))?,
-    );
+    let resp_headers = clear_csrf_cookie("/api/auth/oauth/github/callback")?;
 
     Ok((
         resp_headers,
@@ -170,7 +247,7 @@ async fn github_callback(
     ))
 }
 
-async fn fetch_primary_email(
+async fn fetch_github_primary_email(
     http_client: &reqwest::Client,
     access_token: &str,
 ) -> Result<Option<String>, AppError> {
@@ -188,56 +265,4 @@ async fn fetch_primary_email(
         .map_err(|e| AppError::OAuthFailed(format!("email parse: {e}")))?;
 
     Ok(emails.into_iter().find(|e| e.primary && e.verified).map(|e| e.email))
-}
-
-async fn find_or_create_github_user(
-    pool: &PgPool,
-    github_subject: &str,
-    github_login: &str,
-    email: Option<&str>,
-    avatar_url: Option<&str>,
-) -> Result<User, AppError> {
-    if let Some(user) = db::get_user_by_oauth(pool, "github", github_subject).await? {
-        return Ok(user);
-    }
-
-    let base = sanitize_username(github_login);
-    let candidates =
-        std::iter::once(base.clone()).chain((1..=999).map(|i| format!("{base}_{i}")));
-
-    for candidate in candidates {
-        if candidate.len() > 32 {
-            continue;
-        }
-        match db::insert_oauth_user(pool, &candidate, email, avatar_url, "github", github_subject)
-            .await
-        {
-            Ok(user) => return Ok(user),
-            Err(AppError::UsernameExists) => continue,
-            // OAuth identity was inserted by a concurrent request between our
-            // get_user_by_oauth check and this insert.
-            Err(AppError::Internal(ref msg)) if msg.contains("users_oauth_identity_idx") => {
-                return db::get_user_by_oauth(pool, "github", github_subject)
-                    .await?
-                    .ok_or_else(|| AppError::Internal("oauth user vanished".into()));
-            }
-            Err(e) => return Err(e),
-        }
-    }
-
-    Err(AppError::Internal("could not generate unique username".into()))
-}
-
-fn sanitize_username(github_login: &str) -> String {
-    let base: String = github_login
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '_')
-        .take(28)
-        .collect();
-
-    if base.len() < 3 {
-        format!("gh_{base}")
-    } else {
-        base
-    }
 }
