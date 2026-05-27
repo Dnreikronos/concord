@@ -8,7 +8,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use concord_shared::types::Server;
-use concord_shared::validation::validate_server_name;
+use concord_shared::validation::{validate_icon_url, validate_server_name};
 
 use crate::db;
 use crate::error::AppError;
@@ -50,12 +50,17 @@ async fn create_server(
 ) -> Result<(StatusCode, Json<Server>), AppError> {
     let name = req.name.trim();
     validate_server_name(name)?;
+    if let Some(ref url) = req.icon_url {
+        validate_icon_url(url)?;
+    }
 
-    let server = db::insert_server(&state.pool, name, req.icon_url.as_deref(), auth.user_id).await?;
+    let mut tx = state.pool.begin().await.map_err(|e| AppError::Internal(e.to_string()))?;
 
-    db::insert_server_member(&state.pool, server.id, auth.user_id, "admin").await?;
+    let server = db::insert_server(&mut *tx, name, req.icon_url.as_deref(), auth.user_id).await?;
+    db::insert_server_member(&mut *tx, server.id, auth.user_id, "admin").await?;
+    db::insert_channel(&mut *tx, server.id, "general", "text", 0).await?;
 
-    db::insert_channel(&state.pool, server.id, "general", "text", 0).await?;
+    tx.commit().await.map_err(|e| AppError::Internal(e.to_string()))?;
 
     Ok((StatusCode::CREATED, Json(server)))
 }

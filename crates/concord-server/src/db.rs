@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{Executor, PgPool, Postgres};
 use uuid::Uuid;
 
 use concord_shared::types::{Channel, Server, User};
@@ -300,12 +300,15 @@ impl ChannelRow {
     }
 }
 
-pub async fn insert_server(
-    pool: &PgPool,
+pub async fn insert_server<'e, E>(
+    executor: E,
     name: &str,
     icon_url: Option<&str>,
     owner_id: Uuid,
-) -> Result<Server, AppError> {
+) -> Result<Server, AppError>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     let row = sqlx::query_as::<_, ServerRow>(
         "INSERT INTO servers (name, icon_url, owner_id) \
          VALUES ($1, $2, $3) \
@@ -314,18 +317,21 @@ pub async fn insert_server(
     .bind(name)
     .bind(icon_url)
     .bind(owner_id)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
 
     Ok(row.into_server())
 }
 
-pub async fn insert_server_member(
-    pool: &PgPool,
+pub async fn insert_server_member<'e, E>(
+    executor: E,
     server_id: Uuid,
     user_id: Uuid,
     role: &str,
-) -> Result<(), AppError> {
+) -> Result<(), AppError>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     sqlx::query(
         "INSERT INTO server_members (server_id, user_id, role) \
          VALUES ($1, $2, $3)",
@@ -333,19 +339,22 @@ pub async fn insert_server_member(
     .bind(server_id)
     .bind(user_id)
     .bind(role)
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     Ok(())
 }
 
-pub async fn insert_channel(
-    pool: &PgPool,
+pub async fn insert_channel<'e, E>(
+    executor: E,
     server_id: Uuid,
     name: &str,
     channel_type: &str,
     position: i32,
-) -> Result<Channel, AppError> {
+) -> Result<Channel, AppError>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     let row = sqlx::query_as::<_, ChannelRow>(
         "INSERT INTO channels (server_id, name, channel_type, position) \
          VALUES ($1, $2, $3, $4) \
@@ -356,7 +365,7 @@ pub async fn insert_channel(
     .bind(name)
     .bind(channel_type)
     .bind(position)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
 
     row.into_channel()
