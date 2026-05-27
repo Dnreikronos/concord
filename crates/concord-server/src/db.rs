@@ -42,6 +42,42 @@ struct UserRow {
     updated_at: DateTime<Utc>,
 }
 
+pub async fn get_user_by_email(
+    pool: &PgPool,
+    email: &str,
+) -> Result<Option<User>, AppError> {
+    let row = sqlx::query_as::<_, UserRow>(
+        "SELECT id, username, email, password_hash, avatar_url, \
+                status, oauth_provider, oauth_subject, \
+                created_at, updated_at \
+         FROM users WHERE email = $1",
+    )
+    .bind(email)
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(|r| r.into_user()).transpose()
+}
+
+pub async fn insert_refresh_token(
+    pool: &PgPool,
+    user_id: Uuid,
+    token_hash: &str,
+    expires_at: DateTime<Utc>,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) \
+         VALUES ($1, $2, $3)",
+    )
+    .bind(user_id)
+    .bind(token_hash)
+    .bind(expires_at)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
 pub async fn get_message_channel(
     pool: &PgPool,
     message_id: Uuid,
