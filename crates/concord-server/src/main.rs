@@ -17,8 +17,27 @@ async fn main() {
         .await
         .expect("failed to connect to database");
 
+    let github_oauth = cfg.github_oauth.map(|gh| {
+        use oauth2::{basic::BasicClient, AuthUrl, ClientId, ClientSecret, RedirectUrl, TokenUrl};
+        use secrecy::ExposeSecret;
+        BasicClient::new(ClientId::new(gh.client_id))
+            .set_client_secret(ClientSecret::new(gh.client_secret.expose_secret().to_string()))
+            .set_auth_uri(
+                AuthUrl::new("https://github.com/login/oauth/authorize".into()).unwrap(),
+            )
+            .set_token_uri(
+                TokenUrl::new("https://github.com/login/oauth/access_token".into()).unwrap(),
+            )
+            .set_redirect_uri(RedirectUrl::new(gh.redirect_url).unwrap())
+    });
+
     let (tx, _) = broadcast::channel(256);
-    let state = Arc::new(AppState { pool, tx, jwt_secret: cfg.jwt_secret.into() });
+    let state = Arc::new(AppState {
+        pool,
+        tx,
+        jwt_secret: cfg.jwt_secret.into(),
+        github_oauth,
+    });
 
     let app = routes::all_routes().with_state(state);
 

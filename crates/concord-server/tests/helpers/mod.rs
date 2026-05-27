@@ -41,6 +41,7 @@ pub async fn test_app() -> Router {
         pool,
         tx,
         jwt_secret: secrecy::SecretString::from("test-secret-do-not-use-in-prod"),
+        github_oauth: None,
     });
 
     routes::all_routes().with_state(state)
