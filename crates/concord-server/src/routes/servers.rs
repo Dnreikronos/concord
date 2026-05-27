@@ -160,16 +160,50 @@ async fn create_invite(
         return Err(AppError::Forbidden);
     }
 
-    let code = generate_invite_code();
-    let invite = db::create_invite(
-        &state.pool,
-        server_id,
-        auth.user_id,
-        &code,
-        req.max_uses,
-        req.expires_at,
-    )
-    .await?;
+    if let Some(n) = req.max_uses {
+        if n <= 0 {
+            return Err(AppError::Validation(
+                concord_shared::validation::ValidationError::InvalidValue {
+                    field: "max_uses",
+                    reason: "must be positive",
+                },
+            ));
+        }
+    }
+    if let Some(exp) = req.expires_at {
+        if exp <= Utc::now() {
+            return Err(AppError::Validation(
+                concord_shared::validation::ValidationError::InvalidValue {
+                    field: "expires_at",
+                    reason: "must be in the future",
+                },
+            ));
+        }
+    }
+
+    let invite = {
+        let mut attempts = 0;
+        loop {
+            let code = generate_invite_code();
+            match db::create_invite(
+                &state.pool,
+                server_id,
+                auth.user_id,
+                &code,
+                req.max_uses,
+                req.expires_at,
+            )
+            .await
+            {
+                Ok(inv) => break inv,
+                Err(AppError::InviteCodeCollision) if attempts < 3 => {
+                    attempts += 1;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    };
 
     Ok((StatusCode::CREATED, Json(invite)))
 }
