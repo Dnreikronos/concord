@@ -13,6 +13,7 @@ pub const PASSWORD_MIN: usize = 8;
 pub const PASSWORD_MAX: usize = 128;
 pub const MESSAGE_CONTENT_MIN: usize = 1;
 pub const MESSAGE_CONTENT_MAX: usize = 4000;
+pub const ICON_URL_MAX: usize = 2048;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
@@ -111,6 +112,13 @@ pub fn validate_message_content(s: &str) -> Result<(), ValidationError> {
 
 pub fn validate_server_name(s: &str) -> Result<(), ValidationError> {
     validate_name(s, "server name", SERVER_NAME_MIN, SERVER_NAME_MAX)
+}
+
+pub fn validate_icon_url(s: &str) -> Result<(), ValidationError> {
+    if s.len() > ICON_URL_MAX {
+        return Err(ValidationError::TooLong { field: "icon_url", max: ICON_URL_MAX });
+    }
+    Ok(())
 }
 
 pub fn validate_channel_name(s: &str) -> Result<(), ValidationError> {
