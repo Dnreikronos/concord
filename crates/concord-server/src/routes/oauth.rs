@@ -47,7 +47,10 @@ async fn github_redirect(
         .url();
 
     let mut headers = HeaderMap::new();
-    headers.insert(SET_COOKIE, cookie.parse().unwrap());
+    headers.insert(
+        SET_COOKIE,
+        cookie.parse().map_err(|_| AppError::Internal("invalid cookie header".into()))?,
+    );
 
     Ok((headers, Redirect::temporary(auth_url.as_str())).into_response())
 }
@@ -151,7 +154,10 @@ async fn github_callback(
         "{CSRF_COOKIE_NAME}=; HttpOnly; Secure; SameSite=Lax; Path=/api/auth/oauth/github/callback; Max-Age=0"
     );
     let mut resp_headers = HeaderMap::new();
-    resp_headers.insert(SET_COOKIE, clear_cookie.parse().unwrap());
+    resp_headers.insert(
+        SET_COOKIE,
+        clear_cookie.parse().map_err(|_| AppError::Internal("invalid cookie header".into()))?,
+    );
 
     Ok((
         resp_headers,
