@@ -37,6 +37,7 @@ async fn main() {
         tx,
         jwt_secret: cfg.jwt_secret.into(),
         github_oauth,
+        http_client: reqwest::Client::new(),
     });
 
     let app = routes::all_routes().with_state(state);

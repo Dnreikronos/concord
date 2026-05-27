@@ -107,16 +107,15 @@ async fn github_callback(
     jwt::decode_oauth_state(&query.state, state.jwt_secret.expose_secret())
         .map_err(|_| AppError::InvalidToken)?;
 
-    let http_client = reqwest::Client::new();
     let token_response = client
         .exchange_code(oauth2::AuthorizationCode::new(query.code))
-        .request_async(&http_client)
+        .request_async(&state.http_client)
         .await
         .map_err(|e| AppError::OAuthFailed(format!("token exchange: {e}")))?;
 
     let gh_access_token = token_response.access_token().secret();
 
-    let github_user: GitHubUser = http_client
+    let github_user: GitHubUser = state.http_client
         .get("https://api.github.com/user")
         .bearer_auth(gh_access_token)
         .header("User-Agent", "concord-server")
@@ -129,7 +128,7 @@ async fn github_callback(
 
     let email = match github_user.email {
         Some(ref e) if !e.is_empty() => Some(e.clone()),
-        _ => fetch_primary_email(&http_client, gh_access_token).await?,
+        _ => fetch_primary_email(&state.http_client, gh_access_token).await?,
     };
 
     let github_subject = github_user.id.to_string();

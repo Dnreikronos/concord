@@ -15,4 +15,5 @@ pub struct AppState {
     pub tx: broadcast::Sender<(Uuid, ServerMsg)>,
     pub jwt_secret: SecretString,
     pub github_oauth: Option<ConfiguredOAuthClient>,
+    pub http_client: reqwest::Client,
 }
