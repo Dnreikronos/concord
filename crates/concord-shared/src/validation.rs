@@ -24,6 +24,7 @@ pub enum ValidationError {
     InvalidEmail,
     InvalidChars { field: &'static str },
     BlankContent { field: &'static str },
+    InvalidValue { field: &'static str, reason: &'static str },
 }
 
 impl fmt::Display for ValidationError {
@@ -41,6 +42,9 @@ impl fmt::Display for ValidationError {
             }
             Self::BlankContent { field } => {
                 write!(f, "{field} must not be blank")
+            }
+            Self::InvalidValue { field, reason } => {
+                write!(f, "{field}: {reason}")
             }
         }
     }
