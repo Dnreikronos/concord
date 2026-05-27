@@ -16,6 +16,8 @@ pub enum AppError {
     OAuthIdentityExists,
     OAuthNotConfigured,
     OAuthFailed(String),
+    NotFound,
+    Forbidden,
     Internal(String),
 }
 
@@ -52,6 +54,12 @@ impl IntoResponse for AppError {
             Self::OAuthFailed(msg) => {
                 eprintln!("oauth error: {msg}");
                 (StatusCode::BAD_GATEWAY, "OAuth authentication failed".into())
+            }
+            Self::NotFound => {
+                (StatusCode::NOT_FOUND, "not found".into())
+            }
+            Self::Forbidden => {
+                (StatusCode::FORBIDDEN, "forbidden".into())
             }
             Self::Internal(msg) => {
                 eprintln!("internal error: {msg}");
