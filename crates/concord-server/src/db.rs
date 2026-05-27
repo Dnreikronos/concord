@@ -247,8 +247,6 @@ pub async fn insert_oauth_user(
     row.into_user()
 }
 
-// ── Server CRUD ──────────────────────────────────────────────────────
-
 #[derive(sqlx::FromRow)]
 struct ServerRow {
     id: Uuid,
