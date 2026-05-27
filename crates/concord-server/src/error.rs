@@ -13,6 +13,8 @@ pub enum AppError {
     InvalidCredentials,
     Unauthorized,
     InvalidToken,
+    OAuthNotConfigured,
+    OAuthFailed(String),
     Internal(String),
 }
 
@@ -39,6 +41,13 @@ impl IntoResponse for AppError {
             }
             Self::InvalidToken => {
                 (StatusCode::UNAUTHORIZED, "invalid or expired token".into())
+            }
+            Self::OAuthNotConfigured => {
+                (StatusCode::NOT_FOUND, "GitHub OAuth is not configured".into())
+            }
+            Self::OAuthFailed(msg) => {
+                eprintln!("oauth error: {msg}");
+                (StatusCode::BAD_GATEWAY, "OAuth authentication failed".into())
             }
             Self::Internal(msg) => {
                 eprintln!("internal error: {msg}");
