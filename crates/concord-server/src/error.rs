@@ -13,6 +13,7 @@ pub enum AppError {
     InvalidCredentials,
     Unauthorized,
     InvalidToken,
+    OAuthIdentityExists,
     OAuthNotConfigured,
     OAuthFailed(String),
     Internal(String),
@@ -41,6 +42,9 @@ impl IntoResponse for AppError {
             }
             Self::InvalidToken => {
                 (StatusCode::UNAUTHORIZED, "invalid or expired token".into())
+            }
+            Self::OAuthIdentityExists => {
+                (StatusCode::CONFLICT, "OAuth identity already linked".into())
             }
             Self::OAuthNotConfigured => {
                 (StatusCode::NOT_FOUND, "OAuth provider is not configured".into())
@@ -74,6 +78,9 @@ impl From<sqlx::Error> for AppError {
                 }
                 if constraint.contains("email") {
                     return Self::EmailExists;
+                }
+                if constraint.contains("oauth_identity") {
+                    return Self::OAuthIdentityExists;
                 }
             }
         }
