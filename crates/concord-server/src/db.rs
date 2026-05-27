@@ -170,8 +170,8 @@ pub async fn delete_message(
 
 pub async fn is_server_admin(
     pool: &PgPool,
-    user_id: Uuid,
     server_id: Uuid,
+    user_id: Uuid,
 ) -> Result<bool, AppError> {
     let result = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(\

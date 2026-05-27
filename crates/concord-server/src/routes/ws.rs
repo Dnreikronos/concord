@@ -196,7 +196,7 @@ async fn try_delete_message(
         .await
         .ok()??;
 
-    if !db::is_server_admin(&state.pool, user_id, server_id)
+    if !db::is_server_admin(&state.pool, server_id, user_id)
         .await
         .unwrap_or(false)
     {
