@@ -161,7 +161,7 @@ async fn create_invite(
     }
 
     if let Some(n) = req.max_uses {
-        if n <= 0 {
+        if n < 1 {
             return Err(AppError::Validation(
                 concord_shared::validation::ValidationError::InvalidValue {
                     field: "max_uses",
