@@ -10,6 +10,7 @@ pub enum AppError {
     Validation(ValidationError),
     UsernameExists,
     EmailExists,
+    InvalidCredentials,
     Internal(String),
 }
 
@@ -27,6 +28,9 @@ impl IntoResponse for AppError {
             }
             Self::EmailExists => {
                 (StatusCode::CONFLICT, "email already exists".into())
+            }
+            Self::InvalidCredentials => {
+                (StatusCode::UNAUTHORIZED, "invalid email or password".into())
             }
             Self::Internal(msg) => {
                 eprintln!("internal error: {msg}");

@@ -10,6 +10,8 @@ use uuid::Uuid;
 use concord_shared::protocol::{ClientMsg, ErrorCode, ServerMsg};
 use concord_shared::validation::validate_message_content;
 
+use secrecy::ExposeSecret;
+
 use crate::db;
 use crate::state::AppState;
 
@@ -233,9 +235,11 @@ fn spawn_forwarder(state: Arc<AppState>, sender: Sink) -> tokio::task::JoinHandl
     })
 }
 
-async fn authenticate(_state: &AppState, _token: &str) -> Result<Uuid, String> {
-    // TODO: validate JWT / session token and return the user_id
-    Err("authentication not yet implemented".into())
+async fn authenticate(state: &AppState, token: &str) -> Result<Uuid, String> {
+    let claims =
+        crate::jwt::decode_access_token(token, state.jwt_secret.expose_secret())
+            .map_err(|e| e.to_string())?;
+    Ok(claims.sub)
 }
 
 async fn send_msg(sender: &Sink, msg: &ServerMsg) -> Result<(), ()> {

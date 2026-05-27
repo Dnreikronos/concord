@@ -37,7 +37,11 @@ async fn shared_pool() -> &'static PgPool {
 pub async fn test_app() -> Router {
     let pool = shared_pool().await.clone();
     let (tx, _) = broadcast::channel(256);
-    let state = Arc::new(AppState { pool, tx });
+    let state = Arc::new(AppState {
+        pool,
+        tx,
+        jwt_secret: secrecy::SecretString::from("test-secret-do-not-use-in-prod"),
+    });
 
     routes::all_routes().with_state(state)
 }

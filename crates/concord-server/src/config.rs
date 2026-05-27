@@ -5,6 +5,7 @@ pub struct Config {
     pub database_url: String,
     pub addr: SocketAddr,
     pub max_connections: u32,
+    pub jwt_secret: String,
 }
 
 impl Config {
@@ -26,6 +27,14 @@ impl Config {
             .parse()
             .expect("MAX_CONNECTIONS must be a valid u32");
 
-        Self { database_url, addr, max_connections }
+        let jwt_secret =
+            env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+
+        assert!(
+            jwt_secret.len() >= 32,
+            "JWT_SECRET must be at least 32 bytes"
+        );
+
+        Self { database_url, addr, max_connections, jwt_secret }
     }
 }
