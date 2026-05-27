@@ -24,6 +24,10 @@ serde = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 serde_json = { workspace = true }
+jsonwebtoken = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 futures-util = { workspace = true }
 
 [dev-dependencies]
