@@ -96,23 +96,30 @@ async fn update_server(
     Path(server_id): Path<Uuid>,
     Json(req): Json<UpdateServerRequest>,
 ) -> Result<Json<Server>, AppError> {
-    let is_admin = db::is_server_admin(&state.pool, auth.user_id, server_id).await?;
-    if !is_admin {
-        return Err(AppError::Forbidden);
-    }
-
     let trimmed_name = req.name.as_deref().map(str::trim);
     if let Some(name) = trimmed_name {
         validate_server_name(name)?;
     }
+    if let Some(Some(ref url)) = req.icon_url {
+        validate_icon_url(url)?;
+    }
 
     let icon_url_ref = req.icon_url.as_ref().map(|o| o.as_deref());
 
-    let server = db::update_server(&state.pool, server_id, trimmed_name, icon_url_ref)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let server = db::update_server_if_admin(&state.pool, server_id, auth.user_id, trimmed_name, icon_url_ref)
+        .await?;
 
-    Ok(Json(server))
+    match server {
+        Some(s) => Ok(Json(s)),
+        None => {
+            let exists = db::get_server(&state.pool, server_id).await?.is_some();
+            if exists {
+                Err(AppError::Forbidden)
+            } else {
+                Err(AppError::NotFound)
+            }
+        }
+    }
 }
 
 async fn delete_server(

@@ -420,20 +420,26 @@ pub async fn is_server_member(
     Ok(result)
 }
 
-pub async fn update_server(
+pub async fn update_server_if_admin(
     pool: &PgPool,
     server_id: Uuid,
+    user_id: Uuid,
     name: Option<&str>,
     icon_url: Option<Option<&str>>,
 ) -> Result<Option<Server>, AppError> {
     let row = sqlx::query_as::<_, ServerRow>(
         "UPDATE servers SET \
-             name = COALESCE($2, name), \
-             icon_url = CASE WHEN $3 THEN $4 ELSE icon_url END \
+             name = COALESCE($3, name), \
+             icon_url = CASE WHEN $4 THEN $5 ELSE icon_url END \
          WHERE id = $1 \
+           AND (owner_id = $2 OR EXISTS(\
+                SELECT 1 FROM server_members \
+                WHERE server_id = $1 AND user_id = $2 AND role = 'admin'\
+           )) \
          RETURNING id, name, icon_url, owner_id, created_at",
     )
     .bind(server_id)
+    .bind(user_id)
     .bind(name)
     .bind(icon_url.is_some())
     .bind(icon_url.flatten())
