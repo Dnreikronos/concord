@@ -18,7 +18,7 @@ async fn main() {
         .expect("failed to connect to database");
 
     let (tx, _) = broadcast::channel(256);
-    let state = Arc::new(AppState { pool, tx, jwt_secret: cfg.jwt_secret });
+    let state = Arc::new(AppState { pool, tx, jwt_secret: cfg.jwt_secret.into() });
 
     let app = routes::all_routes().with_state(state);
 

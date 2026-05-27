@@ -40,7 +40,7 @@ pub async fn test_app() -> Router {
     let state = Arc::new(AppState {
         pool,
         tx,
-        jwt_secret: "test-secret-do-not-use-in-prod".into(),
+        jwt_secret: secrecy::SecretString::from("test-secret-do-not-use-in-prod"),
     });
 
     routes::all_routes().with_state(state)

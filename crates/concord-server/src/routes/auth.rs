@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use concord_shared::types::User;
 use concord_shared::validation::{validate_email, validate_password, validate_username};
 
+use secrecy::ExposeSecret;
+
 use crate::db;
 use crate::error::AppError;
 use crate::jwt;
@@ -88,7 +90,7 @@ async fn login(
         .verify_password(req.password.as_bytes(), &parsed_hash)
         .map_err(|_| AppError::InvalidCredentials)?;
 
-    let access_token = jwt::encode_access_token(user.id, &state.jwt_secret)
+    let access_token = jwt::encode_access_token(user.id, state.jwt_secret.expose_secret())
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     let refresh = jwt::generate_refresh_token();
