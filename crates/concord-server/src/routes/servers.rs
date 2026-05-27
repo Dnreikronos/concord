@@ -104,17 +104,7 @@ async fn update_server(
     let server = db::update_server_if_admin(&state.pool, server_id, auth.user_id, trimmed_name, icon_url_ref)
         .await?;
 
-    match server {
-        Some(s) => Ok(Json(s)),
-        None => {
-            let exists = db::get_server(&state.pool, server_id).await?.is_some();
-            if exists {
-                Err(AppError::Forbidden)
-            } else {
-                Err(AppError::NotFound)
-            }
-        }
-    }
+    server.map(Json).ok_or(AppError::NotFound)
 }
 
 async fn delete_server(
@@ -127,11 +117,6 @@ async fn delete_server(
     if deleted {
         Ok(StatusCode::NO_CONTENT)
     } else {
-        let exists = db::get_server(&state.pool, server_id).await?.is_some();
-        if exists {
-            Err(AppError::Forbidden)
-        } else {
-            Err(AppError::NotFound)
-        }
+        Err(AppError::NotFound)
     }
 }

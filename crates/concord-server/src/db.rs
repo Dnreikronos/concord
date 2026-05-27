@@ -389,21 +389,6 @@ pub async fn list_servers_for_user(
     Ok(rows.into_iter().map(ServerRow::into_server).collect())
 }
 
-pub async fn get_server(
-    pool: &PgPool,
-    server_id: Uuid,
-) -> Result<Option<Server>, AppError> {
-    let row = sqlx::query_as::<_, ServerRow>(
-        "SELECT id, name, icon_url, owner_id, created_at \
-         FROM servers WHERE id = $1",
-    )
-    .bind(server_id)
-    .fetch_optional(pool)
-    .await?;
-
-    Ok(row.map(ServerRow::into_server))
-}
-
 pub async fn get_server_for_member(
     pool: &PgPool,
     server_id: Uuid,
