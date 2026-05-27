@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{Executor, PgPool, Postgres};
 use uuid::Uuid;
 
-use concord_shared::types::{Channel, Server, User};
+use concord_shared::types::{Channel, MemberInfo, Server, ServerInvite, User};
 
 use crate::error::AppError;
 
@@ -449,6 +449,190 @@ pub async fn delete_server_if_owner(
         .await?;
 
     Ok(result.rows_affected() > 0)
+}
+
+#[derive(sqlx::FromRow)]
+struct InviteRow {
+    id: Uuid,
+    server_id: Uuid,
+    creator_id: Uuid,
+    code: String,
+    max_uses: Option<i32>,
+    uses: i32,
+    expires_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+}
+
+impl InviteRow {
+    fn into_invite(self) -> ServerInvite {
+        ServerInvite {
+            id: self.id,
+            server_id: self.server_id,
+            creator_id: self.creator_id,
+            code: self.code,
+            max_uses: self.max_uses,
+            uses: self.uses,
+            expires_at: self.expires_at,
+            created_at: self.created_at,
+        }
+    }
+}
+
+pub async fn create_invite(
+    pool: &PgPool,
+    server_id: Uuid,
+    creator_id: Uuid,
+    code: &str,
+    max_uses: Option<i32>,
+    expires_at: Option<DateTime<Utc>>,
+) -> Result<ServerInvite, AppError> {
+    let row = sqlx::query_as::<_, InviteRow>(
+        "INSERT INTO server_invites (server_id, creator_id, code, max_uses, expires_at) \
+         VALUES ($1, $2, $3, $4, $5) \
+         RETURNING id, server_id, creator_id, code, max_uses, uses, expires_at, created_at",
+    )
+    .bind(server_id)
+    .bind(creator_id)
+    .bind(code)
+    .bind(max_uses)
+    .bind(expires_at)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row.into_invite())
+}
+
+pub async fn get_valid_invite(
+    pool: &PgPool,
+    server_id: Uuid,
+    code: &str,
+) -> Result<Option<ServerInvite>, AppError> {
+    let row = sqlx::query_as::<_, InviteRow>(
+        "SELECT id, server_id, creator_id, code, max_uses, uses, expires_at, created_at \
+         FROM server_invites \
+         WHERE server_id = $1 AND code = $2 \
+           AND (expires_at IS NULL OR expires_at > now()) \
+           AND (max_uses IS NULL OR uses < max_uses)",
+    )
+    .bind(server_id)
+    .bind(code)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(InviteRow::into_invite))
+}
+
+pub async fn increment_invite_uses(
+    pool: &PgPool,
+    invite_id: Uuid,
+) -> Result<(), AppError> {
+    sqlx::query("UPDATE server_invites SET uses = uses + 1 WHERE id = $1")
+        .bind(invite_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn is_server_member(
+    pool: &PgPool,
+    server_id: Uuid,
+    user_id: Uuid,
+) -> Result<bool, AppError> {
+    let result = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2)",
+    )
+    .bind(server_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(result)
+}
+
+pub async fn remove_server_member(
+    pool: &PgPool,
+    server_id: Uuid,
+    user_id: Uuid,
+) -> Result<bool, AppError> {
+    let result = sqlx::query("DELETE FROM server_members WHERE server_id = $1 AND user_id = $2")
+        .bind(server_id)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn list_server_members(
+    pool: &PgPool,
+    server_id: Uuid,
+) -> Result<Vec<MemberInfo>, AppError> {
+    let rows = sqlx::query_as::<_, MemberInfoRow>(
+        "SELECT sm.user_id, u.username, u.avatar_url, \
+                CASE WHEN s.owner_id = sm.user_id THEN 'owner' ELSE sm.role END AS role, \
+                sm.joined_at \
+         FROM server_members sm \
+         JOIN users u ON u.id = sm.user_id \
+         JOIN servers s ON s.id = sm.server_id \
+         WHERE sm.server_id = $1 \
+         ORDER BY sm.joined_at",
+    )
+    .bind(server_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(MemberInfoRow::into_member_info).collect())
+}
+
+#[derive(sqlx::FromRow)]
+struct MemberInfoRow {
+    user_id: Uuid,
+    username: String,
+    avatar_url: Option<String>,
+    role: String,
+    joined_at: DateTime<Utc>,
+}
+
+impl MemberInfoRow {
+    fn into_member_info(self) -> MemberInfo {
+        MemberInfo {
+            user_id: self.user_id,
+            username: self.username,
+            avatar_url: self.avatar_url,
+            role: self.role,
+            joined_at: self.joined_at,
+        }
+    }
+}
+
+pub async fn server_exists(
+    pool: &PgPool,
+    server_id: Uuid,
+) -> Result<bool, AppError> {
+    let result = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM servers WHERE id = $1)",
+    )
+    .bind(server_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(result)
+}
+
+pub async fn is_server_owner(
+    pool: &PgPool,
+    server_id: Uuid,
+    user_id: Uuid,
+) -> Result<bool, AppError> {
+    let result = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM servers WHERE id = $1 AND owner_id = $2)",
+    )
+    .bind(server_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(result)
 }
 
 impl UserRow {
