@@ -30,6 +30,11 @@ impl Config {
         let jwt_secret =
             env::var("JWT_SECRET").expect("JWT_SECRET must be set");
 
+        assert!(
+            jwt_secret.len() >= 32,
+            "JWT_SECRET must be at least 32 bytes"
+        );
+
         Self { database_url, addr, max_connections, jwt_secret }
     }
 }
