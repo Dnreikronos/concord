@@ -25,6 +25,8 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/github", get(github_redirect))
         .route("/github/callback", get(github_callback))
+        .route("/google", get(google_redirect))
+        .route("/google/callback", get(google_callback))
 }
 
 // ---------------------------------------------------------------------------
@@ -265,4 +267,105 @@ async fn fetch_github_primary_email(
         .map_err(|e| AppError::OAuthFailed(format!("email parse: {e}")))?;
 
     Ok(emails.into_iter().find(|e| e.primary && e.verified).map(|e| e.email))
+}
+
+// ---------------------------------------------------------------------------
+// Google
+// ---------------------------------------------------------------------------
+
+async fn google_redirect(
+    State(state): State<Arc<AppState>>,
+) -> Result<Response, AppError> {
+    let client = state.google_oauth.as_ref().ok_or(AppError::OAuthNotConfigured)?;
+
+    let csrf_state =
+        jwt::encode_oauth_state(state.jwt_secret.expose_secret())
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let headers = set_csrf_cookie(&csrf_state, "/api/auth/oauth/google/callback")?;
+
+    let (auth_url, _) = client
+        .authorize_url(|| oauth2::CsrfToken::new(csrf_state))
+        .add_scope(oauth2::Scope::new("openid".into()))
+        .add_scope(oauth2::Scope::new("email".into()))
+        .add_scope(oauth2::Scope::new("profile".into()))
+        .url();
+
+    Ok((headers, Redirect::temporary(auth_url.as_str())).into_response())
+}
+
+#[derive(Deserialize)]
+struct GoogleUserInfo {
+    sub: String,
+    name: Option<String>,
+    email: Option<String>,
+    email_verified: Option<bool>,
+    picture: Option<String>,
+}
+
+async fn google_callback(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<CallbackQuery>,
+) -> Result<(HeaderMap, Json<LoginResponse>), AppError> {
+    let client = state.google_oauth.as_ref().ok_or(AppError::OAuthNotConfigured)?;
+
+    verify_csrf(&headers, &query.state, state.jwt_secret.expose_secret())?;
+
+    let token_response = client
+        .exchange_code(oauth2::AuthorizationCode::new(query.code))
+        .request_async(&state.http_client)
+        .await
+        .map_err(|e| AppError::OAuthFailed(format!("token exchange: {e}")))?;
+
+    let access_token_str = token_response.access_token().secret();
+
+    let google_user: GoogleUserInfo = state.http_client
+        .get("https://www.googleapis.com/oauth2/v3/userinfo")
+        .bearer_auth(access_token_str)
+        .send()
+        .await
+        .map_err(|e| AppError::OAuthFailed(format!("user fetch: {e}")))?
+        .error_for_status()
+        .map_err(|e| AppError::OAuthFailed(format!("user fetch: {e}")))?
+        .json()
+        .await
+        .map_err(|e| AppError::OAuthFailed(format!("user parse: {e}")))?;
+
+    let email = match (&google_user.email, google_user.email_verified) {
+        (Some(e), Some(true)) => Some(e.clone()),
+        _ => None,
+    };
+
+    let email_prefix = email.as_deref().and_then(|e| e.split('@').next());
+    let display_name = google_user
+        .name
+        .as_deref()
+        .or(email_prefix)
+        .unwrap_or("user");
+
+    let user = find_or_create_oauth_user(
+        &state.pool,
+        "google",
+        &google_user.sub,
+        display_name,
+        email.as_deref(),
+        google_user.picture.as_deref(),
+        "g",
+    )
+    .await?;
+
+    let (access_token, refresh) = issue_tokens(&state, &user)?;
+    db::insert_refresh_token(&state.pool, user.id, &refresh.hash, refresh.expires_at).await?;
+
+    let resp_headers = clear_csrf_cookie("/api/auth/oauth/google/callback")?;
+
+    Ok((
+        resp_headers,
+        Json(LoginResponse {
+            access_token,
+            refresh_token: refresh.raw,
+            user,
+        }),
+    ))
 }
