@@ -91,6 +91,12 @@ async fn update_server(
     Path(server_id): Path<Uuid>,
     Json(req): Json<UpdateServerRequest>,
 ) -> Result<Json<Server>, AppError> {
+    if req.name.is_none() && req.icon_url.is_none() {
+        return Err(AppError::Validation(
+            concord_shared::validation::ValidationError::BlankContent { field: "request body" },
+        ));
+    }
+
     let trimmed_name = req.name.as_deref().map(str::trim);
     if let Some(name) = trimmed_name {
         validate_server_name(name)?;
