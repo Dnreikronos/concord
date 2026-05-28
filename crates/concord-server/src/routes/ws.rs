@@ -20,6 +20,33 @@ use crate::state::AppState;
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Outcome of decoding one inbound WebSocket frame into a `ClientMsg`.
+enum Frame {
+    /// A well-formed client message.
+    Msg(ClientMsg),
+    /// The peer sent a Close frame.
+    Close,
+    /// A control or binary frame with no protocol meaning here; ignore it.
+    Skip,
+    /// A text frame that failed to parse as a `ClientMsg`.
+    Invalid,
+}
+
+/// Decode a raw WebSocket frame into a protocol-level message.
+///
+/// Shared by the pre-auth and post-auth read loops so the frame → text →
+/// parse-`ClientMsg` handling stays in one place.
+fn parse_client_frame(frame: Message) -> Frame {
+    match frame {
+        Message::Text(text) => match serde_json::from_str::<ClientMsg>(&text) {
+            Ok(msg) => Frame::Msg(msg),
+            Err(_) => Frame::Invalid,
+        },
+        Message::Close(_) => Frame::Close,
+        _ => Frame::Skip,
+    }
+}
+
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
@@ -65,15 +92,11 @@ async fn wait_for_auth(
             }
         };
 
-        let text = match frame {
-            Message::Text(t) => t,
-            Message::Close(_) => return None,
-            _ => continue,
-        };
-
-        let client_msg: ClientMsg = match serde_json::from_str(&text) {
-            Ok(m) => m,
-            Err(_) => {
+        let client_msg = match parse_client_frame(frame) {
+            Frame::Msg(msg) => msg,
+            Frame::Close => return None,
+            Frame::Skip => continue,
+            Frame::Invalid => {
                 let _ = send_error(sender, ErrorCode::BadRequest, "invalid message format")
                     .await;
                 return None;
@@ -122,15 +145,11 @@ async fn handle_authenticated(
     state: Arc<AppState>,
 ) {
     while let Some(Ok(frame)) = receiver.next().await {
-        let text = match frame {
-            Message::Text(t) => t,
-            Message::Close(_) => break,
-            _ => continue,
-        };
-
-        let client_msg: ClientMsg = match serde_json::from_str(&text) {
-            Ok(m) => m,
-            Err(_) => {
+        let client_msg = match parse_client_frame(frame) {
+            Frame::Msg(msg) => msg,
+            Frame::Close => break,
+            Frame::Skip => continue,
+            Frame::Invalid => {
                 let _ = send_error(
                     &sender,
                     ErrorCode::BadRequest,
