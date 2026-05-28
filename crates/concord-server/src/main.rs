@@ -53,6 +53,7 @@ async fn main() {
         github_oauth,
         google_oauth,
         http_client: reqwest::Client::new(),
+        ws_auth_timeout: std::time::Duration::from_secs(10),
     });
 
     let app = routes::all_routes().with_state(state);
