@@ -5,9 +5,9 @@ use axum::http::Request;
 use axum::Router;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
-use tokio::sync::broadcast;
 use uuid::Uuid;
 
+use concord_server::hub::Hub;
 use concord_server::routes;
 use concord_server::state::AppState;
 
@@ -36,14 +36,14 @@ async fn shared_pool() -> &'static PgPool {
 
 pub async fn test_app() -> Router {
     let pool = shared_pool().await.clone();
-    let (tx, _) = broadcast::channel(256);
     let state = Arc::new(AppState {
         pool,
-        tx,
+        hub: Arc::new(Hub::new()),
         jwt_secret: secrecy::SecretString::from("test-secret-do-not-use-in-prod"),
         github_oauth: None,
         google_oauth: None,
         http_client: reqwest::Client::new(),
+        ws_auth_timeout: std::time::Duration::from_secs(10),
     });
 
     routes::all_routes().with_state(state)
