@@ -5,15 +5,44 @@ use axum::extract::{State, WebSocketUpgrade};
 use axum::response::Response;
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
+use tokio::time::{timeout_at, Instant};
 use uuid::Uuid;
 
 use concord_shared::protocol::{ClientMsg, ErrorCode, ServerMsg};
 use concord_shared::validation::validate_message_content;
 
 use secrecy::ExposeSecret;
+use tracing::warn;
 
 use crate::db;
 use crate::state::AppState;
+
+/// Outcome of decoding one inbound WebSocket frame into a `ClientMsg`.
+enum Frame {
+    /// A well-formed client message.
+    Msg(ClientMsg),
+    /// The peer sent a Close frame.
+    Close,
+    /// A control or binary frame with no protocol meaning here; ignore it.
+    Skip,
+    /// A text frame that failed to parse as a `ClientMsg`.
+    Invalid,
+}
+
+/// Decode a raw WebSocket frame into a protocol-level message.
+///
+/// Shared by the pre-auth and post-auth read loops so the frame → text →
+/// parse-`ClientMsg` handling stays in one place.
+fn parse_client_frame(frame: Message) -> Frame {
+    match frame {
+        Message::Text(text) => match serde_json::from_str::<ClientMsg>(&text) {
+            Ok(msg) => Frame::Msg(msg),
+            Err(_) => Frame::Invalid,
+        },
+        Message::Close(_) => Frame::Close,
+        _ => Frame::Skip,
+    }
+}
 
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
@@ -28,20 +57,102 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let (sender, mut receiver) = socket.split();
     let sender: Sink = Arc::new(tokio::sync::Mutex::new(sender));
 
-    let mut user_id: Option<Uuid> = None;
-    let mut conn_id: Option<Uuid> = None;
-    let mut fwd_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let Some((uid, conn_id, fwd_handle)) =
+        wait_for_auth(&sender, &mut receiver, &state).await
+    else {
+        return;
+    };
 
-    while let Some(Ok(frame)) = receiver.next().await {
-        let text = match frame {
-            Message::Text(t) => t,
-            Message::Close(_) => break,
-            _ => continue,
+    handle_authenticated(uid, conn_id, sender, receiver, fwd_handle, state).await;
+}
+
+async fn wait_for_auth(
+    sender: &Sink,
+    receiver: &mut futures_util::stream::SplitStream<WebSocket>,
+    state: &Arc<AppState>,
+) -> Option<(Uuid, Uuid, tokio::task::JoinHandle<()>)> {
+    // Single deadline for the whole handshake. Re-arming a fresh timeout each
+    // loop iteration let a client trickle non-text frames every <timeout and
+    // stay unauthenticated forever; a fixed deadline bounds that regardless of
+    // how many junk frames arrive.
+    let deadline = Instant::now() + state.ws_auth_timeout;
+
+    loop {
+        let frame = match timeout_at(deadline, receiver.next()).await {
+            Ok(Some(Ok(frame))) => frame,
+            Err(_) => {
+                let _ = send_error(sender, ErrorCode::Unauthorized, "auth timeout")
+                    .await;
+                return None;
+            }
+            Ok(Some(Err(_))) => {
+                let _ = send_error(sender, ErrorCode::Internal, "websocket error during auth")
+                    .await;
+                return None;
+            }
+            Ok(None) => {
+                return None;
+            }
         };
 
-        let client_msg: ClientMsg = match serde_json::from_str(&text) {
-            Ok(m) => m,
-            Err(_) => {
+        let client_msg = match parse_client_frame(frame) {
+            Frame::Msg(msg) => msg,
+            Frame::Close => return None,
+            Frame::Skip => continue,
+            Frame::Invalid => {
+                let _ = send_error(sender, ErrorCode::BadRequest, "invalid message format")
+                    .await;
+                return None;
+            }
+        };
+
+        let ClientMsg::Authenticate { token } = client_msg else {
+            let _ = send_error(sender, ErrorCode::Unauthorized, "must authenticate first")
+                .await;
+            return None;
+        };
+
+        match authenticate(state, token.as_str()).await {
+            Ok(uid) => {
+                let (conn_id, rx) = state.hub.register(uid);
+                let _ = send_msg(sender, &ServerMsg::Authenticated { user_id: uid }).await;
+
+                match db::list_channel_ids_for_user(&state.pool, uid).await {
+                    Ok(channel_ids) => {
+                        for ch in channel_ids {
+                            state.hub.subscribe(uid, ch);
+                        }
+                    }
+                    Err(e) => {
+                        warn!(user_id = %uid, error = ?e, "failed to load channel subscriptions");
+                    }
+                }
+
+                let fwd = spawn_forwarder(rx, Arc::clone(sender));
+                return Some((uid, conn_id, fwd));
+            }
+            Err(msg) => {
+                let _ = send_error(sender, ErrorCode::Unauthorized, &msg).await;
+                return None;
+            }
+        }
+    }
+}
+
+async fn handle_authenticated(
+    uid: Uuid,
+    conn_id: Uuid,
+    sender: Sink,
+    mut receiver: futures_util::stream::SplitStream<WebSocket>,
+    fwd_handle: tokio::task::JoinHandle<()>,
+    state: Arc<AppState>,
+) {
+    while let Some(Ok(frame)) = receiver.next().await {
+        let client_msg = match parse_client_frame(frame) {
+            Frame::Msg(msg) => msg,
+            Frame::Close => break,
+            Frame::Skip => continue,
+            Frame::Invalid => {
                 let _ = send_error(
                     &sender,
                     ErrorCode::BadRequest,
@@ -53,51 +164,19 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         };
 
         match client_msg {
-            ClientMsg::Authenticate { token } => {
-                match authenticate(&state, token.as_str()).await {
-                    Ok(uid) => {
-                        if let Some(old_uid) = user_id {
-                            if let Some(old_cid) = conn_id {
-                                state.hub.unregister(old_uid, old_cid);
-                            }
-                        }
-                        user_id = Some(uid);
-
-                        let (cid, rx) = state.hub.register(uid);
-                        conn_id = Some(cid);
-                        let _ = send_msg(
-                            &sender,
-                            &ServerMsg::Authenticated { user_id: uid },
-                        )
-                        .await;
-
-                        if let Some(h) = fwd_handle.take() {
-                            h.abort();
-                        }
-                        fwd_handle =
-                            Some(spawn_forwarder(rx, Arc::clone(&sender)));
-                    }
-                    Err(msg) => {
-                        let _ =
-                            send_error(&sender, ErrorCode::Unauthorized, &msg).await;
-                    }
-                }
+            ClientMsg::Authenticate { .. } => {
+                let _ = send_error(
+                    &sender,
+                    ErrorCode::BadRequest,
+                    "already authenticated",
+                )
+                .await;
             }
 
             ClientMsg::SendMessage {
                 channel_id,
                 content,
             } => {
-                let Some(uid) = user_id else {
-                    let _ = send_error(
-                        &sender,
-                        ErrorCode::Unauthorized,
-                        "not authenticated",
-                    )
-                    .await;
-                    continue;
-                };
-
                 if let Err(e) = validate_message_content(&content) {
                     let _ =
                         send_error(&sender, ErrorCode::BadRequest, &e.to_string())
@@ -142,16 +221,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 message_id,
                 content,
             } => {
-                let Some(uid) = user_id else {
-                    let _ = send_error(
-                        &sender,
-                        ErrorCode::Unauthorized,
-                        "not authenticated",
-                    )
-                    .await;
-                    continue;
-                };
-
                 if let Err(e) = validate_message_content(&content) {
                     let _ =
                         send_error(&sender, ErrorCode::BadRequest, &e.to_string())
@@ -228,16 +297,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             }
 
             ClientMsg::DeleteMessage { message_id } => {
-                let Some(uid) = user_id else {
-                    let _ = send_error(
-                        &sender,
-                        ErrorCode::Unauthorized,
-                        "not authenticated",
-                    )
-                    .await;
-                    continue;
-                };
-
                 if let Some(channel_id) =
                     try_delete_message(&state, message_id, uid).await
                 {
@@ -256,16 +315,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             }
 
             ClientMsg::JoinChannel { channel_id } => {
-                let Some(uid) = user_id else {
-                    let _ = send_error(
-                        &sender,
-                        ErrorCode::Unauthorized,
-                        "not authenticated",
-                    )
-                    .await;
-                    continue;
-                };
-
                 if verify_channel_membership(&state, &sender, channel_id, uid)
                     .await
                     .is_none()
@@ -277,30 +326,13 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             }
 
             ClientMsg::LeaveChannel { channel_id } => {
-                let Some(uid) = user_id else {
-                    let _ = send_error(
-                        &sender,
-                        ErrorCode::Unauthorized,
-                        "not authenticated",
-                    )
-                    .await;
-                    continue;
-                };
-
                 state.hub.unsubscribe(uid, channel_id);
+                // Clear any live typing session so leavers don't linger as a
+                // stuck indicator until the sweeper catches up.
+                state.typing.stop(uid, channel_id).await;
             }
 
             ClientMsg::StartTyping { channel_id } => {
-                let Some(uid) = user_id else {
-                    let _ = send_error(
-                        &sender,
-                        ErrorCode::Unauthorized,
-                        "not authenticated",
-                    )
-                    .await;
-                    continue;
-                };
-
                 if verify_channel_membership(&state, &sender, channel_id, uid)
                     .await
                     .is_none()
@@ -308,17 +340,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     continue;
                 }
 
-                if !state.hub.check_typing_cooldown(uid, channel_id) {
-                    continue;
-                }
+                state.typing.start(uid, channel_id).await;
+            }
 
-                state.hub.broadcast_to_channel(
-                    channel_id,
-                    &ServerMsg::UserTyping {
-                        channel_id,
-                        user_id: uid,
-                    },
-                );
+            ClientMsg::StopTyping { channel_id } => {
+                state.typing.stop(uid, channel_id).await;
             }
 
             _ => {
@@ -332,14 +358,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         }
     }
 
-    if let Some(uid) = user_id {
-        if let Some(cid) = conn_id {
-            state.hub.unregister(uid, cid);
-        }
-    }
-    if let Some(h) = fwd_handle {
-        h.abort();
-    }
+    state.hub.unregister(uid, conn_id);
+    fwd_handle.abort();
 }
 
 async fn verify_channel_membership(

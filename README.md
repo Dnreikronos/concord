@@ -87,6 +87,7 @@ concord/
 | `GET`    | `/api/servers/:id/categories`                | List categories         |
 | `PATCH`  | `/api/channels/:id`                          | Update channel          |
 | `DELETE` | `/api/channels/:id`                          | Delete channel          |
+| `GET`    | `/api/channels/:id/messages`                 | Message history         |
 
 ### WebSocket (`/ws`)
 

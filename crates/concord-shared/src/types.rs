@@ -156,6 +156,31 @@ pub struct Message {
     pub created_at: DateTime<Utc>,
 }
 
+/// Public author profile embedded in a message-history response. `None` for a
+/// message whose author's account was deleted — `messages.author_id` is
+/// `ON DELETE SET NULL`, so there is no user left to name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageAuthor {
+    pub id: Uuid,
+    pub username: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
+}
+
+/// A message joined with its author's profile, as returned by the channel
+/// history endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageWithAuthor {
+    pub id: Uuid,
+    pub channel_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<MessageAuthor>,
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edited_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DmChannel {
     pub id: Uuid,

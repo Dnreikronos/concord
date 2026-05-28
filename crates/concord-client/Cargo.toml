@@ -10,8 +10,23 @@ repository.workspace = true
 name = "concord-client"
 path = "src/main.rs"
 
+[lib]
+name = "concord_client"
+path = "src/lib.rs"
+
 [dependencies]
 concord-shared = { path = "../concord-shared" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-tungstenite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures-util.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros", "sync", "time"] }
 
 [lints]
 workspace = true
