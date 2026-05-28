@@ -12,6 +12,7 @@ use uuid::Uuid;
 use concord_shared::types::{MemberInfo, Server, ServerInvite};
 use concord_shared::validation::{validate_icon_url, validate_invite_code, validate_server_name};
 
+use super::channels;
 use crate::db;
 use crate::error::AppError;
 use crate::extractors::AuthUser;
@@ -47,6 +48,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{id}/join", post(join_server))
         .route("/{id}/members", get(list_members))
         .route("/{id}/members/@me", delete(leave_server))
+        .route("/{id}/channels", post(channels::create_channel).get(channels::list_channels))
 }
 
 async fn create_server(
