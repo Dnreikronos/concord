@@ -71,14 +71,12 @@ pub async fn create_channel(
         ChannelType::Voice => "voice",
     };
 
-    let position = db::next_channel_position(&state.pool, server_id).await?;
     let channel = db::insert_channel(
         &state.pool,
         server_id,
         name,
         req.topic.as_deref(),
         channel_type_str,
-        position,
     )
     .await?;
 

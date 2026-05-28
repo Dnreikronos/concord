@@ -351,14 +351,13 @@ pub async fn insert_channel<'e, E>(
     name: &str,
     topic: Option<&str>,
     channel_type: &str,
-    position: i32,
 ) -> Result<Channel, AppError>
 where
     E: Executor<'e, Database = Postgres>,
 {
     let row = sqlx::query_as::<_, ChannelRow>(
         "INSERT INTO channels (server_id, name, topic, channel_type, position) \
-         VALUES ($1, $2, $3, $4, $5) \
+         VALUES ($1, $2, $3, $4, (SELECT COALESCE(MAX(position), -1) + 1 FROM channels WHERE server_id = $1)) \
          RETURNING id, server_id, category_id, name, topic, \
                    channel_type, position, created_at",
     )
@@ -366,25 +365,10 @@ where
     .bind(name)
     .bind(topic)
     .bind(channel_type)
-    .bind(position)
     .fetch_one(executor)
     .await?;
 
     row.into_channel()
-}
-
-pub async fn next_channel_position(
-    pool: &PgPool,
-    server_id: Uuid,
-) -> Result<i32, AppError> {
-    let pos = sqlx::query_scalar::<_, i32>(
-        "SELECT COALESCE(MAX(position), -1) + 1 FROM channels WHERE server_id = $1",
-    )
-    .bind(server_id)
-    .fetch_one(pool)
-    .await?;
-
-    Ok(pos)
 }
 
 pub async fn list_channels_for_server(

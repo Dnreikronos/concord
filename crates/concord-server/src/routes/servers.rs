@@ -66,7 +66,7 @@ async fn create_server(
 
     let server = db::insert_server(&mut *tx, name, req.icon_url.as_deref(), auth.user_id).await?;
     db::insert_server_member(&mut *tx, server.id, auth.user_id, "admin").await?;
-    db::insert_channel(&mut *tx, server.id, "general", None, "text", 0).await?;
+    db::insert_channel(&mut *tx, server.id, "general", None, "text").await?;
 
     tx.commit().await.map_err(|e| AppError::Internal(e.to_string()))?;
 
