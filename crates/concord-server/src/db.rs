@@ -380,7 +380,7 @@ pub async fn list_channels_for_server(
                 channel_type, position, created_at \
          FROM channels \
          WHERE server_id = $1 \
-         ORDER BY category_id NULLS FIRST, position",
+         ORDER BY category_id NULLS FIRST, position, created_at",
     )
     .bind(server_id)
     .fetch_all(pool)
