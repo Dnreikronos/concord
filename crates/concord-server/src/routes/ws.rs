@@ -327,6 +327,9 @@ async fn handle_authenticated(
 
             ClientMsg::LeaveChannel { channel_id } => {
                 state.hub.unsubscribe(uid, channel_id);
+                // Clear any live typing session so leavers don't linger as a
+                // stuck indicator until the sweeper catches up.
+                state.typing.stop(uid, channel_id).await;
             }
 
             ClientMsg::StartTyping { channel_id } => {
