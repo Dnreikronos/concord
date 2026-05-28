@@ -62,8 +62,9 @@ pub async fn create_channel(
 
     let name = req.name.trim();
     validate_channel_name(name)?;
-    if let Some(ref topic) = req.topic {
-        validate_channel_topic(topic)?;
+    let topic = req.topic.as_deref().map(str::trim);
+    if let Some(t) = topic {
+        validate_channel_topic(t)?;
     }
 
     let channel_type_str = match req.channel_type {
@@ -75,7 +76,7 @@ pub async fn create_channel(
         &state.pool,
         server_id,
         name,
-        req.topic.as_deref(),
+        topic,
         channel_type_str,
     )
     .await?;
@@ -117,11 +118,12 @@ async fn update_channel(
     if let Some(name) = trimmed_name {
         validate_channel_name(name)?;
     }
-    if let Some(Some(ref topic)) = req.topic {
-        validate_channel_topic(topic)?;
+    let trimmed_topic = req.topic.as_ref().map(|o| o.as_deref().map(str::trim));
+    if let Some(Some(t)) = trimmed_topic {
+        validate_channel_topic(t)?;
     }
 
-    let topic_ref = req.topic.as_ref().map(|o| o.as_deref());
+    let topic_ref = trimmed_topic;
 
     let channel = db::update_channel_if_admin(
         &state.pool,
