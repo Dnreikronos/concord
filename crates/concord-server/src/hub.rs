@@ -47,6 +47,7 @@ impl Hub {
             self.channels.iter_mut().for_each(|mut entry| {
                 entry.value_mut().remove(&user_id);
             });
+            self.typing_cooldowns.retain(|&(uid, _), _| uid != user_id);
         }
     }
 
@@ -60,7 +61,13 @@ impl Hub {
     pub fn unsubscribe(&self, user_id: Uuid, channel_id: Uuid) {
         if let Some(mut subs) = self.channels.get_mut(&channel_id) {
             subs.remove(&user_id);
+            let empty = subs.is_empty();
+            drop(subs);
+            if empty {
+                self.channels.remove(&channel_id);
+            }
         }
+        self.typing_cooldowns.remove(&(user_id, channel_id));
     }
 
     pub fn broadcast_to_channel(&self, channel_id: Uuid, msg: &ServerMsg) {
