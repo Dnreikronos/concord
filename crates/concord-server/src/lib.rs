@@ -6,3 +6,4 @@ pub mod hub;
 pub mod jwt;
 pub mod routes;
 pub mod state;
+pub mod typing;

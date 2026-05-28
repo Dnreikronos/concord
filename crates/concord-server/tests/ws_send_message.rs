@@ -14,6 +14,7 @@ use concord_server::hub::Hub;
 use concord_server::jwt;
 use concord_server::routes;
 use concord_server::state::AppState;
+use concord_server::typing::{Typing, TYPING_TTL};
 use concord_shared::protocol::{ClientMsg, ErrorCode, ServerMsg, Token};
 
 use futures_util::{SinkExt, StreamExt};
@@ -60,9 +61,12 @@ async fn setup_pool() -> PgPool {
 /// `ws://.../ws` URL. All clients connecting to the returned URL share one
 /// `Hub`, so broadcasts cross connections.
 async fn spawn_server(pool: PgPool) -> String {
+    let hub = Arc::new(Hub::new());
+    let typing = Arc::new(Typing::new(Arc::clone(&hub), TYPING_TTL, None));
     let state = Arc::new(AppState {
         pool,
-        hub: Arc::new(Hub::new()),
+        hub,
+        typing,
         jwt_secret: secrecy::SecretString::from(JWT_SECRET),
         github_oauth: None,
         google_oauth: None,

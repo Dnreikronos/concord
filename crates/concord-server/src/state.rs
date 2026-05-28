@@ -7,6 +7,7 @@ use secrecy::SecretString;
 use sqlx::PgPool;
 
 use crate::hub::Hub;
+use crate::typing::Typing;
 
 pub type ConfiguredOAuthClient =
     BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
@@ -14,6 +15,7 @@ pub type ConfiguredOAuthClient =
 pub struct AppState {
     pub pool: PgPool,
     pub hub: Arc<Hub>,
+    pub typing: Arc<Typing>,
     pub jwt_secret: SecretString,
     pub github_oauth: Option<ConfiguredOAuthClient>,
     pub google_oauth: Option<ConfiguredOAuthClient>,

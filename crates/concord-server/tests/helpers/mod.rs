@@ -14,6 +14,7 @@ use uuid::Uuid;
 use concord_server::hub::Hub;
 use concord_server::routes;
 use concord_server::state::AppState;
+use concord_server::typing::{Typing, TYPING_TTL};
 
 /// JWT signing secret wired into `test_app`; reuse it to mint tokens the app
 /// will accept.
@@ -51,9 +52,12 @@ pub async fn setup_pool() -> PgPool {
 
 /// Build the full router backed by `pool`.
 pub fn app_with_pool(pool: PgPool) -> Router {
+    let hub = Arc::new(Hub::new());
+    let typing = Arc::new(Typing::new(Arc::clone(&hub), TYPING_TTL, None));
     let state = Arc::new(AppState {
         pool,
-        hub: Arc::new(Hub::new()),
+        hub,
+        typing,
         jwt_secret: secrecy::SecretString::from(JWT_SECRET),
         github_oauth: None,
         google_oauth: None,

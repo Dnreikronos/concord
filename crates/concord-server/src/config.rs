@@ -54,6 +54,9 @@ pub struct Config {
     pub jwt_secret: String,
     pub github_oauth: Option<GitHubOAuthConfig>,
     pub google_oauth: Option<GoogleOAuthConfig>,
+    /// Redis connection URL for cross-instance typing pub/sub. When unset, the
+    /// server fans typing indicators out in-process only.
+    pub redis_url: Option<String>,
 }
 
 impl Config {
@@ -86,6 +89,16 @@ impl Config {
         let github_oauth = GitHubOAuthConfig::from_env();
         let google_oauth = GoogleOAuthConfig::from_env();
 
-        Self { database_url, addr, max_connections, jwt_secret, github_oauth, google_oauth }
+        let redis_url = env::var("REDIS_URL").ok().filter(|s| !s.is_empty());
+
+        Self {
+            database_url,
+            addr,
+            max_connections,
+            jwt_secret,
+            github_oauth,
+            google_oauth,
+            redis_url,
+        }
     }
 }
