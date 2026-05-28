@@ -105,33 +105,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     continue;
                 }
 
-                let server_id = match db::get_channel_server(&state.pool, channel_id).await {
-                    Ok(Some(sid)) => sid,
-                    Ok(None) => {
-                        let _ = send_error(
-                            &sender,
-                            ErrorCode::NotFound,
-                            "channel not found",
-                        )
-                        .await;
-                        continue;
-                    }
-                    Err(_) => {
-                        let _ = send_error(&sender, ErrorCode::Internal, "internal error").await;
-                        continue;
-                    }
-                };
-
-                if !db::is_server_member(&state.pool, server_id, uid)
+                if verify_channel_membership(&state, &sender, channel_id, uid)
                     .await
-                    .unwrap_or(false)
+                    .is_none()
                 {
-                    let _ = send_error(
-                        &sender,
-                        ErrorCode::Forbidden,
-                        "not a member of this server",
-                    )
-                    .await;
                     continue;
                 }
 
@@ -182,7 +159,37 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     continue;
                 }
 
-                let channel_id = match db::update_message_if_author(
+                let channel_id =
+                    match db::get_message_channel(&state.pool, message_id).await {
+                        Ok(Some(ch)) => ch,
+                        Ok(None) => {
+                            let _ = send_error(
+                                &sender,
+                                ErrorCode::NotFound,
+                                "message not found",
+                            )
+                            .await;
+                            continue;
+                        }
+                        Err(_) => {
+                            let _ = send_error(
+                                &sender,
+                                ErrorCode::Internal,
+                                "internal error",
+                            )
+                            .await;
+                            continue;
+                        }
+                    };
+
+                if verify_channel_membership(&state, &sender, channel_id, uid)
+                    .await
+                    .is_none()
+                {
+                    continue;
+                }
+
+                match db::update_message_if_author(
                     &state.pool,
                     message_id,
                     uid,
@@ -190,12 +197,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 )
                 .await
                 {
-                    Ok(Some(ch)) => ch,
+                    Ok(Some(_)) => {}
                     Ok(None) => {
                         let _ = send_error(
                             &sender,
                             ErrorCode::Forbidden,
-                            "message not found or not the author",
+                            "not the author",
                         )
                         .await;
                         continue;
@@ -209,7 +216,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         .await;
                         continue;
                     }
-                };
+                }
 
                 state.hub.broadcast_to_channel(
                     channel_id,
@@ -259,33 +266,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     continue;
                 };
 
-                let server_id = match db::get_channel_server(&state.pool, channel_id).await {
-                    Ok(Some(sid)) => sid,
-                    Ok(None) => {
-                        let _ = send_error(
-                            &sender,
-                            ErrorCode::NotFound,
-                            "channel not found",
-                        )
-                        .await;
-                        continue;
-                    }
-                    Err(_) => {
-                        let _ = send_error(&sender, ErrorCode::Internal, "internal error").await;
-                        continue;
-                    }
-                };
-
-                if !db::is_server_member(&state.pool, server_id, uid)
+                if verify_channel_membership(&state, &sender, channel_id, uid)
                     .await
-                    .unwrap_or(false)
+                    .is_none()
                 {
-                    let _ = send_error(
-                        &sender,
-                        ErrorCode::Forbidden,
-                        "not a member of this server",
-                    )
-                    .await;
                     continue;
                 }
 
@@ -317,6 +301,13 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     continue;
                 };
 
+                if verify_channel_membership(&state, &sender, channel_id, uid)
+                    .await
+                    .is_none()
+                {
+                    continue;
+                }
+
                 state.hub.broadcast_to_channel(
                     channel_id,
                     &ServerMsg::UserTyping {
@@ -345,6 +336,42 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     if let Some(h) = fwd_handle {
         h.abort();
     }
+}
+
+async fn verify_channel_membership(
+    state: &AppState,
+    sender: &Sink,
+    channel_id: Uuid,
+    user_id: Uuid,
+) -> Option<Uuid> {
+    let server_id = match db::get_channel_server(&state.pool, channel_id).await {
+        Ok(Some(sid)) => sid,
+        Ok(None) => {
+            let _ =
+                send_error(sender, ErrorCode::NotFound, "channel not found").await;
+            return None;
+        }
+        Err(_) => {
+            let _ =
+                send_error(sender, ErrorCode::Internal, "internal error").await;
+            return None;
+        }
+    };
+
+    if !db::is_server_member(&state.pool, server_id, user_id)
+        .await
+        .unwrap_or(false)
+    {
+        let _ = send_error(
+            sender,
+            ErrorCode::Forbidden,
+            "not a member of this server",
+        )
+        .await;
+        return None;
+    }
+
+    Some(server_id)
 }
 
 /// Try author-delete first; on failure check admin privileges and force-delete.
