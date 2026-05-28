@@ -130,6 +130,16 @@ pub async fn reorder(
         ));
     }
 
+    const MAX_REORDER_ITEMS: usize = 500;
+    if req.channels.len() > MAX_REORDER_ITEMS || req.categories.len() > MAX_REORDER_ITEMS {
+        return Err(AppError::Validation(
+            concord_shared::validation::ValidationError::InvalidValue {
+                field: "reorder",
+                reason: "too many items in a single request",
+            },
+        ));
+    }
+
     if !db::is_server_admin(&state.pool, server_id, auth.user_id).await? {
         if !db::server_exists(&state.pool, server_id).await? {
             return Err(AppError::NotFound);
