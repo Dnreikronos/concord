@@ -1,7 +1,7 @@
 use concord_shared::protocol::{ClientMsg, ErrorCode, ServerMsg, Token};
 use uuid::Uuid;
 
-pub enum WsCommand {
+pub(crate) enum WsCommand {
     Connect { url: String, token: Token },
     Send(ClientMsg),
     Shutdown,
