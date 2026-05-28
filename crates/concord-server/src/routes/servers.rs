@@ -12,6 +12,7 @@ use uuid::Uuid;
 use concord_shared::types::{MemberInfo, Server, ServerInvite};
 use concord_shared::validation::{validate_icon_url, validate_invite_code, validate_server_name};
 
+use super::categories;
 use super::channels;
 use crate::db;
 use crate::error::AppError;
@@ -49,6 +50,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{id}/members", get(list_members))
         .route("/{id}/members/@me", delete(leave_server))
         .route("/{id}/channels", post(channels::create_channel).get(channels::list_channels))
+        .route("/{id}/categories", post(categories::create_category))
+        .route("/{id}/channels/reorder", axum::routing::patch(categories::reorder))
 }
 
 async fn create_server(
