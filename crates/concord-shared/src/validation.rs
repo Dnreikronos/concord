@@ -136,6 +136,9 @@ pub fn validate_channel_name(s: &str) -> Result<(), ValidationError> {
 }
 
 pub fn validate_channel_topic(s: &str) -> Result<(), ValidationError> {
+    if s.trim().is_empty() {
+        return Err(ValidationError::BlankContent { field: "channel topic" });
+    }
     let len = s.chars().count();
     if len > CHANNEL_TOPIC_MAX {
         return Err(ValidationError::TooLong { field: "channel topic", max: CHANNEL_TOPIC_MAX });
