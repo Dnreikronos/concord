@@ -77,6 +77,11 @@ pub enum ServerMsg {
     },
 
     // Typing
+    //
+    // Clients must self-expire a typing indicator a few seconds after the last
+    // `TypingStarted` rather than wait for `TypingStopped`: the server emits the
+    // stop on the happy path, but it can be lost if the originating instance
+    // crashes or a network partition drops the cross-instance event.
     TypingStarted {
         channel_id: Uuid,
         user_id: Uuid,
