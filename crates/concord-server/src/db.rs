@@ -349,6 +349,7 @@ pub async fn insert_channel<'e, E>(
     executor: E,
     server_id: Uuid,
     name: &str,
+    topic: Option<&str>,
     channel_type: &str,
     position: i32,
 ) -> Result<Channel, AppError>
@@ -356,19 +357,107 @@ where
     E: Executor<'e, Database = Postgres>,
 {
     let row = sqlx::query_as::<_, ChannelRow>(
-        "INSERT INTO channels (server_id, name, channel_type, position) \
-         VALUES ($1, $2, $3, $4) \
+        "INSERT INTO channels (server_id, name, topic, channel_type, position) \
+         VALUES ($1, $2, $3, $4, $5) \
          RETURNING id, server_id, category_id, name, topic, \
                    channel_type, position, created_at",
     )
     .bind(server_id)
     .bind(name)
+    .bind(topic)
     .bind(channel_type)
     .bind(position)
     .fetch_one(executor)
     .await?;
 
     row.into_channel()
+}
+
+pub async fn next_channel_position(
+    pool: &PgPool,
+    server_id: Uuid,
+) -> Result<i32, AppError> {
+    let pos = sqlx::query_scalar::<_, i32>(
+        "SELECT COALESCE(MAX(position), -1) + 1 FROM channels WHERE server_id = $1",
+    )
+    .bind(server_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(pos)
+}
+
+pub async fn list_channels_for_server(
+    pool: &PgPool,
+    server_id: Uuid,
+) -> Result<Vec<Channel>, AppError> {
+    let rows = sqlx::query_as::<_, ChannelRow>(
+        "SELECT id, server_id, category_id, name, topic, \
+                channel_type, position, created_at \
+         FROM channels \
+         WHERE server_id = $1 \
+         ORDER BY category_id NULLS FIRST, position",
+    )
+    .bind(server_id)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter().map(ChannelRow::into_channel).collect()
+}
+
+pub async fn update_channel_if_admin(
+    pool: &PgPool,
+    channel_id: Uuid,
+    user_id: Uuid,
+    name: Option<&str>,
+    topic: Option<Option<&str>>,
+) -> Result<Option<Channel>, AppError> {
+    let row = sqlx::query_as::<_, ChannelRow>(
+        "UPDATE channels SET \
+             name = COALESCE($3, name), \
+             topic = CASE WHEN $4 THEN $5 ELSE topic END \
+         WHERE id = $1 \
+           AND EXISTS(\
+               SELECT 1 FROM servers WHERE id = channels.server_id AND owner_id = $2 \
+               UNION ALL \
+               SELECT 1 FROM server_members \
+               WHERE server_id = channels.server_id AND user_id = $2 AND role = 'admin'\
+           ) \
+         RETURNING id, server_id, category_id, name, topic, \
+                   channel_type, position, created_at",
+    )
+    .bind(channel_id)
+    .bind(user_id)
+    .bind(name)
+    .bind(topic.is_some())
+    .bind(topic.flatten())
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(ChannelRow::into_channel).transpose()
+}
+
+pub async fn delete_channel_if_admin(
+    pool: &PgPool,
+    channel_id: Uuid,
+    user_id: Uuid,
+) -> Result<bool, AppError> {
+    let result = sqlx::query(
+        "DELETE FROM channels \
+         WHERE id = $1 \
+           AND EXISTS(\
+               SELECT 1 FROM servers WHERE id = channels.server_id AND owner_id = $2 \
+               UNION ALL \
+               SELECT 1 FROM server_members \
+               WHERE server_id = channels.server_id AND user_id = $2 AND role = 'admin'\
+           )",
+    )
+    .bind(channel_id)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
 }
 
 pub async fn list_servers_for_user(
