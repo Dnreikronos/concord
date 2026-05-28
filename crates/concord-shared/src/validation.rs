@@ -14,6 +14,7 @@ pub const PASSWORD_MAX: usize = 128;
 pub const MESSAGE_CONTENT_MIN: usize = 1;
 pub const MESSAGE_CONTENT_MAX: usize = 4000;
 pub const ICON_URL_MAX: usize = 2048;
+pub const CHANNEL_TOPIC_MAX: usize = 1024;
 pub const INVITE_CODE_MIN: usize = 6;
 pub const INVITE_CODE_MAX: usize = 16;
 
@@ -132,6 +133,17 @@ pub fn validate_icon_url(s: &str) -> Result<(), ValidationError> {
 
 pub fn validate_channel_name(s: &str) -> Result<(), ValidationError> {
     validate_name(s, "channel name", CHANNEL_NAME_MIN, CHANNEL_NAME_MAX)
+}
+
+pub fn validate_channel_topic(s: &str) -> Result<(), ValidationError> {
+    if s.trim().is_empty() {
+        return Err(ValidationError::BlankContent { field: "channel topic" });
+    }
+    let len = s.chars().count();
+    if len > CHANNEL_TOPIC_MAX {
+        return Err(ValidationError::TooLong { field: "channel topic", max: CHANNEL_TOPIC_MAX });
+    }
+    Ok(())
 }
 
 pub fn validate_category_name(s: &str) -> Result<(), ValidationError> {
