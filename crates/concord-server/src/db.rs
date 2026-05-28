@@ -349,26 +349,99 @@ pub async fn insert_channel<'e, E>(
     executor: E,
     server_id: Uuid,
     name: &str,
+    topic: Option<&str>,
     channel_type: &str,
-    position: i32,
 ) -> Result<Channel, AppError>
 where
     E: Executor<'e, Database = Postgres>,
 {
     let row = sqlx::query_as::<_, ChannelRow>(
-        "INSERT INTO channels (server_id, name, channel_type, position) \
-         VALUES ($1, $2, $3, $4) \
+        "INSERT INTO channels (server_id, name, topic, channel_type, position) \
+         VALUES ($1, $2, $3, $4, (SELECT COALESCE(MAX(position), -1) + 1 FROM channels WHERE server_id = $1)) \
          RETURNING id, server_id, category_id, name, topic, \
                    channel_type, position, created_at",
     )
     .bind(server_id)
     .bind(name)
+    .bind(topic)
     .bind(channel_type)
-    .bind(position)
     .fetch_one(executor)
     .await?;
 
     row.into_channel()
+}
+
+pub async fn list_channels_for_server(
+    pool: &PgPool,
+    server_id: Uuid,
+) -> Result<Vec<Channel>, AppError> {
+    let rows = sqlx::query_as::<_, ChannelRow>(
+        "SELECT id, server_id, category_id, name, topic, \
+                channel_type, position, created_at \
+         FROM channels \
+         WHERE server_id = $1 \
+         ORDER BY category_id NULLS FIRST, position, created_at",
+    )
+    .bind(server_id)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter().map(ChannelRow::into_channel).collect()
+}
+
+pub async fn update_channel_if_admin(
+    pool: &PgPool,
+    channel_id: Uuid,
+    user_id: Uuid,
+    name: Option<&str>,
+    topic: Option<Option<&str>>,
+) -> Result<Option<Channel>, AppError> {
+    let row = sqlx::query_as::<_, ChannelRow>(
+        "UPDATE channels SET \
+             name = COALESCE($3, name), \
+             topic = CASE WHEN $4 THEN $5 ELSE topic END \
+         WHERE id = $1 \
+           AND EXISTS(\
+               SELECT 1 FROM servers WHERE id = channels.server_id AND owner_id = $2 \
+               UNION ALL \
+               SELECT 1 FROM server_members \
+               WHERE server_id = channels.server_id AND user_id = $2 AND role = 'admin'\
+           ) \
+         RETURNING id, server_id, category_id, name, topic, \
+                   channel_type, position, created_at",
+    )
+    .bind(channel_id)
+    .bind(user_id)
+    .bind(name)
+    .bind(topic.is_some())
+    .bind(topic.flatten())
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(ChannelRow::into_channel).transpose()
+}
+
+pub async fn delete_channel_if_admin(
+    pool: &PgPool,
+    channel_id: Uuid,
+    user_id: Uuid,
+) -> Result<bool, AppError> {
+    let result = sqlx::query(
+        "DELETE FROM channels \
+         WHERE id = $1 \
+           AND EXISTS(\
+               SELECT 1 FROM servers WHERE id = channels.server_id AND owner_id = $2 \
+               UNION ALL \
+               SELECT 1 FROM server_members \
+               WHERE server_id = channels.server_id AND user_id = $2 AND role = 'admin'\
+           )",
+    )
+    .bind(channel_id)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
 }
 
 pub async fn list_servers_for_user(
@@ -625,6 +698,165 @@ pub async fn is_server_owner(
     .await?;
 
     Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// channel_categories
+// ---------------------------------------------------------------------------
+
+#[derive(sqlx::FromRow)]
+struct CategoryRow {
+    id: Uuid,
+    server_id: Uuid,
+    name: String,
+    position: i32,
+    created_at: DateTime<Utc>,
+}
+
+impl CategoryRow {
+    fn into_category(self) -> concord_shared::types::ChannelCategory {
+        concord_shared::types::ChannelCategory {
+            id: self.id,
+            server_id: self.server_id,
+            name: self.name,
+            position: self.position,
+            created_at: self.created_at,
+        }
+    }
+}
+
+pub async fn insert_category(
+    pool: &PgPool,
+    server_id: Uuid,
+    name: &str,
+) -> Result<concord_shared::types::ChannelCategory, AppError> {
+    let row = sqlx::query_as::<_, CategoryRow>(
+        "INSERT INTO channel_categories (server_id, name, position) \
+         VALUES ($1, $2, (SELECT COALESCE(MAX(position), -1) + 1 FROM channel_categories WHERE server_id = $1)) \
+         RETURNING id, server_id, name, position, created_at",
+    )
+    .bind(server_id)
+    .bind(name)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row.into_category())
+}
+
+pub async fn rename_category_if_admin(
+    pool: &PgPool,
+    category_id: Uuid,
+    user_id: Uuid,
+    name: &str,
+) -> Result<Option<concord_shared::types::ChannelCategory>, AppError> {
+    let row = sqlx::query_as::<_, CategoryRow>(
+        "UPDATE channel_categories SET name = $3 \
+         WHERE id = $1 \
+           AND EXISTS(\
+               SELECT 1 FROM servers WHERE id = channel_categories.server_id AND owner_id = $2 \
+               UNION ALL \
+               SELECT 1 FROM server_members \
+               WHERE server_id = channel_categories.server_id AND user_id = $2 AND role = 'admin'\
+           ) \
+         RETURNING id, server_id, name, position, created_at",
+    )
+    .bind(category_id)
+    .bind(user_id)
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(CategoryRow::into_category))
+}
+
+pub async fn delete_category_if_admin(
+    pool: &PgPool,
+    category_id: Uuid,
+    user_id: Uuid,
+) -> Result<bool, AppError> {
+    let result = sqlx::query(
+        "DELETE FROM channel_categories \
+         WHERE id = $1 \
+           AND EXISTS(\
+               SELECT 1 FROM servers WHERE id = channel_categories.server_id AND owner_id = $2 \
+               UNION ALL \
+               SELECT 1 FROM server_members \
+               WHERE server_id = channel_categories.server_id AND user_id = $2 AND role = 'admin'\
+           )",
+    )
+    .bind(category_id)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn get_category_server_id(
+    pool: &PgPool,
+    category_id: Uuid,
+) -> Result<Option<Uuid>, AppError> {
+    let row = sqlx::query_scalar::<_, Uuid>(
+        "SELECT server_id FROM channel_categories WHERE id = $1",
+    )
+    .bind(category_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row)
+}
+
+pub async fn reorder_channels(
+    pool: &PgPool,
+    server_id: Uuid,
+    channels: &[(Uuid, Option<Uuid>, i32)],
+    categories: &[(Uuid, i32)],
+) -> Result<(), AppError> {
+    let mut tx = pool.begin().await.map_err(|e| AppError::Internal(e.to_string()))?;
+
+    for &(id, position) in categories {
+        let affected = sqlx::query(
+            "UPDATE channel_categories SET position = $2 WHERE id = $1 AND server_id = $3",
+        )
+        .bind(id)
+        .bind(position)
+        .bind(server_id)
+        .execute(&mut *tx)
+        .await?;
+
+        if affected.rows_affected() == 0 {
+            return Err(AppError::Validation(
+                concord_shared::validation::ValidationError::InvalidValue {
+                    field: "categories",
+                    reason: "category not found in this server",
+                },
+            ));
+        }
+    }
+
+    for &(id, category_id, position) in channels {
+        let affected = sqlx::query(
+            "UPDATE channels SET category_id = $2, position = $3 WHERE id = $1 AND server_id = $4",
+        )
+        .bind(id)
+        .bind(category_id)
+        .bind(position)
+        .bind(server_id)
+        .execute(&mut *tx)
+        .await?;
+
+        if affected.rows_affected() == 0 {
+            return Err(AppError::Validation(
+                concord_shared::validation::ValidationError::InvalidValue {
+                    field: "channels",
+                    reason: "channel not found in this server",
+                },
+            ));
+        }
+    }
+
+    tx.commit().await.map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(())
 }
 
 impl UserRow {
