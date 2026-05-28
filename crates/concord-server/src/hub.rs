@@ -36,14 +36,14 @@ impl Hub {
 
     pub fn unregister(&self, user_id: Uuid, conn_id: Uuid) {
         self.senders.remove(&conn_id);
-        let has_remaining = if let Some(mut conns) = self.user_conns.get_mut(&user_id) {
-            conns.remove(&conn_id);
-            !conns.is_empty()
-        } else {
-            false
-        };
-        if !has_remaining {
-            self.user_conns.remove(&user_id);
+        let removed_last = self
+            .user_conns
+            .remove_if_mut(&user_id, |_, conns| {
+                conns.remove(&conn_id);
+                conns.is_empty()
+            })
+            .is_some();
+        if removed_last {
             self.channels.iter_mut().for_each(|mut entry| {
                 entry.value_mut().remove(&user_id);
             });
