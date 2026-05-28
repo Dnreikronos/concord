@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::warn;
 
@@ -10,6 +11,7 @@ use concord_shared::protocol::{ClientMsg, ErrorCode, ServerMsg, Token};
 use super::types::{ConnState, WsCommand, WsEvent};
 
 const OUTGOING_BUFFER_CAP: usize = 1024;
+const AUTH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Backoff {
     attempt: u32,
@@ -101,28 +103,36 @@ pub(crate) async fn run(mut cmd_rx: mpsc::Receiver<WsCommand>, evt_tx: mpsc::Sen
                             continue 'outer;
                         }
 
-                        let auth_response = loop {
-                            match stream.next().await {
-                                Some(Ok(Message::Text(t))) => break t,
-                                Some(Ok(Message::Close(_))) | None => {
-                                    let _ = evt_tx
-                                        .send(WsEvent::Disconnected {
-                                            reason: "connection closed during auth".into(),
-                                        })
-                                        .await;
-                                    state = ConnState::Reconnecting;
-                                    continue 'outer;
+                        let auth_response = match timeout(AUTH_RESPONSE_TIMEOUT, async {
+                            loop {
+                                match stream.next().await {
+                                    Some(Ok(Message::Text(t))) => return Ok(t),
+                                    Some(Ok(Message::Close(_))) | None => {
+                                        return Err("connection closed during auth".to_owned());
+                                    }
+                                    Some(Err(e)) => {
+                                        return Err(e.to_string());
+                                    }
+                                    Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_))) => continue,
                                 }
-                                Some(Err(e)) => {
-                                    let _ = evt_tx
-                                        .send(WsEvent::Disconnected {
-                                            reason: e.to_string(),
-                                        })
-                                        .await;
-                                    state = ConnState::Reconnecting;
-                                    continue 'outer;
-                                }
-                                Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_))) => continue,
+                            }
+                        }).await {
+                            Ok(Ok(t)) => t,
+                            Ok(Err(reason)) => {
+                                let _ = evt_tx
+                                    .send(WsEvent::Disconnected { reason })
+                                    .await;
+                                state = ConnState::Reconnecting;
+                                continue 'outer;
+                            }
+                            Err(_) => {
+                                let _ = evt_tx
+                                    .send(WsEvent::Disconnected {
+                                        reason: "auth response timeout".into(),
+                                    })
+                                    .await;
+                                state = ConnState::Reconnecting;
+                                continue 'outer;
                             }
                         };
 
