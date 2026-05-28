@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use tokio::sync::mpsc;
@@ -6,10 +7,13 @@ use uuid::Uuid;
 
 use concord_shared::protocol::ServerMsg;
 
+const TYPING_COOLDOWN: Duration = Duration::from_secs(5);
+
 pub struct Hub {
     senders: DashMap<Uuid, mpsc::UnboundedSender<ServerMsg>>,
     user_conns: DashMap<Uuid, HashSet<Uuid>>,
     channels: DashMap<Uuid, HashSet<Uuid>>,
+    typing_cooldowns: DashMap<(Uuid, Uuid), Instant>,
 }
 
 impl Hub {
@@ -18,6 +22,7 @@ impl Hub {
             senders: DashMap::new(),
             user_conns: DashMap::new(),
             channels: DashMap::new(),
+            typing_cooldowns: DashMap::new(),
         }
     }
 
@@ -77,5 +82,17 @@ impl Hub {
                 }
             }
         }
+    }
+
+    pub fn check_typing_cooldown(&self, user_id: Uuid, channel_id: Uuid) -> bool {
+        let now = Instant::now();
+        let key = (user_id, channel_id);
+        if let Some(last) = self.typing_cooldowns.get(&key) {
+            if now.duration_since(*last) < TYPING_COOLDOWN {
+                return false;
+            }
+        }
+        self.typing_cooldowns.insert(key, now);
+        true
     }
 }

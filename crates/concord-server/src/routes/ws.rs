@@ -308,6 +308,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     continue;
                 }
 
+                if !state.hub.check_typing_cooldown(uid, channel_id) {
+                    continue;
+                }
+
                 state.hub.broadcast_to_channel(
                     channel_id,
                     &ServerMsg::UserTyping {
