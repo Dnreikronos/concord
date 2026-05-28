@@ -6,6 +6,9 @@ use tokio::sync::mpsc;
 use super::connection;
 use super::types::{WsCommand, WsEvent};
 
+/// Capacity of the command channel feeding the background connection task.
+const CMD_CHANNEL_CAP: usize = 64;
+
 #[derive(Debug)]
 pub struct SendError;
 
@@ -24,7 +27,7 @@ pub struct ConnectionHandle {
 
 impl ConnectionHandle {
     pub fn spawn(event_buffer: usize) -> (Self, mpsc::Receiver<WsEvent>) {
-        let (cmd_tx, cmd_rx) = mpsc::channel::<WsCommand>(64);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<WsCommand>(CMD_CHANNEL_CAP);
         let (evt_tx, evt_rx) = mpsc::channel::<WsEvent>(event_buffer);
 
         tokio::spawn(connection::run(cmd_rx, evt_tx));
