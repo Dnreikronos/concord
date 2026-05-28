@@ -1,12 +1,11 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
 use axum::response::Response;
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
-use tokio::time::timeout;
+use tokio::time::{timeout_at, Instant};
 use uuid::Uuid;
 
 use concord_shared::protocol::{ClientMsg, ErrorCode, ServerMsg};
@@ -17,8 +16,6 @@ use tracing::warn;
 
 use crate::db;
 use crate::state::AppState;
-
-const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Outcome of decoding one inbound WebSocket frame into a `ClientMsg`.
 enum Frame {
@@ -74,8 +71,14 @@ async fn wait_for_auth(
     receiver: &mut futures_util::stream::SplitStream<WebSocket>,
     state: &Arc<AppState>,
 ) -> Option<(Uuid, Uuid, tokio::task::JoinHandle<()>)> {
+    // Single deadline for the whole handshake. Re-arming a fresh timeout each
+    // loop iteration let a client trickle non-text frames every <timeout and
+    // stay unauthenticated forever; a fixed deadline bounds that regardless of
+    // how many junk frames arrive.
+    let deadline = Instant::now() + state.ws_auth_timeout;
+
     loop {
-        let frame = match timeout(AUTH_TIMEOUT, receiver.next()).await {
+        let frame = match timeout_at(deadline, receiver.next()).await {
             Ok(Some(Ok(frame))) => frame,
             Err(_) => {
                 let _ = send_error(sender, ErrorCode::Unauthorized, "auth timeout")
