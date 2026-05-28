@@ -4,5 +4,6 @@ pub mod error;
 pub mod extractors;
 pub mod hub;
 pub mod jwt;
+pub mod presence;
 pub mod routes;
 pub mod state;
