@@ -29,6 +29,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let sender: Sink = Arc::new(tokio::sync::Mutex::new(sender));
 
     let mut user_id: Option<Uuid> = None;
+    let mut conn_id: Option<Uuid> = None;
     let mut fwd_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     while let Some(Ok(frame)) = receiver.next().await {
@@ -55,23 +56,86 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             ClientMsg::Authenticate { token } => {
                 match authenticate(&state, token.as_str()).await {
                     Ok(uid) => {
+                        if let Some(old_uid) = user_id {
+                            if let Some(old_cid) = conn_id {
+                                state.hub.unregister(old_uid, old_cid);
+                            }
+                        }
                         user_id = Some(uid);
+
+                        let (cid, rx) = state.hub.register(uid);
+                        conn_id = Some(cid);
                         let _ = send_msg(
                             &sender,
                             &ServerMsg::Authenticated { user_id: uid },
                         )
                         .await;
 
-                        if fwd_handle.is_none() {
-                            fwd_handle =
-                                Some(spawn_forwarder(state.clone(), Arc::clone(&sender)));
+                        if let Some(h) = fwd_handle.take() {
+                            h.abort();
                         }
+                        fwd_handle =
+                            Some(spawn_forwarder(rx, Arc::clone(&sender)));
                     }
                     Err(msg) => {
                         let _ =
                             send_error(&sender, ErrorCode::Unauthorized, &msg).await;
                     }
                 }
+            }
+
+            ClientMsg::SendMessage {
+                channel_id,
+                content,
+            } => {
+                let Some(uid) = user_id else {
+                    let _ = send_error(
+                        &sender,
+                        ErrorCode::Unauthorized,
+                        "not authenticated",
+                    )
+                    .await;
+                    continue;
+                };
+
+                if let Err(e) = validate_message_content(&content) {
+                    let _ =
+                        send_error(&sender, ErrorCode::BadRequest, &e.to_string())
+                            .await;
+                    continue;
+                }
+
+                if verify_channel_membership(&state, &sender, channel_id, uid)
+                    .await
+                    .is_none()
+                {
+                    continue;
+                }
+
+                let inserted = match db::insert_message(
+                    &state.pool,
+                    channel_id,
+                    uid,
+                    &content,
+                )
+                .await
+                {
+                    Ok(row) => row,
+                    Err(_) => {
+                        let _ = send_error(&sender, ErrorCode::Internal, "internal error").await;
+                        continue;
+                    }
+                };
+
+                state.hub.broadcast_to_channel(
+                    channel_id,
+                    &ServerMsg::NewMessage {
+                        id: inserted.id,
+                        channel_id,
+                        author_id: Some(uid),
+                        content,
+                    },
+                );
             }
 
             ClientMsg::EditMessage {
@@ -95,7 +159,37 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     continue;
                 }
 
-                let channel_id = match db::update_message_if_author(
+                let channel_id =
+                    match db::get_message_channel(&state.pool, message_id).await {
+                        Ok(Some(ch)) => ch,
+                        Ok(None) => {
+                            let _ = send_error(
+                                &sender,
+                                ErrorCode::NotFound,
+                                "message not found",
+                            )
+                            .await;
+                            continue;
+                        }
+                        Err(_) => {
+                            let _ = send_error(
+                                &sender,
+                                ErrorCode::Internal,
+                                "internal error",
+                            )
+                            .await;
+                            continue;
+                        }
+                    };
+
+                if verify_channel_membership(&state, &sender, channel_id, uid)
+                    .await
+                    .is_none()
+                {
+                    continue;
+                }
+
+                match db::update_message_if_author(
                     &state.pool,
                     message_id,
                     uid,
@@ -103,12 +197,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 )
                 .await
                 {
-                    Ok(Some(ch)) => ch,
+                    Ok(Some(_)) => {}
                     Ok(None) => {
                         let _ = send_error(
                             &sender,
                             ErrorCode::Forbidden,
-                            "message not found or not the author",
+                            "not the author",
                         )
                         .await;
                         continue;
@@ -122,15 +216,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         .await;
                         continue;
                     }
-                };
+                }
 
-                let _ = state.tx.send((
+                state.hub.broadcast_to_channel(
                     channel_id,
-                    ServerMsg::MessageEdited {
+                    &ServerMsg::MessageEdited {
                         message_id,
                         content,
                     },
-                ));
+                );
             }
 
             ClientMsg::DeleteMessage { message_id } => {
@@ -147,10 +241,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 if let Some(channel_id) =
                     try_delete_message(&state, message_id, uid).await
                 {
-                    let _ = state.tx.send((
+                    state.hub.broadcast_to_channel(
                         channel_id,
-                        ServerMsg::MessageDeleted { message_id },
-                    ));
+                        &ServerMsg::MessageDeleted { message_id },
+                    );
                 } else {
                     let _ = send_error(
                         &sender,
@@ -159,6 +253,72 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     )
                     .await;
                 }
+            }
+
+            ClientMsg::JoinChannel { channel_id } => {
+                let Some(uid) = user_id else {
+                    let _ = send_error(
+                        &sender,
+                        ErrorCode::Unauthorized,
+                        "not authenticated",
+                    )
+                    .await;
+                    continue;
+                };
+
+                if verify_channel_membership(&state, &sender, channel_id, uid)
+                    .await
+                    .is_none()
+                {
+                    continue;
+                }
+
+                state.hub.subscribe(uid, channel_id);
+            }
+
+            ClientMsg::LeaveChannel { channel_id } => {
+                let Some(uid) = user_id else {
+                    let _ = send_error(
+                        &sender,
+                        ErrorCode::Unauthorized,
+                        "not authenticated",
+                    )
+                    .await;
+                    continue;
+                };
+
+                state.hub.unsubscribe(uid, channel_id);
+            }
+
+            ClientMsg::StartTyping { channel_id } => {
+                let Some(uid) = user_id else {
+                    let _ = send_error(
+                        &sender,
+                        ErrorCode::Unauthorized,
+                        "not authenticated",
+                    )
+                    .await;
+                    continue;
+                };
+
+                if verify_channel_membership(&state, &sender, channel_id, uid)
+                    .await
+                    .is_none()
+                {
+                    continue;
+                }
+
+                if !state.hub.check_typing_cooldown(uid, channel_id) {
+                    continue;
+                }
+
+                state.hub.broadcast_to_channel(
+                    channel_id,
+                    &ServerMsg::UserTyping {
+                        channel_id,
+                        user_id: uid,
+                    },
+                );
             }
 
             _ => {
@@ -172,9 +332,55 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         }
     }
 
+    if let Some(uid) = user_id {
+        if let Some(cid) = conn_id {
+            state.hub.unregister(uid, cid);
+        }
+    }
     if let Some(h) = fwd_handle {
         h.abort();
     }
+}
+
+async fn verify_channel_membership(
+    state: &AppState,
+    sender: &Sink,
+    channel_id: Uuid,
+    user_id: Uuid,
+) -> Option<Uuid> {
+    let server_id = match db::get_channel_server(&state.pool, channel_id).await {
+        Ok(Some(sid)) => sid,
+        Ok(None) => {
+            let _ =
+                send_error(sender, ErrorCode::NotFound, "channel not found").await;
+            return None;
+        }
+        Err(_) => {
+            let _ =
+                send_error(sender, ErrorCode::Internal, "internal error").await;
+            return None;
+        }
+    };
+
+    match db::is_server_member(&state.pool, server_id, user_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = send_error(
+                sender,
+                ErrorCode::Forbidden,
+                "not a member of this server",
+            )
+            .await;
+            return None;
+        }
+        Err(_) => {
+            let _ =
+                send_error(sender, ErrorCode::Internal, "internal error").await;
+            return None;
+        }
+    }
+
+    Some(server_id)
 }
 
 /// Try author-delete first; on failure check admin privileges and force-delete.
@@ -206,30 +412,19 @@ async fn try_delete_message(
     db::delete_message(&state.pool, message_id).await.ok()?
 }
 
-fn spawn_forwarder(state: Arc<AppState>, sender: Sink) -> tokio::task::JoinHandle<()> {
-    let mut rx = state.tx.subscribe();
+fn spawn_forwarder(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<ServerMsg>,
+    sender: Sink,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok((_, msg)) => {
-                    let text = match serde_json::to_string(&msg) {
-                        Ok(t) => t,
-                        Err(_) => continue,
-                    };
-                    let mut sink = sender.lock().await;
-                    if sink.send(Message::Text(text.into())).await.is_err() {
-                        break;
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    let _ = send_error(
-                        &sender,
-                        ErrorCode::Internal,
-                        &format!("missed {n} messages"),
-                    )
-                    .await;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        while let Some(msg) = rx.recv().await {
+            let text = match serde_json::to_string(&msg) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let mut sink = sender.lock().await;
+            if sink.send(Message::Text(text.into())).await.is_err() {
+                break;
             }
         }
     })

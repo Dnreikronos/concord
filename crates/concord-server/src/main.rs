@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use sqlx::postgres::PgPoolOptions;
-use tokio::sync::broadcast;
 
 use concord_server::config::Config;
+use concord_server::hub::Hub;
 use concord_server::routes;
 use concord_server::state::AppState;
 
@@ -45,10 +45,10 @@ async fn main() {
             .set_redirect_uri(RedirectUrl::new(g.redirect_url).unwrap())
     });
 
-    let (tx, _) = broadcast::channel(256);
+    let hub = Arc::new(Hub::new());
     let state = Arc::new(AppState {
         pool,
-        tx,
+        hub,
         jwt_secret: cfg.jwt_secret.into(),
         github_oauth,
         google_oauth,

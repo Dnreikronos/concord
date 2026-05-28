@@ -30,6 +30,7 @@ hex = "0.4"
 secrecy = "0.10"
 oauth2 = "5"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+dashmap = "6"
 
 [workspace.lints.rust]
 unused = "warn"
