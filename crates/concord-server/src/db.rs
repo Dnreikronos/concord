@@ -431,6 +431,27 @@ pub async fn list_channel_ids_for_user(
     Ok(ids)
 }
 
+/// Distinct other users who share at least one server with `user_id`. These
+/// are the "relevant users" for presence: the people who should learn when
+/// `user_id` comes online, changes status, or goes offline. `user_id` itself
+/// is excluded.
+pub async fn list_shared_server_user_ids(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Vec<Uuid>, AppError> {
+    let ids = sqlx::query_scalar::<_, Uuid>(
+        "SELECT DISTINCT peer.user_id \
+         FROM server_members me \
+         JOIN server_members peer ON peer.server_id = me.server_id \
+         WHERE me.user_id = $1 AND peer.user_id <> $1",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(ids)
+}
+
 pub async fn update_channel_if_admin(
     pool: &PgPool,
     channel_id: Uuid,
