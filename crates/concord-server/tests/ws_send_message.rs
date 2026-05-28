@@ -209,9 +209,28 @@ async fn send_message_reaches_other_channel_subscriber() {
         .expect("insert second member");
 
     let url = spawn_server(pool.clone()).await;
-    let mut author_ws = connect_authed(&url, author).await;
-    let mut other_ws = connect_authed(&url, other).await;
 
+    // The server subscribes a connection only after it sends `Authenticated`
+    // (ws.rs), so returning from the handshake doesn't prove a client is in the
+    // broadcast set yet. Connect `other` first and round-trip its own message:
+    // receiving that echo proves `other` is subscribed, since the server
+    // subscribes before reading any post-auth frame. Connect the author only
+    // afterward, so the warm-up never lands on the author's socket.
+    let mut other_ws = connect_authed(&url, other).await;
+    send(
+        &mut other_ws,
+        &ClientMsg::SendMessage {
+            channel_id: channel,
+            content: "warmup".into(),
+        },
+    )
+    .await;
+    match recv(&mut other_ws).await {
+        ServerMsg::NewMessage { content, .. } => assert_eq!(content, "warmup"),
+        other => panic!("expected warmup NewMessage, got {other:?}"),
+    }
+
+    let mut author_ws = connect_authed(&url, author).await;
     send(
         &mut author_ws,
         &ClientMsg::SendMessage {
@@ -221,7 +240,7 @@ async fn send_message_reaches_other_channel_subscriber() {
     )
     .await;
 
-    // Both the author and the bystander subscriber must observe the message.
+    // Both the author and the already-subscribed bystander must observe it.
     for ws in [&mut author_ws, &mut other_ws] {
         match recv(ws).await {
             ServerMsg::NewMessage {
@@ -245,8 +264,8 @@ async fn send_message_by_non_member_is_forbidden() {
     let owner = seed_user(&pool).await;
     let (_server, channel) = seed_server_with_channel(&pool, owner).await;
 
-    // A valid token for a user who is not a member of the server.
-    let outsider = Uuid::new_v4();
+    // A real, registered user who simply isn't a member of the server.
+    let outsider = seed_user(&pool).await;
     let url = spawn_server(pool.clone()).await;
     let mut ws = connect_authed(&url, outsider).await;
 
@@ -298,18 +317,20 @@ async fn send_message_to_unknown_channel_is_not_found() {
 }
 
 #[tokio::test]
-async fn send_blank_message_is_rejected_before_any_lookup() {
+async fn send_blank_message_is_rejected_before_channel_lookup() {
     let pool = setup_pool().await;
     let author = seed_user(&pool).await;
-    let (_server, channel) = seed_server_with_channel(&pool, author).await;
 
+    // No server or channel is seeded, so the channel id below doesn't exist.
+    // If content validation ran after the channel lookup we'd get NotFound;
+    // getting BadRequest instead proves validation runs first.
     let url = spawn_server(pool.clone()).await;
     let mut ws = connect_authed(&url, author).await;
 
     send(
         &mut ws,
         &ClientMsg::SendMessage {
-            channel_id: channel,
+            channel_id: Uuid::new_v4(),
             content: "   ".into(),
         },
     )
@@ -319,6 +340,36 @@ async fn send_blank_message_is_rejected_before_any_lookup() {
         ServerMsg::Error { code, message } => {
             assert_eq!(code, ErrorCode::BadRequest);
             assert_eq!(message, "message content must not be blank");
+        }
+        other => panic!("expected BadRequest error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn send_oversized_message_is_rejected() {
+    let pool = setup_pool().await;
+    let author = seed_user(&pool).await;
+    let (_server, channel) = seed_server_with_channel(&pool, author).await;
+
+    let url = spawn_server(pool.clone()).await;
+    let mut ws = connect_authed(&url, author).await;
+
+    // One past the 4000-char cap; the WS path must surface the same rejection
+    // the validator unit-tests cover.
+    let too_long = "a".repeat(4001);
+    send(
+        &mut ws,
+        &ClientMsg::SendMessage {
+            channel_id: channel,
+            content: too_long,
+        },
+    )
+    .await;
+
+    match recv(&mut ws).await {
+        ServerMsg::Error { code, message } => {
+            assert_eq!(code, ErrorCode::BadRequest);
+            assert_eq!(message, "message content must be at most 4000 characters");
         }
         other => panic!("expected BadRequest error, got {other:?}"),
     }
