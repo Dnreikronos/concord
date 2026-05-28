@@ -362,17 +362,22 @@ async fn verify_channel_membership(
         }
     };
 
-    if !db::is_server_member(&state.pool, server_id, user_id)
-        .await
-        .unwrap_or(false)
-    {
-        let _ = send_error(
-            sender,
-            ErrorCode::Forbidden,
-            "not a member of this server",
-        )
-        .await;
-        return None;
+    match db::is_server_member(&state.pool, server_id, user_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = send_error(
+                sender,
+                ErrorCode::Forbidden,
+                "not a member of this server",
+            )
+            .await;
+            return None;
+        }
+        Err(_) => {
+            let _ =
+                send_error(sender, ErrorCode::Internal, "internal error").await;
+            return None;
+        }
     }
 
     Some(server_id)
