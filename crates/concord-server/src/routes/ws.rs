@@ -55,17 +55,23 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             ClientMsg::Authenticate { token } => {
                 match authenticate(&state, token.as_str()).await {
                     Ok(uid) => {
+                        if let Some(old) = user_id {
+                            state.hub.unregister(old);
+                        }
                         user_id = Some(uid);
+
+                        let rx = state.hub.register(uid);
                         let _ = send_msg(
                             &sender,
                             &ServerMsg::Authenticated { user_id: uid },
                         )
                         .await;
 
-                        if fwd_handle.is_none() {
-                            fwd_handle =
-                                Some(spawn_forwarder(state.clone(), Arc::clone(&sender)));
+                        if let Some(h) = fwd_handle.take() {
+                            h.abort();
                         }
+                        fwd_handle =
+                            Some(spawn_forwarder(rx, Arc::clone(&sender)));
                     }
                     Err(msg) => {
                         let _ =
@@ -124,13 +130,13 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     }
                 };
 
-                let _ = state.tx.send((
+                state.hub.broadcast_to_channel(
                     channel_id,
-                    ServerMsg::MessageEdited {
+                    &ServerMsg::MessageEdited {
                         message_id,
                         content,
                     },
-                ));
+                );
             }
 
             ClientMsg::DeleteMessage { message_id } => {
@@ -147,10 +153,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 if let Some(channel_id) =
                     try_delete_message(&state, message_id, uid).await
                 {
-                    let _ = state.tx.send((
+                    state.hub.broadcast_to_channel(
                         channel_id,
-                        ServerMsg::MessageDeleted { message_id },
-                    ));
+                        &ServerMsg::MessageDeleted { message_id },
+                    );
                 } else {
                     let _ = send_error(
                         &sender,
@@ -172,6 +178,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         }
     }
 
+    if let Some(uid) = user_id {
+        state.hub.unregister(uid);
+    }
     if let Some(h) = fwd_handle {
         h.abort();
     }
@@ -206,30 +215,19 @@ async fn try_delete_message(
     db::delete_message(&state.pool, message_id).await.ok()?
 }
 
-fn spawn_forwarder(state: Arc<AppState>, sender: Sink) -> tokio::task::JoinHandle<()> {
-    let mut rx = state.tx.subscribe();
+fn spawn_forwarder(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<ServerMsg>,
+    sender: Sink,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok((_, msg)) => {
-                    let text = match serde_json::to_string(&msg) {
-                        Ok(t) => t,
-                        Err(_) => continue,
-                    };
-                    let mut sink = sender.lock().await;
-                    if sink.send(Message::Text(text.into())).await.is_err() {
-                        break;
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    let _ = send_error(
-                        &sender,
-                        ErrorCode::Internal,
-                        &format!("missed {n} messages"),
-                    )
-                    .await;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        while let Some(msg) = rx.recv().await {
+            let text = match serde_json::to_string(&msg) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let mut sink = sender.lock().await;
+            if sink.send(Message::Text(text.into())).await.is_err() {
+                break;
             }
         }
     })
