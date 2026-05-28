@@ -26,15 +26,27 @@ impl Hub {
         }
     }
 
-    pub fn register(&self, user_id: Uuid) -> (Uuid, mpsc::UnboundedReceiver<ServerMsg>) {
+    /// Register a new connection for `user_id`. The returned `bool` is `true`
+    /// when this is the user's *first* live connection — the offline-to-online
+    /// transition that presence broadcasts hang off of. Additional connections
+    /// (other devices/tabs) return `false`.
+    pub fn register(
+        &self,
+        user_id: Uuid,
+    ) -> (Uuid, mpsc::UnboundedReceiver<ServerMsg>, bool) {
         let conn_id = Uuid::new_v4();
         let (tx, rx) = mpsc::unbounded_channel();
         self.senders.insert(conn_id, tx);
-        self.user_conns.entry(user_id).or_default().insert(conn_id);
-        (conn_id, rx)
+        let mut conns = self.user_conns.entry(user_id).or_default();
+        let is_first = conns.is_empty();
+        conns.insert(conn_id);
+        (conn_id, rx, is_first)
     }
 
-    pub fn unregister(&self, user_id: Uuid, conn_id: Uuid) {
+    /// Drop a connection. Returns `true` when it was the user's *last* live
+    /// connection — the online-to-offline transition — so the caller can clear
+    /// persisted presence and broadcast the user going offline.
+    pub fn unregister(&self, user_id: Uuid, conn_id: Uuid) -> bool {
         self.senders.remove(&conn_id);
         let removed_last = self
             .user_conns
@@ -49,6 +61,7 @@ impl Hub {
             });
             self.typing_cooldowns.retain(|&(uid, _), _| uid != user_id);
         }
+        removed_last
     }
 
     pub fn subscribe(&self, user_id: Uuid, channel_id: Uuid) {
