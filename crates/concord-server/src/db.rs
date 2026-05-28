@@ -99,6 +99,32 @@ pub async fn take_refresh_token(
     Ok(row)
 }
 
+#[derive(sqlx::FromRow)]
+pub struct InsertedMessage {
+    pub id: Uuid,
+    pub created_at: DateTime<Utc>,
+}
+
+pub async fn insert_message(
+    pool: &PgPool,
+    channel_id: Uuid,
+    author_id: Uuid,
+    content: &str,
+) -> Result<InsertedMessage, AppError> {
+    let row = sqlx::query_as::<_, InsertedMessage>(
+        "INSERT INTO messages (channel_id, author_id, content) \
+         VALUES ($1, $2, $3) \
+         RETURNING id, created_at",
+    )
+    .bind(channel_id)
+    .bind(author_id)
+    .bind(content)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row)
+}
+
 pub async fn get_message_channel(
     pool: &PgPool,
     message_id: Uuid,
