@@ -8,6 +8,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use concord_server::hub::Hub;
+use concord_server::presence::Presence;
 use concord_server::routes;
 use concord_server::state::AppState;
 
@@ -39,6 +40,7 @@ pub async fn test_app() -> Router {
     let state = Arc::new(AppState {
         pool,
         hub: Arc::new(Hub::new()),
+        presence: Presence::disabled(),
         jwt_secret: secrecy::SecretString::from("test-secret-do-not-use-in-prod"),
         github_oauth: None,
         google_oauth: None,

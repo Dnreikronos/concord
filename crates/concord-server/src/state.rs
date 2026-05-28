@@ -7,6 +7,7 @@ use secrecy::SecretString;
 use sqlx::PgPool;
 
 use crate::hub::Hub;
+use crate::presence::Presence;
 
 pub type ConfiguredOAuthClient =
     BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
@@ -14,6 +15,10 @@ pub type ConfiguredOAuthClient =
 pub struct AppState {
     pub pool: PgPool,
     pub hub: Arc<Hub>,
+    /// Durable, TTL-backed presence store (Redis). Best-effort: a disabled or
+    /// unreachable store degrades to in-process-only presence rather than
+    /// breaking connections.
+    pub presence: Presence,
     pub jwt_secret: SecretString,
     pub github_oauth: Option<ConfiguredOAuthClient>,
     pub google_oauth: Option<ConfiguredOAuthClient>,

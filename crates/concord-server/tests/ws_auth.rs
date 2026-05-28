@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use concord_server::hub::Hub;
 use concord_server::jwt;
+use concord_server::presence::Presence;
 use concord_server::routes;
 use concord_server::state::AppState;
 use concord_shared::protocol::{ClientMsg, ErrorCode, ServerMsg, Token};
@@ -38,6 +39,7 @@ async fn spawn_server(auth_timeout: Duration) -> String {
     let state = Arc::new(AppState {
         pool,
         hub: Arc::new(Hub::new()),
+        presence: Presence::disabled(),
         jwt_secret: secrecy::SecretString::from(JWT_SECRET),
         github_oauth: None,
         google_oauth: None,

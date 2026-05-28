@@ -1,5 +1,6 @@
 use std::env;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use secrecy::SecretString;
 
@@ -54,6 +55,13 @@ pub struct Config {
     pub jwt_secret: String,
     pub github_oauth: Option<GitHubOAuthConfig>,
     pub google_oauth: Option<GoogleOAuthConfig>,
+    /// Redis connection URL for the presence store. Optional: when unset the
+    /// server runs with presence persistence disabled.
+    pub redis_url: Option<String>,
+    /// How long a presence entry lives in Redis before expiring. The
+    /// per-connection heartbeat re-arms it at half this interval, so a value
+    /// comfortably larger than one heartbeat is required.
+    pub presence_ttl: Duration,
 }
 
 impl Config {
@@ -86,6 +94,24 @@ impl Config {
         let github_oauth = GitHubOAuthConfig::from_env();
         let google_oauth = GoogleOAuthConfig::from_env();
 
-        Self { database_url, addr, max_connections, jwt_secret, github_oauth, google_oauth }
+        let redis_url = env::var("REDIS_URL").ok().filter(|s| !s.is_empty());
+
+        let presence_ttl = Duration::from_secs(
+            env::var("PRESENCE_TTL_SECONDS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(60),
+        );
+
+        Self {
+            database_url,
+            addr,
+            max_connections,
+            jwt_secret,
+            github_oauth,
+            google_oauth,
+            redis_url,
+            presence_ttl,
+        }
     }
 }
