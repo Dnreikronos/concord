@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use rand::{thread_rng, Rng};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
@@ -39,8 +40,9 @@ impl Backoff {
     fn next_delay(&mut self) -> Duration {
         let delay_ms = self.base_ms.saturating_mul(1u64 << self.attempt.min(6));
         let capped = delay_ms.min(self.max_ms);
+        let jitter = thread_rng().gen_range(0..=capped / 4);
         self.attempt = self.attempt.saturating_add(1);
-        Duration::from_millis(capped)
+        Duration::from_millis(capped + jitter)
     }
 }
 
@@ -293,14 +295,20 @@ mod tests {
     use super::Backoff;
     use std::time::Duration;
 
+    fn assert_in_range(delay: Duration, base_ms: u64) {
+        let ms = delay.as_millis() as u64;
+        assert!(ms >= base_ms, "delay {ms}ms < base {base_ms}ms");
+        assert!(ms <= base_ms + base_ms / 4, "delay {ms}ms > base {base_ms}ms + 25% jitter");
+    }
+
     #[test]
     fn backoff_progression() {
         let mut b = Backoff::new();
-        assert_eq!(b.next_delay(), Duration::from_millis(500));
-        assert_eq!(b.next_delay(), Duration::from_millis(1000));
-        assert_eq!(b.next_delay(), Duration::from_millis(2000));
-        assert_eq!(b.next_delay(), Duration::from_millis(4000));
-        assert_eq!(b.next_delay(), Duration::from_millis(8000));
+        assert_in_range(b.next_delay(), 500);
+        assert_in_range(b.next_delay(), 1000);
+        assert_in_range(b.next_delay(), 2000);
+        assert_in_range(b.next_delay(), 4000);
+        assert_in_range(b.next_delay(), 8000);
     }
 
     #[test]
@@ -309,7 +317,7 @@ mod tests {
         for _ in 0..20 {
             b.next_delay();
         }
-        assert_eq!(b.next_delay(), Duration::from_millis(30_000));
+        assert_in_range(b.next_delay(), 30_000);
     }
 
     #[test]
@@ -319,6 +327,6 @@ mod tests {
         b.next_delay();
         b.reset();
         assert_eq!(b.attempt(), 0);
-        assert_eq!(b.next_delay(), Duration::from_millis(500));
+        assert_in_range(b.next_delay(), 500);
     }
 }

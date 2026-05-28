@@ -23,6 +23,7 @@ serde_json.workspace = true
 futures-util.workspace = true
 uuid.workspace = true
 tracing = "0.1"
+rand.workspace = true
 
 [lints]
 workspace = true
