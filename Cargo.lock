@@ -209,6 +209,14 @@ name = "concord-client"
 version = "0.1.0"
 dependencies = [
  "concord-shared",
+ "futures-util",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -233,7 +241,9 @@ dependencies = [
  "sha2",
  "sqlx",
  "tokio",
+ "tokio-tungstenite",
  "tower",
+ "tracing",
  "uuid",
 ]
 

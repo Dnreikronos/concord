@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use oauth2::basic::BasicClient;
 use oauth2::{EndpointNotSet, EndpointSet};
@@ -17,4 +18,8 @@ pub struct AppState {
     pub github_oauth: Option<ConfiguredOAuthClient>,
     pub google_oauth: Option<ConfiguredOAuthClient>,
     pub http_client: reqwest::Client,
+    /// How long an unauthenticated WebSocket connection may stay open before the
+    /// auth-first handshake must complete. Bounds the soft-DoS surface of idle
+    /// or junk-trickling clients.
+    pub ws_auth_timeout: Duration,
 }

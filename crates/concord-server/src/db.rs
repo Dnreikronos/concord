@@ -415,6 +415,22 @@ pub async fn list_channels_for_server(
     rows.into_iter().map(ChannelRow::into_channel).collect()
 }
 
+pub async fn list_channel_ids_for_user(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Vec<Uuid>, AppError> {
+    let ids = sqlx::query_scalar::<_, Uuid>(
+        "SELECT c.id FROM channels c \
+         JOIN server_members sm ON sm.server_id = c.server_id \
+         WHERE sm.user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(ids)
+}
+
 pub async fn update_channel_if_admin(
     pool: &PgPool,
     channel_id: Uuid,
