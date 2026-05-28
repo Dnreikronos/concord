@@ -1,8 +1,21 @@
+use std::fmt;
+
 use concord_shared::protocol::{ClientMsg, Token};
 use tokio::sync::mpsc;
 
 use super::connection;
 use super::types::{WsCommand, WsEvent};
+
+#[derive(Debug)]
+pub struct SendError;
+
+impl fmt::Display for SendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("background task is gone")
+    }
+}
+
+impl std::error::Error for SendError {}
 
 #[derive(Clone)]
 pub struct ConnectionHandle {
@@ -19,15 +32,15 @@ impl ConnectionHandle {
         (ConnectionHandle { cmd_tx }, evt_rx)
     }
 
-    pub async fn connect(&self, url: String, token: Token) {
-        let _ = self.cmd_tx.send(WsCommand::Connect { url, token }).await;
+    pub async fn connect(&self, url: String, token: Token) -> Result<(), SendError> {
+        self.cmd_tx.send(WsCommand::Connect { url, token }).await.map_err(|_| SendError)
     }
 
-    pub async fn send(&self, msg: ClientMsg) {
-        let _ = self.cmd_tx.send(WsCommand::Send(msg)).await;
+    pub async fn send(&self, msg: ClientMsg) -> Result<(), SendError> {
+        self.cmd_tx.send(WsCommand::Send(msg)).await.map_err(|_| SendError)
     }
 
-    pub async fn shutdown(&self) {
-        let _ = self.cmd_tx.send(WsCommand::Shutdown).await;
+    pub async fn shutdown(&self) -> Result<(), SendError> {
+        self.cmd_tx.send(WsCommand::Shutdown).await.map_err(|_| SendError)
     }
 }

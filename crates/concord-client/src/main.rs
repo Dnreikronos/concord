@@ -10,7 +10,7 @@ async fn main() {
     let token =
         std::env::var("CONCORD_TOKEN").expect("CONCORD_TOKEN env var required");
 
-    handle.connect(url, Token::new(token)).await;
+    handle.connect(url, Token::new(token)).await.expect("background task died");
 
     while let Some(event) = events.recv().await {
         match event {
