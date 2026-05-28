@@ -29,6 +29,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let sender: Sink = Arc::new(tokio::sync::Mutex::new(sender));
 
     let mut user_id: Option<Uuid> = None;
+    let mut conn_id: Option<Uuid> = None;
     let mut fwd_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     while let Some(Ok(frame)) = receiver.next().await {
@@ -55,12 +56,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             ClientMsg::Authenticate { token } => {
                 match authenticate(&state, token.as_str()).await {
                     Ok(uid) => {
-                        if let Some(old) = user_id {
-                            state.hub.unregister(old);
+                        if let Some(old_uid) = user_id {
+                            if let Some(old_cid) = conn_id {
+                                state.hub.unregister(old_uid, old_cid);
+                            }
                         }
                         user_id = Some(uid);
 
-                        let rx = state.hub.register(uid);
+                        let (cid, rx) = state.hub.register(uid);
+                        conn_id = Some(cid);
                         let _ = send_msg(
                             &sender,
                             &ServerMsg::Authenticated { user_id: uid },
@@ -334,7 +338,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     }
 
     if let Some(uid) = user_id {
-        state.hub.unregister(uid);
+        if let Some(cid) = conn_id {
+            state.hub.unregister(uid, cid);
+        }
     }
     if let Some(h) = fwd_handle {
         h.abort();
