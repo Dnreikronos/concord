@@ -38,6 +38,8 @@ reqwest = { workspace = true }
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros", "sync", "time"] }
+tokio-tungstenite = { workspace = true }
 
 [lints]
 workspace = true
