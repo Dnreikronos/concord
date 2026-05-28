@@ -9,6 +9,8 @@ use concord_shared::protocol::{ClientMsg, ErrorCode, ServerMsg, Token};
 
 use super::types::{ConnState, WsCommand, WsEvent};
 
+const OUTGOING_BUFFER_CAP: usize = 1024;
+
 struct Backoff {
     attempt: u32,
     base_ms: u64,
@@ -56,7 +58,11 @@ pub(crate) async fn run(mut cmd_rx: mpsc::Receiver<WsCommand>, evt_tx: mpsc::Sen
                     state = ConnState::Connecting;
                 }
                 Some(WsCommand::Send(msg)) => {
-                    outgoing_buffer.push(msg);
+                    if outgoing_buffer.len() < OUTGOING_BUFFER_CAP {
+                        outgoing_buffer.push(msg);
+                    } else {
+                        warn!("outgoing buffer full, dropping message");
+                    }
                 }
                 Some(WsCommand::Shutdown) | None => {
                     let _ = evt_tx.send(WsEvent::Closed).await;
@@ -254,7 +260,11 @@ pub(crate) async fn run(mut cmd_rx: mpsc::Receiver<WsCommand>, evt_tx: mpsc::Sen
                                 state = ConnState::Connecting;
                             }
                             Some(WsCommand::Send(msg)) => {
-                                outgoing_buffer.push(msg);
+                                if outgoing_buffer.len() < OUTGOING_BUFFER_CAP {
+                                    outgoing_buffer.push(msg);
+                                } else {
+                                    warn!("outgoing buffer full, dropping message");
+                                }
                             }
                             Some(WsCommand::Shutdown) | None => {
                                 let _ = evt_tx.send(WsEvent::Closed).await;
