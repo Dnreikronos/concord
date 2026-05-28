@@ -13,6 +13,7 @@ use concord_shared::protocol::{ClientMsg, ErrorCode, ServerMsg};
 use concord_shared::validation::validate_message_content;
 
 use secrecy::ExposeSecret;
+use tracing::warn;
 
 use crate::db;
 use crate::state::AppState;
@@ -49,9 +50,17 @@ async fn wait_for_auth(
     loop {
         let frame = match timeout(AUTH_TIMEOUT, receiver.next()).await {
             Ok(Some(Ok(frame))) => frame,
-            Ok(Some(Err(_))) | Ok(None) | Err(_) => {
+            Err(_) => {
                 let _ = send_error(sender, ErrorCode::Unauthorized, "auth timeout")
                     .await;
+                return None;
+            }
+            Ok(Some(Err(_))) => {
+                let _ = send_error(sender, ErrorCode::Internal, "websocket error during auth")
+                    .await;
+                return None;
+            }
+            Ok(None) => {
                 return None;
             }
         };
@@ -82,9 +91,14 @@ async fn wait_for_auth(
                 let (conn_id, rx) = state.hub.register(uid);
                 let _ = send_msg(sender, &ServerMsg::Authenticated { user_id: uid }).await;
 
-                if let Ok(channel_ids) = db::list_channel_ids_for_user(&state.pool, uid).await {
-                    for ch in channel_ids {
-                        state.hub.subscribe(uid, ch);
+                match db::list_channel_ids_for_user(&state.pool, uid).await {
+                    Ok(channel_ids) => {
+                        for ch in channel_ids {
+                            state.hub.subscribe(uid, ch);
+                        }
+                    }
+                    Err(e) => {
+                        warn!(user_id = %uid, error = ?e, "failed to load channel subscriptions");
                     }
                 }
 
