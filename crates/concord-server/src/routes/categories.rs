@@ -79,6 +79,14 @@ async fn rename_category(
     let name = req.name.trim();
     validate_category_name(name)?;
 
+    let server_id = db::get_category_server_id(&state.pool, category_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    if !db::is_server_admin(&state.pool, server_id, auth.user_id).await? {
+        return Err(AppError::Forbidden);
+    }
+
     let category =
         db::rename_category_if_admin(&state.pool, category_id, auth.user_id, name).await?;
 
@@ -90,6 +98,14 @@ async fn delete_category(
     auth: AuthUser,
     Path(category_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
+    let server_id = db::get_category_server_id(&state.pool, category_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    if !db::is_server_admin(&state.pool, server_id, auth.user_id).await? {
+        return Err(AppError::Forbidden);
+    }
+
     let deleted =
         db::delete_category_if_admin(&state.pool, category_id, auth.user_id).await?;
 

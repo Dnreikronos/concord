@@ -792,7 +792,7 @@ pub async fn delete_category_if_admin(
     Ok(result.rows_affected() > 0)
 }
 
-pub async fn get_category_server(
+pub async fn get_category_server_id(
     pool: &PgPool,
     category_id: Uuid,
 ) -> Result<Option<Uuid>, AppError> {
