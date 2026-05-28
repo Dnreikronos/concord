@@ -80,6 +80,83 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 }
             }
 
+            ClientMsg::SendMessage {
+                channel_id,
+                content,
+            } => {
+                let Some(uid) = user_id else {
+                    let _ = send_error(
+                        &sender,
+                        ErrorCode::Unauthorized,
+                        "not authenticated",
+                    )
+                    .await;
+                    continue;
+                };
+
+                if let Err(e) = validate_message_content(&content) {
+                    let _ =
+                        send_error(&sender, ErrorCode::BadRequest, &e.to_string())
+                            .await;
+                    continue;
+                }
+
+                let server_id = match db::get_channel_server(&state.pool, channel_id).await {
+                    Ok(Some(sid)) => sid,
+                    Ok(None) => {
+                        let _ = send_error(
+                            &sender,
+                            ErrorCode::NotFound,
+                            "channel not found",
+                        )
+                        .await;
+                        continue;
+                    }
+                    Err(_) => {
+                        let _ = send_error(&sender, ErrorCode::Internal, "internal error").await;
+                        continue;
+                    }
+                };
+
+                if !db::is_server_member(&state.pool, server_id, uid)
+                    .await
+                    .unwrap_or(false)
+                {
+                    let _ = send_error(
+                        &sender,
+                        ErrorCode::Forbidden,
+                        "not a member of this server",
+                    )
+                    .await;
+                    continue;
+                }
+
+                let inserted = match db::insert_message(
+                    &state.pool,
+                    channel_id,
+                    uid,
+                    &content,
+                )
+                .await
+                {
+                    Ok(row) => row,
+                    Err(_) => {
+                        let _ = send_error(&sender, ErrorCode::Internal, "internal error").await;
+                        continue;
+                    }
+                };
+
+                state.hub.broadcast_to_channel(
+                    channel_id,
+                    &ServerMsg::NewMessage {
+                        id: inserted.id,
+                        channel_id,
+                        author_id: Some(uid),
+                        content,
+                    },
+                );
+            }
+
             ClientMsg::EditMessage {
                 message_id,
                 content,
@@ -165,6 +242,84 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     )
                     .await;
                 }
+            }
+
+            ClientMsg::JoinChannel { channel_id } => {
+                let Some(uid) = user_id else {
+                    let _ = send_error(
+                        &sender,
+                        ErrorCode::Unauthorized,
+                        "not authenticated",
+                    )
+                    .await;
+                    continue;
+                };
+
+                let server_id = match db::get_channel_server(&state.pool, channel_id).await {
+                    Ok(Some(sid)) => sid,
+                    Ok(None) => {
+                        let _ = send_error(
+                            &sender,
+                            ErrorCode::NotFound,
+                            "channel not found",
+                        )
+                        .await;
+                        continue;
+                    }
+                    Err(_) => {
+                        let _ = send_error(&sender, ErrorCode::Internal, "internal error").await;
+                        continue;
+                    }
+                };
+
+                if !db::is_server_member(&state.pool, server_id, uid)
+                    .await
+                    .unwrap_or(false)
+                {
+                    let _ = send_error(
+                        &sender,
+                        ErrorCode::Forbidden,
+                        "not a member of this server",
+                    )
+                    .await;
+                    continue;
+                }
+
+                state.hub.subscribe(uid, channel_id);
+            }
+
+            ClientMsg::LeaveChannel { channel_id } => {
+                let Some(uid) = user_id else {
+                    let _ = send_error(
+                        &sender,
+                        ErrorCode::Unauthorized,
+                        "not authenticated",
+                    )
+                    .await;
+                    continue;
+                };
+
+                state.hub.unsubscribe(uid, channel_id);
+            }
+
+            ClientMsg::StartTyping { channel_id } => {
+                let Some(uid) = user_id else {
+                    let _ = send_error(
+                        &sender,
+                        ErrorCode::Unauthorized,
+                        "not authenticated",
+                    )
+                    .await;
+                    continue;
+                };
+
+                state.hub.broadcast_to_channel(
+                    channel_id,
+                    &ServerMsg::UserTyping {
+                        channel_id,
+                        user_id: uid,
+                    },
+                );
             }
 
             _ => {
