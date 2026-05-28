@@ -10,6 +10,7 @@ use uuid::Uuid;
 use concord_server::hub::Hub;
 use concord_server::routes;
 use concord_server::state::AppState;
+use concord_server::typing::{Typing, TYPING_TTL};
 
 static POOL: tokio::sync::OnceCell<PgPool> = tokio::sync::OnceCell::const_new();
 
@@ -36,9 +37,12 @@ async fn shared_pool() -> &'static PgPool {
 
 pub async fn test_app() -> Router {
     let pool = shared_pool().await.clone();
+    let hub = Arc::new(Hub::new());
+    let typing = Arc::new(Typing::new(Arc::clone(&hub), TYPING_TTL, None));
     let state = Arc::new(AppState {
         pool,
-        hub: Arc::new(Hub::new()),
+        hub,
+        typing,
         jwt_secret: secrecy::SecretString::from("test-secret-do-not-use-in-prod"),
         github_oauth: None,
         google_oauth: None,

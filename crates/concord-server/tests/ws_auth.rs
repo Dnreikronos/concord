@@ -12,6 +12,7 @@ use concord_server::hub::Hub;
 use concord_server::jwt;
 use concord_server::routes;
 use concord_server::state::AppState;
+use concord_server::typing::{Typing, TYPING_TTL};
 use concord_shared::protocol::{ClientMsg, ErrorCode, ServerMsg, Token};
 
 use futures_util::{SinkExt, StreamExt};
@@ -35,9 +36,12 @@ async fn spawn_server(auth_timeout: Duration) -> String {
         .connect_lazy("postgres://postgres@127.0.0.1:1/concord_nonexistent")
         .expect("lazy pool construction should not fail");
 
+    let hub = Arc::new(Hub::new());
+    let typing = Arc::new(Typing::new(Arc::clone(&hub), TYPING_TTL, None));
     let state = Arc::new(AppState {
         pool,
-        hub: Arc::new(Hub::new()),
+        hub,
+        typing,
         jwt_secret: secrecy::SecretString::from(JWT_SECRET),
         github_oauth: None,
         google_oauth: None,

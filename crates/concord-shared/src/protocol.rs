@@ -39,6 +39,7 @@ pub enum ClientMsg {
     JoinChannel { channel_id: Uuid },
     LeaveChannel { channel_id: Uuid },
     StartTyping { channel_id: Uuid },
+    StopTyping { channel_id: Uuid },
 
     // Servers
     CreateServer { name: String },
@@ -76,7 +77,11 @@ pub enum ServerMsg {
     },
 
     // Typing
-    UserTyping {
+    TypingStarted {
+        channel_id: Uuid,
+        user_id: Uuid,
+    },
+    TypingStopped {
         channel_id: Uuid,
         user_id: Uuid,
     },

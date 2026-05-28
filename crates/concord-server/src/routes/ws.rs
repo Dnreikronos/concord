@@ -337,17 +337,11 @@ async fn handle_authenticated(
                     continue;
                 }
 
-                if !state.hub.check_typing_cooldown(uid, channel_id) {
-                    continue;
-                }
+                state.typing.start(uid, channel_id).await;
+            }
 
-                state.hub.broadcast_to_channel(
-                    channel_id,
-                    &ServerMsg::UserTyping {
-                        channel_id,
-                        user_id: uid,
-                    },
-                );
+            ClientMsg::StopTyping { channel_id } => {
+                state.typing.stop(uid, channel_id).await;
             }
 
             _ => {
