@@ -21,6 +21,5 @@ pub enum WsEvent {
 pub(crate) enum ConnState {
     Disconnected,
     Connecting,
-    Authenticating,
     Reconnecting,
 }

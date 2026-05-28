@@ -67,12 +67,8 @@ pub(crate) async fn run(mut cmd_rx: mpsc::Receiver<WsCommand>, evt_tx: mpsc::Sen
                 let ws_url = url.as_ref().unwrap();
                 match tokio_tungstenite::connect_async(ws_url).await {
                     Ok((ws_stream, _)) => {
-                        backoff.reset();
-
                         let (mut sink, mut stream) = ws_stream.split();
 
-                        // -- Authenticating inline --
-                        state = ConnState::Authenticating;
                         let auth_msg = ClientMsg::Authenticate {
                             token: token.clone().unwrap(),
                         };
@@ -98,31 +94,34 @@ pub(crate) async fn run(mut cmd_rx: mpsc::Receiver<WsCommand>, evt_tx: mpsc::Sen
                             continue 'outer;
                         }
 
-                        let auth_response = match stream.next().await {
-                            Some(Ok(Message::Text(t))) => t,
-                            Some(Ok(Message::Close(_))) | None => {
-                                let _ = evt_tx
-                                    .send(WsEvent::Disconnected {
-                                        reason: "connection closed during auth".into(),
-                                    })
-                                    .await;
-                                state = ConnState::Reconnecting;
-                                continue 'outer;
+                        let auth_response = loop {
+                            match stream.next().await {
+                                Some(Ok(Message::Text(t))) => break t,
+                                Some(Ok(Message::Close(_))) | None => {
+                                    let _ = evt_tx
+                                        .send(WsEvent::Disconnected {
+                                            reason: "connection closed during auth".into(),
+                                        })
+                                        .await;
+                                    state = ConnState::Reconnecting;
+                                    continue 'outer;
+                                }
+                                Some(Err(e)) => {
+                                    let _ = evt_tx
+                                        .send(WsEvent::Disconnected {
+                                            reason: e.to_string(),
+                                        })
+                                        .await;
+                                    state = ConnState::Reconnecting;
+                                    continue 'outer;
+                                }
+                                Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_))) => continue,
                             }
-                            Some(Err(e)) => {
-                                let _ = evt_tx
-                                    .send(WsEvent::Disconnected {
-                                        reason: e.to_string(),
-                                    })
-                                    .await;
-                                state = ConnState::Reconnecting;
-                                continue 'outer;
-                            }
-                            _ => continue 'outer,
                         };
 
                         match serde_json::from_str::<ServerMsg>(&auth_response) {
                             Ok(ServerMsg::Authenticated { user_id }) => {
+                                backoff.reset();
                                 let _ =
                                     evt_tx.send(WsEvent::Connected { user_id }).await;
                             }
@@ -226,10 +225,6 @@ pub(crate) async fn run(mut cmd_rx: mpsc::Receiver<WsCommand>, evt_tx: mpsc::Sen
                         state = ConnState::Reconnecting;
                     }
                 }
-            }
-
-            ConnState::Authenticating => {
-                unreachable!("handled inline within Connecting arm")
             }
 
             ConnState::Reconnecting => {
