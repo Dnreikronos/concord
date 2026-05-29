@@ -15,6 +15,11 @@
 -- principle outlive the channel. Channel deletion is rare and owner/admin
 -- gated, so this narrow race is acceptable; the alternative (a shared channel
 -- registry that both tables key into) is a far larger schema change.
+--
+-- Second trade-off: the cascade is a per-row DELETE trigger, so a TRUNCATE of
+-- channels or dm_channels bypasses it and orphans their messages (the old FK
+-- would have blocked the TRUNCATE outright). The app only ever deletes these
+-- rows individually, never truncates, so this stays theoretical.
 
 ALTER TABLE messages DROP CONSTRAINT messages_channel_id_fkey;
 
