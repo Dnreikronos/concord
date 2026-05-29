@@ -166,6 +166,7 @@ async fn dm_message_persists_and_broadcasts_to_author() {
     let url = spawn_server(pool.clone()).await;
     let mut ws = connect_authed(&url, author).await;
 
+    let before = chrono::Utc::now();
     send(
         &mut ws,
         &ClientMsg::SendDirectMessage {
@@ -181,11 +182,17 @@ async fn dm_message_persists_and_broadcasts_to_author() {
             dm_channel_id,
             author_id,
             content,
-            ..
+            created_at,
         } => {
             assert_eq!(dm_channel_id, dm);
             assert_eq!(author_id, Some(author));
             assert_eq!(content, "hello dm");
+
+            // The broadcast carries the server-stamped time, not a client
+            // guess: it lands within a sane window of the send, never the epoch
+            // default a missing or mis-wired field would produce.
+            assert!(created_at >= before - chrono::Duration::seconds(5));
+            assert!(created_at <= chrono::Utc::now() + chrono::Duration::seconds(5));
 
             // The broadcast id must point at a row actually persisted under the
             // DM channel id — proves DM messages land in the shared table.
