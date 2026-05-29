@@ -175,20 +175,18 @@ async fn add_member(
         }));
     }
 
-    if db::is_dm_member(&state.pool, dm_channel_id, req.user_id).await? {
-        return Err(AppError::AlreadyDmMember);
-    }
-
-    if db::dm_member_count(&state.pool, dm_channel_id).await? as usize >= DM_GROUP_MAX {
-        return Err(AppError::Validation(ValidationError::InvalidValue {
+    // Duplicate-check, cap-check, and insert run together behind a per-channel
+    // advisory lock so concurrent adds can't both pass `count < max` and push
+    // the group over DM_GROUP_MAX (or both insert the same user and 500 on the
+    // PK). See db::add_dm_member_checked.
+    match db::add_dm_member_checked(&state.pool, dm_channel_id, req.user_id, DM_GROUP_MAX).await? {
+        db::AddMemberOutcome::Added => Ok(StatusCode::NO_CONTENT),
+        db::AddMemberOutcome::AlreadyMember => Err(AppError::AlreadyDmMember),
+        db::AddMemberOutcome::Full => Err(AppError::Validation(ValidationError::InvalidValue {
             field: "user_id",
             reason: "a group DM allows at most 10 participants",
-        }));
+        })),
     }
-
-    db::insert_dm_member(&state.pool, dm_channel_id, req.user_id).await?;
-
-    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `DELETE /api/dms/{id}/members/{user_id}` — remove a member.

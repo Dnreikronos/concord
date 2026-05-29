@@ -1322,6 +1322,67 @@ pub async fn dm_member_count(pool: &PgPool, dm_channel_id: Uuid) -> Result<i64, 
     Ok(count)
 }
 
+/// Outcome of an attempt to add a member to a group DM, decided inside the
+/// serialized critical section so the caller can map it to a status code.
+pub enum AddMemberOutcome {
+    Added,
+    AlreadyMember,
+    Full,
+}
+
+/// Add `user_id` to a group DM atomically: the duplicate-membership check, the
+/// `max` head-count check, and the insert all run in one transaction behind a
+/// per-channel advisory lock (mirrors [`find_or_create_dm_channel`]). Without
+/// the lock two concurrent adds can both read `count < max` and both insert,
+/// pushing the group over its cap; the `dm_members` PK only stops re-adding the
+/// *same* user, not over-counting distinct users.
+pub async fn add_dm_member_checked(
+    pool: &PgPool,
+    dm_channel_id: Uuid,
+    user_id: Uuid,
+    max: usize,
+) -> Result<AddMemberOutcome, AppError> {
+    let mut tx = pool.begin().await.map_err(|e| AppError::Internal(e.to_string()))?;
+
+    // One bigint lock id per channel; serializes concurrent adds on this DM.
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(\
+             ('x' || substr(md5($1::text), 1, 16))::bit(64)::bigint)",
+    )
+    .bind(dm_channel_id)
+    .execute(&mut *tx)
+    .await?;
+
+    let already = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM dm_members WHERE dm_channel_id = $1 AND user_id = $2)",
+    )
+    .bind(dm_channel_id)
+    .bind(user_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if already {
+        tx.rollback().await.map_err(|e| AppError::Internal(e.to_string()))?;
+        return Ok(AddMemberOutcome::AlreadyMember);
+    }
+
+    let count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM dm_members WHERE dm_channel_id = $1",
+    )
+    .bind(dm_channel_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if count as usize >= max {
+        tx.rollback().await.map_err(|e| AppError::Internal(e.to_string()))?;
+        return Ok(AddMemberOutcome::Full);
+    }
+
+    insert_dm_member(&mut *tx, dm_channel_id, user_id).await?;
+
+    tx.commit().await.map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(AddMemberOutcome::Added)
+}
+
 /// Remove `target` from a group DM and repair invariants in one transaction:
 /// if the departing member owned the group, ownership passes to the
 /// earliest-joined survivor; if no members remain, the empty channel is
