@@ -102,6 +102,17 @@ pub fn authed_get(uri: &str, user_id: Uuid) -> Request<Body> {
         .unwrap()
 }
 
+/// A `POST uri` request with a JSON `body`, authenticated as `user_id`.
+pub fn authed_post(uri: &str, user_id: Uuid, body: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("authorization", auth_header(user_id))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_owned()))
+        .unwrap()
+}
+
 /// Insert a password-auth user (optionally with an avatar). Returns its id and
 /// generated username.
 pub async fn seed_user(pool: &PgPool, avatar_url: Option<&str>) -> (Uuid, String) {
