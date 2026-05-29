@@ -199,6 +199,29 @@ pub struct DmMember {
     pub joined_at: DateTime<Utc>,
 }
 
+/// Public profile of a DM participant, embedded in a `DmChannelInfo`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DmParticipant {
+    pub user_id: Uuid,
+    pub username: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
+}
+
+/// A DM channel returned with its participants resolved, as produced by the
+/// DM-creation endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DmChannelInfo {
+    pub id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub is_group: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub participants: Vec<DmParticipant>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerInvite {
     pub id: Uuid,
