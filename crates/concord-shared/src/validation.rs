@@ -17,6 +17,13 @@ pub const ICON_URL_MAX: usize = 2048;
 pub const CHANNEL_TOPIC_MAX: usize = 1024;
 pub const INVITE_CODE_MIN: usize = 6;
 pub const INVITE_CODE_MAX: usize = 16;
+pub const DM_NAME_MIN: usize = 1;
+pub const DM_NAME_MAX: usize = 100;
+// Total participant count for a group DM, the creator included. A 2-person
+// group is the floor (anything smaller is a 1:1 DM, created elsewhere); 10 is
+// the ceiling enforced on both creation and later member additions.
+pub const DM_GROUP_MIN: usize = 2;
+pub const DM_GROUP_MAX: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
@@ -164,6 +171,12 @@ pub fn validate_invite_code(s: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
+/// Validate an optional group-DM name. Names are optional at the protocol
+/// level; this only runs when one is supplied.
+pub fn validate_dm_name(s: &str) -> Result<(), ValidationError> {
+    validate_name(s, "dm name", DM_NAME_MIN, DM_NAME_MAX)
+}
+
 fn validate_name(
     s: &str,
     field: &'static str,
@@ -262,5 +275,14 @@ mod tests {
         assert!(validate_password("12345678").is_ok());
         assert!(validate_password(&"a".repeat(128)).is_ok());
         assert!(validate_password(&"a".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn dm_name_validation() {
+        assert!(validate_dm_name("the group chat").is_ok());
+        assert!(validate_dm_name("").is_err());
+        assert!(validate_dm_name("   ").is_err());
+        assert!(validate_dm_name(&"a".repeat(100)).is_ok());
+        assert!(validate_dm_name(&"a".repeat(101)).is_err());
     }
 }

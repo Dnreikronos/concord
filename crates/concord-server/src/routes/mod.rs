@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod categories;
 pub mod channels;
+pub mod dms;
 pub mod oauth;
 pub mod servers;
 pub mod ws;
@@ -20,6 +21,7 @@ pub fn all_routes() -> Router<Arc<AppState>> {
         .nest("/api/servers", servers::router())
         .nest("/api/channels", channels::router())
         .nest("/api/categories", categories::router())
+        .nest("/api/dms", dms::router())
         .route("/ws", get(ws::ws_handler))
         .layer(DefaultBodyLimit::max(1024 * 1024))
 }

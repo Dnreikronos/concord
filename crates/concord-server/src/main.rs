@@ -4,6 +4,7 @@ use sqlx::postgres::PgPoolOptions;
 
 use concord_server::config::Config;
 use concord_server::hub::Hub;
+use concord_server::presence::Presence;
 use concord_server::routes;
 use concord_server::state::AppState;
 use concord_server::typing::{self, Typing, SWEEP_INTERVAL, TYPING_TTL};
@@ -46,6 +47,20 @@ async fn main() {
             .set_redirect_uri(RedirectUrl::new(g.redirect_url).unwrap())
     });
 
+    let presence = match &cfg.redis_url {
+        Some(url) => match Presence::connect(url, cfg.presence_ttl).await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("redis unavailable, presence persistence disabled: {e}");
+                Presence::disabled()
+            }
+        },
+        None => {
+            eprintln!("REDIS_URL not set, presence persistence disabled");
+            Presence::disabled()
+        }
+    };
+
     // Optional Redis: a connection manager for publishing typing events and a
     // raw client for the pub/sub subscriber. On any failure we log and fall
     // back to in-process fan-out rather than refusing to start.
@@ -76,6 +91,7 @@ async fn main() {
     let state = Arc::new(AppState {
         pool,
         hub,
+        presence,
         typing,
         jwt_secret: cfg.jwt_secret.into(),
         github_oauth,

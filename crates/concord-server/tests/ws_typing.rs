@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use concord_server::hub::Hub;
+use concord_server::presence::Presence;
 use concord_server::state::AppState;
 use concord_server::typing::Typing;
 use concord_server::{db, jwt, routes};
@@ -81,6 +82,7 @@ async fn setup(ttl: Duration) -> Fixture {
         pool,
         hub,
         typing,
+        presence: Presence::disabled(),
         jwt_secret: secrecy::SecretString::from(JWT_SECRET),
         github_oauth: None,
         google_oauth: None,

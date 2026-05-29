@@ -1,10 +1,11 @@
-//! Integration tests for `SendMessage` over WebSocket (issue #16).
+//! Integration tests for `SendDirectMessage` over WebSocket (issue #23).
 //!
-//! Unlike `ws_auth.rs`, these exercise the full post-auth path — channel-access
-//! checks, message insertion, and the channel broadcast — so they need a real
-//! Postgres. Set `DATABASE_URL` to a throwaway test database; each test builds
-//! its own pool and runs migrations (idempotent). Tests seed their own
-//! server/channel with random identifiers, so they're safe to run in parallel.
+//! These exercise the full post-auth DM path — membership validation, message
+//! insertion into the shared `messages` table, and the participant-only
+//! broadcast — so they need a real Postgres. Set `DATABASE_URL` to a throwaway
+//! test database; each test builds its own pool and runs migrations
+//! (idempotent). Tests seed their own users and DM channels with random
+//! identifiers, so they're safe to run in parallel.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,16 +31,8 @@ const JWT_SECRET: &str = "test-secret-do-not-use-in-prod";
 
 type ClientWs = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
-/// Build a pool owned by the calling test's runtime.
-///
-/// Each `#[tokio::test]` spins up its own current-thread runtime, and sqlx
-/// binds a connection to whichever runtime opened it. A `static` pool shared
-/// across tests therefore strands connections the moment an early test's
-/// runtime is dropped, starving later tests into the acquire timeout. Giving
-/// every test a fresh pool keeps each pool's lifetime inside one runtime.
-///
-/// Migrations are idempotent and sqlx guards them with an advisory lock, so
-/// re-running per test is cheap and safe even when tests run in parallel.
+/// Build a pool owned by the calling test's runtime. See `ws_send_message.rs`
+/// for why each test gets its own pool rather than sharing a `static`.
 async fn setup_pool() -> PgPool {
     let database_url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for integration tests");
@@ -97,17 +90,22 @@ async fn send(ws: &mut ClientWs, msg: &ClientMsg) {
     ws.send(Message::Text(text.into())).await.unwrap();
 }
 
-/// Read frames until a `ServerMsg` text frame arrives (skipping control frames),
-/// bounded by a timeout so a hung test fails fast. The window is generous
-/// because these tests run in parallel against a real DB: cold-start
-/// congestion (opening pools, running migrations, several tests firing at
-/// once) can briefly delay a round-trip past a tighter bound.
+/// Read frames until a non-presence `ServerMsg` text frame arrives, bounded by
+/// a timeout so a hung test fails fast.
+///
+/// Presence frames (the connect-time `PresenceSnapshot` and any
+/// `UserStatusChanged`) are emitted independently of DM traffic, so they're
+/// skipped here — these tests assert on the DM messages they actually sent.
 async fn recv(ws: &mut ClientWs) -> ServerMsg {
     let fut = async {
         loop {
             match ws.next().await {
                 Some(Ok(Message::Text(t))) => {
-                    return serde_json::from_str::<ServerMsg>(&t).unwrap()
+                    match serde_json::from_str::<ServerMsg>(&t).unwrap() {
+                        ServerMsg::PresenceSnapshot { .. }
+                        | ServerMsg::UserStatusChanged { .. } => continue,
+                        other => return other,
+                    }
                 }
                 Some(Ok(_)) => continue,
                 other => panic!("expected text frame, got {other:?}"),
@@ -149,136 +147,111 @@ async fn seed_user(pool: &PgPool) -> Uuid {
         .id
 }
 
-/// Insert a server owned by `owner_id`, register `owner_id` as a member, and
-/// add one text channel. Returns `(server_id, channel_id)`.
-async fn seed_server_with_channel(pool: &PgPool, owner_id: Uuid) -> (Uuid, Uuid) {
-    let server = db::insert_server(pool, "test-server", None, owner_id)
+/// Open a 1:1 DM between two users and return its channel id.
+async fn seed_dm(pool: &PgPool, a: Uuid, b: Uuid) -> Uuid {
+    db::find_or_create_dm_channel(pool, a, b)
         .await
-        .expect("insert server");
-    db::insert_server_member(pool, server.id, owner_id, "member")
-        .await
-        .expect("insert server member");
-    let channel = db::insert_channel(pool, server.id, "general", None, "text")
-        .await
-        .expect("insert channel");
-    (server.id, channel.id)
+        .expect("create dm channel")
+        .0
+        .id
 }
 
 #[tokio::test]
-async fn send_message_persists_and_broadcasts_to_author() {
+async fn dm_message_persists_and_broadcasts_to_author() {
     let pool = setup_pool().await;
     let author = seed_user(&pool).await;
-    let (_server, channel) = seed_server_with_channel(&pool, author).await;
+    let other = seed_user(&pool).await;
+    let dm = seed_dm(&pool, author, other).await;
 
     let url = spawn_server(pool.clone()).await;
     let mut ws = connect_authed(&url, author).await;
 
     send(
         &mut ws,
-        &ClientMsg::SendMessage {
-            channel_id: channel,
-            content: "hello world".into(),
+        &ClientMsg::SendDirectMessage {
+            dm_channel_id: dm,
+            content: "hello dm".into(),
         },
     )
     .await;
 
     match recv(&mut ws).await {
-        ServerMsg::NewMessage {
+        ServerMsg::NewDirectMessage {
             id,
-            channel_id,
+            dm_channel_id,
             author_id,
             content,
         } => {
-            assert_eq!(channel_id, channel);
+            assert_eq!(dm_channel_id, dm);
             assert_eq!(author_id, Some(author));
-            assert_eq!(content, "hello world");
+            assert_eq!(content, "hello dm");
 
-            // The broadcast id must point at a row actually persisted in this
-            // channel — proves the insert happened, not just the fan-out.
+            // The broadcast id must point at a row actually persisted under the
+            // DM channel id — proves DM messages land in the shared table.
             let stored = db::get_message_channel(&pool, id).await.unwrap();
-            assert_eq!(stored, Some(channel));
+            assert_eq!(stored, Some(dm));
         }
-        other => panic!("expected NewMessage, got {other:?}"),
+        other => panic!("expected NewDirectMessage, got {other:?}"),
     }
 }
 
 #[tokio::test]
-async fn send_message_reaches_other_channel_subscriber() {
+async fn dm_message_reaches_other_participant() {
     let pool = setup_pool().await;
-    let author = seed_user(&pool).await;
-    let other = seed_user(&pool).await;
-    let (server, channel) = seed_server_with_channel(&pool, author).await;
-    // `other` joins the same server, so the auth-time subscription wires them
-    // into the channel's broadcast set.
-    db::insert_server_member(&pool, server, other, "member")
-        .await
-        .expect("insert second member");
+    let a = seed_user(&pool).await;
+    let b = seed_user(&pool).await;
+    let dm = seed_dm(&pool, a, b).await;
 
     let url = spawn_server(pool.clone()).await;
+    // DM fan-out targets members by user id (not a channel subscription), and a
+    // connection is registered before its `Authenticated` ack, so both sockets
+    // are in the delivery set the moment `connect_authed` returns.
+    let mut ws_a = connect_authed(&url, a).await;
+    let mut ws_b = connect_authed(&url, b).await;
 
-    // The server subscribes a connection only after it sends `Authenticated`
-    // (ws.rs), so returning from the handshake doesn't prove a client is in the
-    // broadcast set yet. Connect `other` first and round-trip its own message:
-    // receiving that echo proves `other` is subscribed, since the server
-    // subscribes before reading any post-auth frame. Connect the author only
-    // afterward, so the warm-up never lands on the author's socket.
-    let mut other_ws = connect_authed(&url, other).await;
     send(
-        &mut other_ws,
-        &ClientMsg::SendMessage {
-            channel_id: channel,
-            content: "warmup".into(),
-        },
-    )
-    .await;
-    match recv(&mut other_ws).await {
-        ServerMsg::NewMessage { content, .. } => assert_eq!(content, "warmup"),
-        other => panic!("expected warmup NewMessage, got {other:?}"),
-    }
-
-    let mut author_ws = connect_authed(&url, author).await;
-    send(
-        &mut author_ws,
-        &ClientMsg::SendMessage {
-            channel_id: channel,
+        &mut ws_a,
+        &ClientMsg::SendDirectMessage {
+            dm_channel_id: dm,
             content: "ping".into(),
         },
     )
     .await;
 
-    // Both the author and the already-subscribed bystander must observe it.
-    for ws in [&mut author_ws, &mut other_ws] {
+    // Author echo and the recipient both observe the message.
+    for ws in [&mut ws_a, &mut ws_b] {
         match recv(ws).await {
-            ServerMsg::NewMessage {
-                channel_id,
+            ServerMsg::NewDirectMessage {
+                dm_channel_id,
                 author_id,
                 content,
                 ..
             } => {
-                assert_eq!(channel_id, channel);
-                assert_eq!(author_id, Some(author));
+                assert_eq!(dm_channel_id, dm);
+                assert_eq!(author_id, Some(a));
                 assert_eq!(content, "ping");
             }
-            other => panic!("expected NewMessage, got {other:?}"),
+            other => panic!("expected NewDirectMessage, got {other:?}"),
         }
     }
 }
 
 #[tokio::test]
-async fn send_message_by_non_member_is_forbidden() {
+async fn dm_message_by_non_member_is_forbidden() {
     let pool = setup_pool().await;
-    let owner = seed_user(&pool).await;
-    let (_server, channel) = seed_server_with_channel(&pool, owner).await;
+    let a = seed_user(&pool).await;
+    let b = seed_user(&pool).await;
+    let dm = seed_dm(&pool, a, b).await;
 
-    // A real, registered user who simply isn't a member of the server.
+    // A real, registered user who isn't a participant of the DM.
     let outsider = seed_user(&pool).await;
     let url = spawn_server(pool.clone()).await;
     let mut ws = connect_authed(&url, outsider).await;
 
     send(
         &mut ws,
-        &ClientMsg::SendMessage {
-            channel_id: channel,
+        &ClientMsg::SendDirectMessage {
+            dm_channel_id: dm,
             content: "intruder".into(),
         },
     )
@@ -287,27 +260,34 @@ async fn send_message_by_non_member_is_forbidden() {
     match recv(&mut ws).await {
         ServerMsg::Error { code, message } => {
             assert_eq!(code, ErrorCode::Forbidden);
-            assert_eq!(message, "not a member of this server");
+            assert_eq!(message, "not a member of this DM");
         }
         other => panic!("expected Forbidden error, got {other:?}"),
     }
+
+    // Nothing should have been persisted for the rejected send.
+    let count = db::list_channel_messages(&pool, dm, None, 10)
+        .await
+        .unwrap()
+        .len();
+    assert_eq!(count, 0, "non-member send must not persist a row");
 }
 
 #[tokio::test]
-async fn send_message_to_unknown_channel_is_not_found() {
+async fn dm_message_to_unknown_channel_is_forbidden() {
     let pool = setup_pool().await;
-    let author = seed_user(&pool).await;
-    // Seed a real server/channel so the member is genuine, then aim at a
-    // channel id that doesn't exist.
-    let (_server, _channel) = seed_server_with_channel(&pool, author).await;
+    let user = seed_user(&pool).await;
 
     let url = spawn_server(pool.clone()).await;
-    let mut ws = connect_authed(&url, author).await;
+    let mut ws = connect_authed(&url, user).await;
 
+    // A channel id with no DM behind it has no members, so the membership check
+    // rejects it the same way it rejects a real DM the caller isn't in — we
+    // never confirm whether the channel exists.
     send(
         &mut ws,
-        &ClientMsg::SendMessage {
-            channel_id: Uuid::new_v4(),
+        &ClientMsg::SendDirectMessage {
+            dm_channel_id: Uuid::new_v4(),
             content: "into the void".into(),
         },
     )
@@ -315,28 +295,27 @@ async fn send_message_to_unknown_channel_is_not_found() {
 
     match recv(&mut ws).await {
         ServerMsg::Error { code, message } => {
-            assert_eq!(code, ErrorCode::NotFound);
-            assert_eq!(message, "channel not found");
+            assert_eq!(code, ErrorCode::Forbidden);
+            assert_eq!(message, "not a member of this DM");
         }
-        other => panic!("expected NotFound error, got {other:?}"),
+        other => panic!("expected Forbidden error, got {other:?}"),
     }
 }
 
 #[tokio::test]
-async fn send_blank_message_is_rejected_before_channel_lookup() {
+async fn blank_dm_is_rejected_before_membership_check() {
     let pool = setup_pool().await;
-    let author = seed_user(&pool).await;
+    let user = seed_user(&pool).await;
 
-    // No server or channel is seeded, so the channel id below doesn't exist.
-    // If content validation ran after the channel lookup we'd get NotFound;
-    // getting BadRequest instead proves validation runs first.
+    // No DM is seeded for `user`, so a passing membership check would surface
+    // Forbidden. Getting BadRequest instead proves validation runs first.
     let url = spawn_server(pool.clone()).await;
-    let mut ws = connect_authed(&url, author).await;
+    let mut ws = connect_authed(&url, user).await;
 
     send(
         &mut ws,
-        &ClientMsg::SendMessage {
-            channel_id: Uuid::new_v4(),
+        &ClientMsg::SendDirectMessage {
+            dm_channel_id: Uuid::new_v4(),
             content: "   ".into(),
         },
     )
@@ -352,21 +331,22 @@ async fn send_blank_message_is_rejected_before_channel_lookup() {
 }
 
 #[tokio::test]
-async fn send_oversized_message_is_rejected() {
+async fn oversized_dm_is_rejected() {
     let pool = setup_pool().await;
-    let author = seed_user(&pool).await;
-    let (_server, channel) = seed_server_with_channel(&pool, author).await;
+    let a = seed_user(&pool).await;
+    let b = seed_user(&pool).await;
+    let dm = seed_dm(&pool, a, b).await;
 
     let url = spawn_server(pool.clone()).await;
-    let mut ws = connect_authed(&url, author).await;
+    let mut ws = connect_authed(&url, a).await;
 
-    // One past the 4000-char cap; the WS path must surface the same rejection
+    // One past the 4000-char cap; the DM path must surface the same rejection
     // the validator unit-tests cover.
     let too_long = "a".repeat(4001);
     send(
         &mut ws,
-        &ClientMsg::SendMessage {
-            channel_id: channel,
+        &ClientMsg::SendDirectMessage {
+            dm_channel_id: dm,
             content: too_long,
         },
     )

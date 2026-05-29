@@ -1,14 +1,17 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
 use axum::response::Response;
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
+use tokio::task::JoinHandle;
 use tokio::time::{timeout_at, Instant};
 use uuid::Uuid;
 
 use concord_shared::protocol::{ClientMsg, ErrorCode, ServerMsg};
+use concord_shared::types::UserStatus;
 use concord_shared::validation::validate_message_content;
 
 use secrecy::ExposeSecret;
@@ -53,24 +56,34 @@ pub async fn ws_handler(
 
 type Sink = Arc<tokio::sync::Mutex<SplitSink<WebSocket, Message>>>;
 
+/// Everything the post-auth loop needs to tear down cleanly once the socket
+/// closes.
+struct Session {
+    uid: Uuid,
+    conn_id: Uuid,
+    /// Drains the user's outbound queue onto the socket.
+    fwd_handle: JoinHandle<()>,
+    /// Re-arms the Redis presence TTL while the connection lives. `None` when
+    /// presence persistence is disabled.
+    heartbeat_handle: Option<JoinHandle<()>>,
+}
+
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let (sender, mut receiver) = socket.split();
     let sender: Sink = Arc::new(tokio::sync::Mutex::new(sender));
 
-    let Some((uid, conn_id, fwd_handle)) =
-        wait_for_auth(&sender, &mut receiver, &state).await
-    else {
+    let Some(session) = wait_for_auth(&sender, &mut receiver, &state).await else {
         return;
     };
 
-    handle_authenticated(uid, conn_id, sender, receiver, fwd_handle, state).await;
+    handle_authenticated(session, sender, receiver, state).await;
 }
 
 async fn wait_for_auth(
     sender: &Sink,
     receiver: &mut futures_util::stream::SplitStream<WebSocket>,
     state: &Arc<AppState>,
-) -> Option<(Uuid, Uuid, tokio::task::JoinHandle<()>)> {
+) -> Option<Session> {
     // Single deadline for the whole handshake. Re-arming a fresh timeout each
     // loop iteration let a client trickle non-text frames every <timeout and
     // stay unauthenticated forever; a fixed deadline bounds that regardless of
@@ -114,7 +127,7 @@ async fn wait_for_auth(
 
         match authenticate(state, token.as_str()).await {
             Ok(uid) => {
-                let (conn_id, rx) = state.hub.register(uid);
+                let (conn_id, rx, is_first) = state.hub.register(uid);
                 let _ = send_msg(sender, &ServerMsg::Authenticated { user_id: uid }).await;
 
                 match db::list_channel_ids_for_user(&state.pool, uid).await {
@@ -128,8 +141,16 @@ async fn wait_for_auth(
                     }
                 }
 
+                init_presence(state, sender, uid, is_first).await;
+
                 let fwd = spawn_forwarder(rx, Arc::clone(sender));
-                return Some((uid, conn_id, fwd));
+                let heartbeat = spawn_heartbeat(state, uid);
+                return Some(Session {
+                    uid,
+                    conn_id,
+                    fwd_handle: fwd,
+                    heartbeat_handle: heartbeat,
+                });
             }
             Err(msg) => {
                 let _ = send_error(sender, ErrorCode::Unauthorized, &msg).await;
@@ -140,13 +161,18 @@ async fn wait_for_auth(
 }
 
 async fn handle_authenticated(
-    uid: Uuid,
-    conn_id: Uuid,
+    session: Session,
     sender: Sink,
     mut receiver: futures_util::stream::SplitStream<WebSocket>,
-    fwd_handle: tokio::task::JoinHandle<()>,
     state: Arc<AppState>,
 ) {
+    let Session {
+        uid,
+        conn_id,
+        fwd_handle,
+        heartbeat_handle,
+    } = session;
+
     while let Some(Ok(frame)) = receiver.next().await {
         let client_msg = match parse_client_frame(frame) {
             Frame::Msg(msg) => msg,
@@ -215,6 +241,72 @@ async fn handle_authenticated(
                         content,
                     },
                 );
+            }
+
+            ClientMsg::SendDirectMessage {
+                dm_channel_id,
+                content,
+            } => {
+                if let Err(e) = validate_message_content(&content) {
+                    let _ =
+                        send_error(&sender, ErrorCode::BadRequest, &e.to_string())
+                            .await;
+                    continue;
+                }
+
+                // Load the DM's members once: the list both authorizes the
+                // sender and is the fan-out set. A non-member — which also
+                // covers a non-existent channel, since that has no members — is
+                // rejected before any insert. We answer Forbidden rather than
+                // NotFound so the endpoint never confirms a DM the caller can't
+                // see. Fanning out to this same set reaches every connected
+                // member (author included) without connect-time subscription
+                // bookkeeping.
+                let members = match db::list_dm_member_ids(&state.pool, dm_channel_id).await {
+                    Ok(members) => members,
+                    Err(e) => {
+                        warn!(user_id = %uid, dm_channel_id = %dm_channel_id, error = ?e, "failed to load DM members");
+                        let _ = send_error(&sender, ErrorCode::Internal, "internal error").await;
+                        continue;
+                    }
+                };
+                if !members.contains(&uid) {
+                    let _ = send_error(
+                        &sender,
+                        ErrorCode::Forbidden,
+                        "not a member of this DM",
+                    )
+                    .await;
+                    continue;
+                }
+
+                // DM messages live in the same `messages` table, keyed by the
+                // dm_channel id (see migration 0005).
+                let inserted = match db::insert_message(
+                    &state.pool,
+                    dm_channel_id,
+                    uid,
+                    &content,
+                )
+                .await
+                {
+                    Ok(row) => row,
+                    Err(e) => {
+                        warn!(user_id = %uid, dm_channel_id = %dm_channel_id, error = ?e, "failed to insert DM message");
+                        let _ = send_error(&sender, ErrorCode::Internal, "internal error").await;
+                        continue;
+                    }
+                };
+
+                let msg = ServerMsg::NewDirectMessage {
+                    id: inserted.id,
+                    dm_channel_id,
+                    author_id: Some(uid),
+                    content,
+                };
+                for member in members {
+                    state.hub.send_to_user(member, &msg);
+                }
             }
 
             ClientMsg::EditMessage {
@@ -347,6 +439,11 @@ async fn handle_authenticated(
                 state.typing.stop(uid, channel_id).await;
             }
 
+            ClientMsg::UpdateStatus { status } => {
+                state.presence.set(uid, status).await;
+                broadcast_status_change(&state, uid, status).await;
+            }
+
             _ => {
                 let _ = send_error(
                     &sender,
@@ -358,8 +455,15 @@ async fn handle_authenticated(
         }
     }
 
-    state.hub.unregister(uid, conn_id);
+    let was_last = state.hub.unregister(uid, conn_id);
     fwd_handle.abort();
+    if let Some(handle) = heartbeat_handle {
+        handle.abort();
+    }
+    if was_last {
+        state.presence.clear(uid).await;
+        broadcast_status_change(&state, uid, UserStatus::Offline).await;
+    }
 }
 
 async fn verify_channel_membership(
@@ -430,6 +534,77 @@ async fn try_delete_message(
     }
 
     db::delete_message(&state.pool, message_id).await.ok()?
+}
+
+/// On-connect presence setup. On the user's first connection it marks them
+/// online (persisting to Redis and notifying shared-server peers); on every
+/// connection it sends back a snapshot of those peers' current presence so the
+/// client starts with an accurate roster.
+///
+/// Best-effort throughout: if the peer lookup fails the whole step is skipped
+/// rather than failing the connection, which also keeps the auth handshake
+/// testable against a pool that never connects.
+async fn init_presence(state: &Arc<AppState>, sender: &Sink, uid: Uuid, is_first: bool) {
+    let peers = match db::list_shared_server_user_ids(&state.pool, uid).await {
+        Ok(peers) => peers,
+        Err(e) => {
+            warn!(user_id = %uid, error = ?e, "failed to load presence peers");
+            return;
+        }
+    };
+
+    if is_first {
+        state.presence.set(uid, UserStatus::Online).await;
+        let msg = ServerMsg::UserStatusChanged {
+            user_id: uid,
+            status: UserStatus::Online,
+        };
+        for &peer in &peers {
+            state.hub.send_to_user(peer, &msg);
+        }
+    }
+
+    let users = state.presence.get_many(&peers).await;
+    let _ = send_msg(sender, &ServerMsg::PresenceSnapshot { users }).await;
+}
+
+/// Notify every user who shares a server with `uid` that their status changed.
+/// The hub only delivers to peers with a live connection; offline peers are a
+/// no-op.
+async fn broadcast_status_change(state: &AppState, uid: Uuid, status: UserStatus) {
+    let peers = match db::list_shared_server_user_ids(&state.pool, uid).await {
+        Ok(peers) => peers,
+        Err(e) => {
+            warn!(user_id = %uid, error = ?e, "failed to load presence peers for broadcast");
+            return;
+        }
+    };
+    let msg = ServerMsg::UserStatusChanged {
+        user_id: uid,
+        status,
+    };
+    for peer in peers {
+        state.hub.send_to_user(peer, &msg);
+    }
+}
+
+/// Spawn a task that re-arms the user's Redis presence TTL at half the TTL
+/// interval, so a connected user never lapses to offline. Returns `None` when
+/// presence persistence is disabled — nothing to keep alive.
+fn spawn_heartbeat(state: &Arc<AppState>, uid: Uuid) -> Option<JoinHandle<()>> {
+    if !state.presence.is_enabled() {
+        return None;
+    }
+    let presence = state.presence.clone();
+    let period = (presence.ttl() / 2).max(Duration::from_secs(1));
+    Some(tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(period);
+        ticker.tick().await; // the first tick resolves immediately; skip it
+        loop {
+            ticker.tick().await;
+            presence.refresh(uid).await;
+        }
+    }))
 }
 
 fn spawn_forwarder(

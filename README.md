@@ -88,6 +88,10 @@ concord/
 | `PATCH`  | `/api/channels/:id`                          | Update channel          |
 | `DELETE` | `/api/channels/:id`                          | Delete channel          |
 | `GET`    | `/api/channels/:id/messages`                 | Message history         |
+| `POST`   | `/api/dms`                                   | Open or reuse 1:1 DM    |
+| `POST`   | `/api/dms/group`                             | Create group DM         |
+| `POST`   | `/api/dms/:id/members`                       | Add member to group DM  |
+| `DELETE` | `/api/dms/:id/members/:user_id`              | Remove member / leave   |
 
 ### WebSocket (`/ws`)
 
