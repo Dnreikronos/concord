@@ -860,14 +860,24 @@ struct InitialData {
 /// fetch is logged and skipped rather than failing the whole load.
 async fn load_servers_and_channels(base: &str, token: &str) -> Result<InitialData, api::ApiError> {
     let servers = api::list_servers(base, token).await?;
-    let mut channels = Vec::with_capacity(servers.len());
-    for server in &servers {
-        match api::list_channels(base, token, server.id).await {
-            Ok(list) => channels.push((server.id, list)),
-            Err(err) => {
-                tracing::warn!(server = %server.id, error = %err, "failed to load channels");
+    // Fetch every server's channels concurrently rather than serially; a failed
+    // per-server fetch is logged and skipped rather than failing the whole load.
+    let fetches = servers.iter().map(|server| {
+        let id = server.id;
+        async move {
+            match api::list_channels(base, token, id).await {
+                Ok(list) => Some((id, list)),
+                Err(err) => {
+                    tracing::warn!(server = %id, error = %err, "failed to load channels");
+                    None
+                }
             }
         }
-    }
+    });
+    let channels = futures_util::future::join_all(fetches)
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
     Ok(InitialData { servers, channels })
 }
