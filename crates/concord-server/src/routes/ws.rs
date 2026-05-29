@@ -264,7 +264,8 @@ async fn handle_authenticated(
                 // bookkeeping.
                 let members = match db::list_dm_member_ids(&state.pool, dm_channel_id).await {
                     Ok(members) => members,
-                    Err(_) => {
+                    Err(e) => {
+                        warn!(user_id = %uid, dm_channel_id = %dm_channel_id, error = ?e, "failed to load DM members");
                         let _ = send_error(&sender, ErrorCode::Internal, "internal error").await;
                         continue;
                     }
@@ -290,7 +291,8 @@ async fn handle_authenticated(
                 .await
                 {
                     Ok(row) => row,
-                    Err(_) => {
+                    Err(e) => {
+                        warn!(user_id = %uid, dm_channel_id = %dm_channel_id, error = ?e, "failed to insert DM message");
                         let _ = send_error(&sender, ErrorCode::Internal, "internal error").await;
                         continue;
                     }
