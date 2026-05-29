@@ -16,7 +16,8 @@
 //! `cx.observe`" pattern that the per-feature views will follow.
 
 use gpui::*;
-use gpui_component::{h_flex, v_flex};
+use gpui_component::tooltip::Tooltip;
+use gpui_component::{h_flex, v_flex, Icon, IconName, Sizable};
 use uuid::Uuid;
 
 use concord_shared::protocol::{ServerMsg, Token};
@@ -386,6 +387,39 @@ impl ConcordApp {
         .detach();
     }
 
+    /// Switch the active server from the rail: show the servers view, select
+    /// `server_id`, and — when it is a fresh selection — load its members and
+    /// open its first text channel (mirroring the initial load). Channels were
+    /// already fetched for every server on login, so no channel fetch is needed.
+    fn select_server(&mut self, server_id: Uuid, cx: &mut Context<Self>) {
+        self.nav.activate(View::Servers);
+        let already_active = self.servers.read(cx).active_server() == Some(server_id);
+        self.servers.update(cx, |s, cx| {
+            s.set_active(server_id);
+            cx.notify();
+        });
+        if already_active {
+            // Re-clicking the active server just re-reveals the servers view.
+            cx.notify();
+            return;
+        }
+
+        if self.servers.read(cx).members_for(server_id).is_empty() {
+            self.load_members(server_id, cx);
+        }
+        let first_channel = self
+            .servers
+            .read(cx)
+            .channels_for(server_id)
+            .iter()
+            .find(|c| c.channel_type == ChannelType::Text)
+            .map(|c| c.id);
+        if let Some(channel_id) = first_channel {
+            self.open_channel(channel_id, cx);
+        }
+        cx.notify();
+    }
+
     /// Make `channel_id` the active channel and load its first history page.
     /// Re-selecting the already-active channel is a no-op.
     fn open_channel(&mut self, channel_id: Uuid, cx: &mut Context<Self>) {
@@ -445,8 +479,38 @@ impl ConcordApp {
 
     // -- Layout -----------------------------------------------------------
 
-    /// Leftmost rail: one circular button per top-level [`View`].
+    /// Leftmost rail: a Discord-style column of server icons. A home / DM
+    /// shortcut sits on top, the servers scroll in the middle, and the
+    /// "add server" and settings buttons are pinned to the bottom.
     fn server_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let on_servers = self.nav.is_active(View::Servers);
+        let active_server = self.servers.read(cx).active_server();
+        let servers: Vec<(Uuid, SharedString)> = self
+            .servers
+            .read(cx)
+            .servers()
+            .iter()
+            .map(|s| (s.id, SharedString::from(s.name.clone())))
+            .collect();
+
+        // The server list fills the space between the fixed top and bottom
+        // buttons and scrolls when it overflows.
+        let mut list = v_flex()
+            .id("server-list")
+            .flex_1()
+            .min_h(px(0.0))
+            .w_full()
+            .overflow_y_scroll()
+            .py(px(space::SM))
+            .gap(px(space::SM))
+            .items_center();
+        for (id, name) in servers {
+            // Only the rail's own view marks a server active, so DMs / settings
+            // don't leave a server highlighted.
+            let selected = on_servers && active_server == Some(id);
+            list = list.child(Self::server_button(id, name, selected, cx));
+        }
+
         v_flex()
             .w(px(space::SERVER_RAIL))
             .h_full()
@@ -455,43 +519,165 @@ impl ConcordApp {
             .py(px(space::MD))
             .gap(px(space::SM))
             .items_center()
-            .child(self.rail_button(View::Servers, cx))
-            .child(self.rail_button(View::DirectMessages, cx))
-            .child(div().flex_1())
-            .child(self.rail_button(View::Settings, cx))
+            .child(Self::nav_button(
+                View::DirectMessages,
+                IconName::Inbox,
+                "Direct Messages",
+                self.nav.is_active(View::DirectMessages),
+                cx,
+            ))
+            .child(Self::rail_divider())
+            .child(list)
+            .child(Self::add_server_button(cx))
+            .child(Self::nav_button(
+                View::Settings,
+                IconName::Settings,
+                "Settings",
+                self.nav.is_active(View::Settings),
+                cx,
+            ))
     }
 
-    /// A single rail button. Clicking it activates `view`.
-    fn rail_button(&self, view: View, cx: &mut Context<Self>) -> impl IntoElement {
-        let active = self.nav.is_active(view);
+    /// The hairline rule separating the home shortcut from the server list.
+    fn rail_divider() -> impl IntoElement {
         div()
-            .id(view.glyph())
-            .size(px(space::RAIL_BUTTON))
+            .w(px(space::RAIL_DIVIDER))
+            .h(px(2.0))
+            .flex_shrink_0()
+            .rounded_full()
+            .bg(color::border())
+    }
+
+    /// The white pill that marks the active rail item, hugging the rail's
+    /// left edge. Inactive items reserve no height so the icons stay aligned.
+    fn rail_pill(active: bool) -> impl IntoElement {
+        div()
+            .absolute()
+            .left(px(0.0))
+            .top(px((space::RAIL_BUTTON - space::RAIL_PILL_HEIGHT) / 2.0))
+            .w(px(space::RAIL_PILL_WIDTH))
+            .h(px(if active { space::RAIL_PILL_HEIGHT } else { 0.0 }))
+            .rounded_full()
+            .bg(color::interactive_active())
+    }
+
+    /// One rail slot: an active pill plus a round, clickable button holding
+    /// `content`, with a hover tooltip. The button rounds into a squircle when
+    /// active or hovered; `accent` swaps the idle look to the brand green used
+    /// by the "add server" affordance.
+    fn rail_item(
+        id: impl Into<ElementId>,
+        active: bool,
+        accent: bool,
+        tooltip: SharedString,
+        content: AnyElement,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        let (bg, fg) = if accent {
+            (color::elevated(), color::online())
+        } else if active {
+            (color::accent(), color::interactive_active())
+        } else {
+            (color::elevated(), color::text())
+        };
+        div()
+            .relative()
+            .w_full()
             .flex()
             .items_center()
             .justify_center()
-            .rounded(px(space::LG))
-            .text_size(px(font::SM))
-            .bg(if active {
-                color::accent()
-            } else {
-                color::sidebar()
-            })
-            .text_color(if active {
-                color::interactive_active()
-            } else {
-                color::text_muted()
-            })
-            .hover(|s| {
-                s.bg(color::accent_hover())
-                    .text_color(color::interactive_active())
-            })
-            .cursor_pointer()
-            .child(view.glyph())
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.nav.activate(view);
-                cx.notify();
-            }))
+            .child(Self::rail_pill(active))
+            .child(
+                div()
+                    .id(id)
+                    .size(px(space::RAIL_BUTTON))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(if active {
+                        space::LG
+                    } else {
+                        space::RAIL_BUTTON / 2.0
+                    }))
+                    .bg(bg)
+                    .text_color(fg)
+                    .hover(move |s| {
+                        s.rounded(px(space::LG))
+                            .bg(if accent { color::online() } else { color::accent() })
+                            .text_color(color::interactive_active())
+                    })
+                    .cursor_pointer()
+                    .child(content)
+                    .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                    .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx))),
+            )
+    }
+
+    /// A rail button bound to a top-level [`View`] (the home / DM shortcut and
+    /// settings). Clicking it activates `view`.
+    fn nav_button(
+        view: View,
+        icon: IconName,
+        tooltip: &'static str,
+        active: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let content = Icon::new(icon)
+            .with_size(px(space::RAIL_ICON))
+            .into_any_element();
+        Self::rail_item(tooltip, active, false, tooltip.into(), content, cx, move |this, _, cx| {
+            this.nav.activate(view);
+            cx.notify();
+        })
+    }
+
+    /// A server icon: the server's first initial (image icons land later).
+    /// Clicking it switches to that server.
+    fn server_button(
+        id: Uuid,
+        name: SharedString,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let initial: SharedString = name
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().collect::<String>())
+            .unwrap_or_else(|| "?".into())
+            .into();
+        let content = div()
+            .text_size(px(font::LG))
+            .font_weight(FontWeight::SEMIBOLD)
+            .child(initial)
+            .into_any_element();
+        Self::rail_item(
+            SharedString::from(id.to_string()),
+            selected,
+            false,
+            name,
+            content,
+            cx,
+            move |this, _, cx| this.select_server(id, cx),
+        )
+    }
+
+    /// The "add a server" button pinned below the server list. Server creation
+    /// is a separate piece of work; the affordance lives here so the rail is
+    /// complete.
+    fn add_server_button(cx: &mut Context<Self>) -> impl IntoElement {
+        let content = Icon::new(IconName::Plus)
+            .with_size(px(space::RAIL_ICON))
+            .into_any_element();
+        Self::rail_item(
+            "add-server",
+            false,
+            true,
+            "Add a Server".into(),
+            content,
+            cx,
+            |_, _, _| tracing::debug!("add-server clicked; creation flow lands in later work"),
+        )
     }
 
     /// Sidebar: the active server's channels, or a placeholder for other views.
