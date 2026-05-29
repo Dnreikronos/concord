@@ -165,7 +165,9 @@ impl ConcordApp {
                 // A reconnect (as opposed to the first connect) may have missed
                 // live messages while the socket was down, so refetch the active
                 // channel's newest page. The initial connect needs no refetch —
-                // `load_initial_data` already loaded it.
+                // `load_initial_data` already loaded it. This replaces history
+                // with the newest page; once scroll-back (`prepend_older`) is
+                // wired (#31), reconnect should merge rather than clobber it.
                 let reconnected =
                     self.connection.read(cx).status() == ConnectionStatus::Reconnecting;
                 self.connection.update(cx, |c, cx| {
