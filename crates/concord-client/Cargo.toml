@@ -10,6 +10,13 @@ repository.workspace = true
 name = "concord-client"
 path = "src/main.rs"
 
+# Desktop GUI. Gated behind the `gui` feature so the heavy GPUI git deps stay
+# out of the default build (the WebSocket lib and its tests compile fast).
+[[bin]]
+name = "concord-ui"
+path = "src/bin/ui.rs"
+required-features = ["gui"]
+
 [lib]
 name = "concord_client"
 path = "src/lib.rs"
