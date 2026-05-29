@@ -1311,6 +1311,22 @@ pub async fn is_dm_member(
     Ok(exists)
 }
 
+/// Every member's user id for a DM channel. A DM message fans out to exactly
+/// these ids (and only these), so the broadcast reaches participants alone.
+pub async fn list_dm_member_ids(
+    pool: &PgPool,
+    dm_channel_id: Uuid,
+) -> Result<Vec<Uuid>, AppError> {
+    let ids = sqlx::query_scalar::<_, Uuid>(
+        "SELECT user_id FROM dm_members WHERE dm_channel_id = $1",
+    )
+    .bind(dm_channel_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(ids)
+}
+
 pub async fn dm_member_count(pool: &PgPool, dm_channel_id: Uuid) -> Result<i64, AppError> {
     let count = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM dm_members WHERE dm_channel_id = $1",

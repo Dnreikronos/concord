@@ -243,6 +243,72 @@ async fn handle_authenticated(
                 );
             }
 
+            ClientMsg::SendDirectMessage {
+                dm_channel_id,
+                content,
+            } => {
+                if let Err(e) = validate_message_content(&content) {
+                    let _ =
+                        send_error(&sender, ErrorCode::BadRequest, &e.to_string())
+                            .await;
+                    continue;
+                }
+
+                // Load the DM's members once: the list both authorizes the
+                // sender and is the fan-out set. A non-member — which also
+                // covers a non-existent channel, since that has no members — is
+                // rejected before any insert. We answer Forbidden rather than
+                // NotFound so the endpoint never confirms a DM the caller can't
+                // see. Fanning out to this same set reaches every connected
+                // member (author included) without connect-time subscription
+                // bookkeeping.
+                let members = match db::list_dm_member_ids(&state.pool, dm_channel_id).await {
+                    Ok(members) => members,
+                    Err(e) => {
+                        warn!(user_id = %uid, dm_channel_id = %dm_channel_id, error = ?e, "failed to load DM members");
+                        let _ = send_error(&sender, ErrorCode::Internal, "internal error").await;
+                        continue;
+                    }
+                };
+                if !members.contains(&uid) {
+                    let _ = send_error(
+                        &sender,
+                        ErrorCode::Forbidden,
+                        "not a member of this DM",
+                    )
+                    .await;
+                    continue;
+                }
+
+                // DM messages live in the same `messages` table, keyed by the
+                // dm_channel id (see migration 0005).
+                let inserted = match db::insert_message(
+                    &state.pool,
+                    dm_channel_id,
+                    uid,
+                    &content,
+                )
+                .await
+                {
+                    Ok(row) => row,
+                    Err(e) => {
+                        warn!(user_id = %uid, dm_channel_id = %dm_channel_id, error = ?e, "failed to insert DM message");
+                        let _ = send_error(&sender, ErrorCode::Internal, "internal error").await;
+                        continue;
+                    }
+                };
+
+                let msg = ServerMsg::NewDirectMessage {
+                    id: inserted.id,
+                    dm_channel_id,
+                    author_id: Some(uid),
+                    content,
+                };
+                for member in members {
+                    state.hub.send_to_user(member, &msg);
+                }
+            }
+
             ClientMsg::EditMessage {
                 message_id,
                 content,
