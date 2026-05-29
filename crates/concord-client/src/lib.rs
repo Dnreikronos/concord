@@ -15,3 +15,8 @@ pub mod ui;
 /// desktop client and for tests, like [`auth`].
 #[cfg(any(feature = "gui", test))]
 pub mod state;
+
+/// REST client for loading the data the UI renders (servers, channels,
+/// members, message history). `gui`-only — like [`auth`], a user of `reqwest`.
+#[cfg(feature = "gui")]
+pub mod api;
