@@ -21,8 +21,17 @@ required-features = ["gui"]
 name = "concord_client"
 path = "src/lib.rs"
 
+# `reqwest` is pulled in by `gui` rather than the default build: the auth HTTP
+# calls only run from the desktop client, and keeping it out of the default
+# build leaves the WebSocket lib and its tests compiling fast.
 [features]
-gui = ["dep:gpui", "dep:gpui_platform", "dep:gpui-component", "dep:gpui-component-assets"]
+gui = [
+    "dep:gpui",
+    "dep:gpui_platform",
+    "dep:gpui-component",
+    "dep:gpui-component-assets",
+    "dep:reqwest",
+]
 
 [dependencies]
 concord-shared = { path = "../concord-shared" }
@@ -47,6 +56,9 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
 ], optional = true }
 gpui-component = { git = "https://github.com/longbridge/gpui-component", optional = true }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", optional = true }
+
+# HTTP client for the auth REST calls. Optional, enabled by `gui`.
+reqwest = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros", "sync", "time"] }

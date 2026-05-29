@@ -6,16 +6,15 @@
 
 use gpui::*;
 use gpui_component::{Root, Theme, ThemeMode, TitleBar};
-use gpui_component_assets::Assets;
 
-use concord_client::ui::ConcordApp;
+use concord_client::ui::{ConcordApp, ConcordAssets};
 
 /// Initial window dimensions, in logical pixels.
 const WINDOW_WIDTH: f32 = 1100.0;
 const WINDOW_HEIGHT: f32 = 720.0;
 
 fn main() {
-    let app = gpui_platform::application().with_assets(Assets);
+    let app = gpui_platform::application().with_assets(ConcordAssets);
 
     app.run(move |cx| {
         gpui_component::init(cx);
@@ -34,7 +33,7 @@ fn main() {
                 window.set_window_title("Concord");
                 Theme::change(ThemeMode::Dark, Some(window), cx);
 
-                let view = cx.new(|_| ConcordApp::new());
+                let view = cx.new(|cx| ConcordApp::new(window, cx));
                 cx.new(|cx| Root::new(view, window, cx))
             })
             .expect("failed to open main window");
