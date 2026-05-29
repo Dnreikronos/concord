@@ -261,6 +261,53 @@ pub async fn seed_dm_channel(pool: &PgPool, members: &[Uuid]) -> Uuid {
     dm_id
 }
 
+/// Create a group DM owned by `owner` (added as a member) with the given extra
+/// `members`. Returns the dm channel id. `name` may be `None` for an unnamed
+/// group.
+pub async fn seed_group_dm(pool: &PgPool, name: Option<&str>, owner: Uuid, members: &[Uuid]) -> Uuid {
+    let dm_id = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO dm_channels (name, is_group, owner_id) \
+         VALUES ($1, true, $2) RETURNING id",
+    )
+    .bind(name)
+    .bind(owner)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+
+    for &user_id in std::iter::once(&owner).chain(members) {
+        sqlx::query("INSERT INTO dm_members (dm_channel_id, user_id) VALUES ($1, $2)")
+            .bind(dm_id)
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    dm_id
+}
+
+/// Set `user`'s `last_read_at` for a DM to an explicit timestamp, so unread
+/// tests can pin the high-water mark relative to seeded message times.
+pub async fn seed_dm_read_at(
+    pool: &PgPool,
+    dm_channel_id: Uuid,
+    user: Uuid,
+    last_read_at: DateTime<Utc>,
+) {
+    sqlx::query(
+        "INSERT INTO dm_read_state (dm_channel_id, user_id, last_read_at) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (dm_channel_id, user_id) DO UPDATE SET last_read_at = $3",
+    )
+    .bind(dm_channel_id)
+    .bind(user)
+    .bind(last_read_at)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 /// Insert a message with an explicit `created_at` so ordering and cursor tests
 /// are deterministic. `author_id` may be `None` to simulate a deleted author.
 pub async fn seed_message_at(
