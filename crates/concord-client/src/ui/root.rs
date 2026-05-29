@@ -407,10 +407,19 @@ impl ConcordApp {
                             c.set_history(channel_id, page, has_more);
                         }
                         Ok(Err(err)) => {
-                            c.set_loading(false);
+                            // Only clear the spinner if this response is still
+                            // for the channel on screen — a late failure for a
+                            // channel the user already left must not touch it.
+                            if c.active_channel() == Some(channel_id) {
+                                c.set_loading(false);
+                            }
                             tracing::warn!(error = %err, "failed to load channel history");
                         }
-                        Err(_canceled) => c.set_loading(false),
+                        Err(_canceled) => {
+                            if c.active_channel() == Some(channel_id) {
+                                c.set_loading(false);
+                            }
+                        }
                     }
                     cx.notify();
                 });
