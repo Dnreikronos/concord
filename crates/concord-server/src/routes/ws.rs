@@ -254,26 +254,29 @@ async fn handle_authenticated(
                     continue;
                 }
 
-                // Only a participant may post to a DM. A non-member — which
-                // also covers a non-existent channel, since that has no
-                // members — is rejected before any insert. We answer Forbidden
-                // rather than NotFound either way so the endpoint never
-                // confirms a DM the caller can't see.
-                match db::is_dm_member(&state.pool, dm_channel_id, uid).await {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        let _ = send_error(
-                            &sender,
-                            ErrorCode::Forbidden,
-                            "not a member of this DM",
-                        )
-                        .await;
-                        continue;
-                    }
+                // Load the DM's members once: the list both authorizes the
+                // sender and is the fan-out set. A non-member — which also
+                // covers a non-existent channel, since that has no members — is
+                // rejected before any insert. We answer Forbidden rather than
+                // NotFound so the endpoint never confirms a DM the caller can't
+                // see. Fanning out to this same set reaches every connected
+                // member (author included) without connect-time subscription
+                // bookkeeping.
+                let members = match db::list_dm_member_ids(&state.pool, dm_channel_id).await {
+                    Ok(members) => members,
                     Err(_) => {
                         let _ = send_error(&sender, ErrorCode::Internal, "internal error").await;
                         continue;
                     }
+                };
+                if !members.contains(&uid) {
+                    let _ = send_error(
+                        &sender,
+                        ErrorCode::Forbidden,
+                        "not a member of this DM",
+                    )
+                    .await;
+                    continue;
                 }
 
                 // DM messages live in the same `messages` table, keyed by the
@@ -287,18 +290,6 @@ async fn handle_authenticated(
                 .await
                 {
                     Ok(row) => row,
-                    Err(_) => {
-                        let _ = send_error(&sender, ErrorCode::Internal, "internal error").await;
-                        continue;
-                    }
-                };
-
-                // Fan out to the DM's members directly rather than through a
-                // channel subscription: the participant set is small, always
-                // current, and reaches every connected member (author included)
-                // without relying on connect-time subscription bookkeeping.
-                let members = match db::list_dm_member_ids(&state.pool, dm_channel_id).await {
-                    Ok(members) => members,
                     Err(_) => {
                         let _ = send_error(&sender, ErrorCode::Internal, "internal error").await;
                         continue;
