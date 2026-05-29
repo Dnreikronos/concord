@@ -275,13 +275,18 @@ pub async fn seed_group_dm(pool: &PgPool, name: Option<&str>, owner: Uuid, membe
     .await
     .unwrap();
 
+    // Dedupe so passing `owner` (or a repeat) in `members` doesn't blow up on
+    // the dm_members PK, mirroring how create_group_dm dedupes its recipients.
+    let mut seen = std::collections::HashSet::new();
     for &user_id in std::iter::once(&owner).chain(members) {
-        sqlx::query("INSERT INTO dm_members (dm_channel_id, user_id) VALUES ($1, $2)")
-            .bind(dm_id)
-            .bind(user_id)
-            .execute(pool)
-            .await
-            .unwrap();
+        if seen.insert(user_id) {
+            sqlx::query("INSERT INTO dm_members (dm_channel_id, user_id) VALUES ($1, $2)")
+                .bind(dm_id)
+                .bind(user_id)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
     }
 
     dm_id
