@@ -7,7 +7,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use concord_shared::types::{DmChannel, DmChannelInfo};
+use concord_shared::types::DmChannelInfo;
 use concord_shared::validation::{validate_dm_name, ValidationError, DM_GROUP_MAX, DM_GROUP_MIN};
 
 use crate::db;
@@ -93,7 +93,7 @@ async fn create_group_dm(
     State(state): State<Arc<AppState>>,
     auth: AuthUser,
     Json(req): Json<CreateGroupDmRequest>,
-) -> Result<(StatusCode, Json<DmChannel>), AppError> {
+) -> Result<(StatusCode, Json<DmChannelInfo>), AppError> {
     // Names are optional; a blank/whitespace-only name is treated as "unnamed".
     let name: Option<String> = req
         .name
@@ -147,7 +147,20 @@ async fn create_group_dm(
 
     tx.commit().await.map_err(|e| AppError::Internal(e.to_string()))?;
 
-    Ok((StatusCode::CREATED, Json(channel)))
+    // Resolve participants so the group-create response matches the 1:1 path
+    // (create_dm), which also returns a fully-populated DmChannelInfo.
+    let participants = db::list_dm_participants(&state.pool, channel.id).await?;
+
+    let info = DmChannelInfo {
+        id: channel.id,
+        name: channel.name,
+        is_group: channel.is_group,
+        owner_id: channel.owner_id,
+        created_at: channel.created_at,
+        participants,
+    };
+
+    Ok((StatusCode::CREATED, Json(info)))
 }
 
 /// `POST /api/dms/{id}/members` — add a user to an existing group DM.
