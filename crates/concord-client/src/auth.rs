@@ -106,11 +106,25 @@ struct ErrorBody {
 // HTTP round-trips. `gui`-only — these are the sole users of `reqwest`.
 // ---------------------------------------------------------------------------
 
+/// Shared HTTP client with a request timeout, so a stalled server can't leave
+/// the submit flow waiting forever. Built once and reused to keep the
+/// connection pool and TLS state warm across calls.
+#[cfg(feature = "gui")]
+fn http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
 /// Log in with email + password, returning the issued [`Session`].
 #[cfg(feature = "gui")]
 pub async fn login(base_url: &str, email: &str, password: &str) -> Result<Session, AuthError> {
     let base = base_url.trim_end_matches('/');
-    let resp = reqwest::Client::new()
+    let resp = http_client()
         .post(format!("{base}/api/auth/login"))
         .json(&LoginBody { email, password })
         .send()
@@ -132,7 +146,7 @@ pub async fn register(
     password: &str,
 ) -> Result<Session, AuthError> {
     let base = base_url.trim_end_matches('/');
-    let resp = reqwest::Client::new()
+    let resp = http_client()
         .post(format!("{base}/api/auth/register"))
         .json(&RegisterBody {
             username,
