@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{Executor, PgPool, Postgres};
 use uuid::Uuid;
 
-use concord_shared::types::{Channel, MemberInfo, Server, ServerInvite, User};
+use concord_shared::types::{Channel, DmChannel, MemberInfo, Server, ServerInvite, User};
 
 use crate::error::AppError;
 
@@ -927,4 +927,198 @@ impl UserRow {
             updated_at: self.updated_at,
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// direct messages (group DMs)
+// ---------------------------------------------------------------------------
+
+#[derive(sqlx::FromRow)]
+struct DmChannelRow {
+    id: Uuid,
+    name: Option<String>,
+    is_group: bool,
+    owner_id: Option<Uuid>,
+    created_at: DateTime<Utc>,
+}
+
+impl DmChannelRow {
+    fn into_dm_channel(self) -> DmChannel {
+        DmChannel {
+            id: self.id,
+            name: self.name,
+            is_group: self.is_group,
+            owner_id: self.owner_id,
+            created_at: self.created_at,
+        }
+    }
+}
+
+pub async fn insert_dm_channel<'e, E>(
+    executor: E,
+    name: Option<&str>,
+    owner_id: Uuid,
+) -> Result<DmChannel, AppError>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let row = sqlx::query_as::<_, DmChannelRow>(
+        "INSERT INTO dm_channels (name, is_group, owner_id) \
+         VALUES ($1, true, $2) \
+         RETURNING id, name, is_group, owner_id, created_at",
+    )
+    .bind(name)
+    .bind(owner_id)
+    .fetch_one(executor)
+    .await?;
+
+    Ok(row.into_dm_channel())
+}
+
+pub async fn insert_dm_member<'e, E>(
+    executor: E,
+    dm_channel_id: Uuid,
+    user_id: Uuid,
+) -> Result<(), AppError>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    sqlx::query("INSERT INTO dm_members (dm_channel_id, user_id) VALUES ($1, $2)")
+        .bind(dm_channel_id)
+        .bind(user_id)
+        .execute(executor)
+        .await?;
+
+    Ok(())
+}
+
+/// Return the subset of `ids` that exist in `users`. Used to reject group-DM
+/// creation that names recipients who aren't real accounts.
+pub async fn existing_user_ids(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<Uuid>, AppError> {
+    let rows = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE id = ANY($1)")
+        .bind(ids)
+        .fetch_all(pool)
+        .await?;
+
+    Ok(rows)
+}
+
+pub async fn user_exists(pool: &PgPool, user_id: Uuid) -> Result<bool, AppError> {
+    let exists = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)")
+        .bind(user_id)
+        .fetch_one(pool)
+        .await?;
+
+    Ok(exists)
+}
+
+/// Fetch a group DM by id. Returns `None` for a missing channel or a 1:1 DM —
+/// the member-management endpoints operate on groups only.
+pub async fn get_group_dm(
+    pool: &PgPool,
+    dm_channel_id: Uuid,
+) -> Result<Option<DmChannel>, AppError> {
+    let row = sqlx::query_as::<_, DmChannelRow>(
+        "SELECT id, name, is_group, owner_id, created_at \
+         FROM dm_channels WHERE id = $1 AND is_group = true",
+    )
+    .bind(dm_channel_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(DmChannelRow::into_dm_channel))
+}
+
+pub async fn is_dm_member(
+    pool: &PgPool,
+    dm_channel_id: Uuid,
+    user_id: Uuid,
+) -> Result<bool, AppError> {
+    let exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM dm_members WHERE dm_channel_id = $1 AND user_id = $2)",
+    )
+    .bind(dm_channel_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(exists)
+}
+
+pub async fn dm_member_count(pool: &PgPool, dm_channel_id: Uuid) -> Result<i64, AppError> {
+    let count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM dm_members WHERE dm_channel_id = $1",
+    )
+    .bind(dm_channel_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(count)
+}
+
+pub async fn list_dm_member_ids(
+    pool: &PgPool,
+    dm_channel_id: Uuid,
+) -> Result<Vec<Uuid>, AppError> {
+    let ids = sqlx::query_scalar::<_, Uuid>(
+        "SELECT user_id FROM dm_members WHERE dm_channel_id = $1 ORDER BY joined_at, user_id",
+    )
+    .bind(dm_channel_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(ids)
+}
+
+/// Remove `target` from a group DM and repair invariants in one transaction:
+/// if the departing member owned the group, ownership passes to the
+/// earliest-joined survivor; if no members remain, the empty channel is
+/// deleted (its rows cascade). Returns `false` if `target` wasn't a member.
+pub async fn remove_dm_member(
+    pool: &PgPool,
+    dm_channel_id: Uuid,
+    target: Uuid,
+) -> Result<bool, AppError> {
+    let mut tx = pool.begin().await.map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let deleted = sqlx::query("DELETE FROM dm_members WHERE dm_channel_id = $1 AND user_id = $2")
+        .bind(dm_channel_id)
+        .bind(target)
+        .execute(&mut *tx)
+        .await?;
+
+    if deleted.rows_affected() == 0 {
+        tx.rollback().await.map_err(|e| AppError::Internal(e.to_string()))?;
+        return Ok(false);
+    }
+
+    let next_owner = sqlx::query_scalar::<_, Uuid>(
+        "SELECT user_id FROM dm_members WHERE dm_channel_id = $1 \
+         ORDER BY joined_at, user_id LIMIT 1",
+    )
+    .bind(dm_channel_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    match next_owner {
+        // Last member left: drop the now-empty channel.
+        None => {
+            sqlx::query("DELETE FROM dm_channels WHERE id = $1")
+                .bind(dm_channel_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        // Reassign ownership only if the member who left was the owner.
+        Some(survivor) => {
+            sqlx::query("UPDATE dm_channels SET owner_id = $2 WHERE id = $1 AND owner_id = $3")
+                .bind(dm_channel_id)
+                .bind(survivor)
+                .bind(target)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+
+    tx.commit().await.map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(true)
 }
