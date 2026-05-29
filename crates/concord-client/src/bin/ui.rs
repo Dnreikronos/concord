@@ -34,7 +34,7 @@ fn main() {
                 window.set_window_title("Concord");
                 Theme::change(ThemeMode::Dark, Some(window), cx);
 
-                let view = cx.new(|_| ConcordApp::new());
+                let view = cx.new(|cx| ConcordApp::new(window, cx));
                 cx.new(|cx| Root::new(view, window, cx))
             })
             .expect("failed to open main window");

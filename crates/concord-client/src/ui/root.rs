@@ -7,19 +7,57 @@
 use gpui::*;
 use gpui_component::{h_flex, v_flex};
 
+use crate::auth::Session;
+use crate::ui::auth_view::{AuthEvent, AuthView};
 use crate::ui::nav::{NavState, View};
 use crate::ui::theme::{color, font, space};
 
-/// The application's root view, owning the top-level navigation state.
+/// Which top-level screen the app is showing.
+enum Screen {
+    /// The login / register card, shown until the user authenticates.
+    Auth,
+    /// The main three-column app, shown once a session exists.
+    Main,
+}
+
+/// The application's root view. It gates the main UI behind authentication:
+/// it starts on the [`AuthView`] and, on a successful login, stores the
+/// [`Session`] and swaps to the main three-column layout.
 pub struct ConcordApp {
+    screen: Screen,
+    auth: Entity<AuthView>,
     nav: NavState,
+    session: Option<Session>,
+    _auth_subscription: Subscription,
 }
 
 impl ConcordApp {
-    /// Construct the root view on the default navigation state.
-    pub fn new() -> Self {
+    /// Construct the root view, starting on the auth screen.
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let auth = cx.new(|cx| AuthView::new(window, cx));
+        let auth_subscription = cx.subscribe(&auth, Self::on_auth_event);
         Self {
+            screen: Screen::Auth,
+            auth,
             nav: NavState::new(),
+            session: None,
+            _auth_subscription: auth_subscription,
+        }
+    }
+
+    /// React to the auth view: store the session and reveal the main app.
+    fn on_auth_event(
+        &mut self,
+        _auth: Entity<AuthView>,
+        event: &AuthEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            AuthEvent::Authenticated(session) => {
+                self.session = Some(session.clone());
+                self.screen = Screen::Main;
+                cx.notify();
+            }
         }
     }
 
@@ -172,19 +210,23 @@ impl ConcordApp {
                             .text_color(color::text_muted())
                             .text_size(px(font::MD))
                             .child(body),
-                    ),
+                    )
+                    .children(self.session.as_ref().map(|session| {
+                        div()
+                            .text_color(color::text_faint())
+                            .text_size(px(font::SM))
+                            .child(SharedString::from(format!(
+                                "Signed in as {}",
+                                session.user.username
+                            )))
+                    })),
             )
     }
 }
 
-impl Default for ConcordApp {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Render for ConcordApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl ConcordApp {
+    /// The main three-column layout (server rail · sidebar · content).
+    fn main_layout(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .size_full()
             .bg(color::chat())
@@ -193,5 +235,14 @@ impl Render for ConcordApp {
             .child(self.server_rail(cx))
             .child(self.channel_sidebar())
             .child(self.content())
+    }
+}
+
+impl Render for ConcordApp {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        match self.screen {
+            Screen::Auth => self.auth.clone().into_any_element(),
+            Screen::Main => self.main_layout(cx).into_any_element(),
+        }
     }
 }
