@@ -87,6 +87,9 @@ concord/
 | `GET`    | `/api/servers/:id/categories`                | List categories         |
 | `PATCH`  | `/api/channels/:id`                          | Update channel          |
 | `DELETE` | `/api/channels/:id`                          | Delete channel          |
+| `POST`   | `/api/dms`                                   | Create group DM         |
+| `POST`   | `/api/dms/:id/members`                       | Add member to group DM  |
+| `DELETE` | `/api/dms/:id/members/:user_id`              | Remove member / leave   |
 
 ### WebSocket (`/ws`)
 
