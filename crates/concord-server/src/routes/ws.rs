@@ -243,6 +243,79 @@ async fn handle_authenticated(
                 );
             }
 
+            ClientMsg::SendDirectMessage {
+                dm_channel_id,
+                content,
+            } => {
+                if let Err(e) = validate_message_content(&content) {
+                    let _ =
+                        send_error(&sender, ErrorCode::BadRequest, &e.to_string())
+                            .await;
+                    continue;
+                }
+
+                // Only a participant may post to a DM. A non-member — which
+                // also covers a non-existent channel, since that has no
+                // members — is rejected before any insert. We answer Forbidden
+                // rather than NotFound either way so the endpoint never
+                // confirms a DM the caller can't see.
+                match db::is_dm_member(&state.pool, dm_channel_id, uid).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let _ = send_error(
+                            &sender,
+                            ErrorCode::Forbidden,
+                            "not a member of this DM",
+                        )
+                        .await;
+                        continue;
+                    }
+                    Err(_) => {
+                        let _ = send_error(&sender, ErrorCode::Internal, "internal error").await;
+                        continue;
+                    }
+                }
+
+                // DM messages live in the same `messages` table, keyed by the
+                // dm_channel id (see migration 0005).
+                let inserted = match db::insert_message(
+                    &state.pool,
+                    dm_channel_id,
+                    uid,
+                    &content,
+                )
+                .await
+                {
+                    Ok(row) => row,
+                    Err(_) => {
+                        let _ = send_error(&sender, ErrorCode::Internal, "internal error").await;
+                        continue;
+                    }
+                };
+
+                // Fan out to the DM's members directly rather than through a
+                // channel subscription: the participant set is small, always
+                // current, and reaches every connected member (author included)
+                // without relying on connect-time subscription bookkeeping.
+                let members = match db::list_dm_member_ids(&state.pool, dm_channel_id).await {
+                    Ok(members) => members,
+                    Err(_) => {
+                        let _ = send_error(&sender, ErrorCode::Internal, "internal error").await;
+                        continue;
+                    }
+                };
+
+                let msg = ServerMsg::NewDirectMessage {
+                    id: inserted.id,
+                    dm_channel_id,
+                    author_id: Some(uid),
+                    content,
+                };
+                for member in members {
+                    state.hub.send_to_user(member, &msg);
+                }
+            }
+
             ClientMsg::EditMessage {
                 message_id,
                 content,
