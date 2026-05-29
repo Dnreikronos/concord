@@ -181,6 +181,7 @@ async fn dm_message_persists_and_broadcasts_to_author() {
             dm_channel_id,
             author_id,
             content,
+            ..
         } => {
             assert_eq!(dm_channel_id, dm);
             assert_eq!(author_id, Some(author));

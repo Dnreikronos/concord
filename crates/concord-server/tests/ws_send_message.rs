@@ -188,6 +188,7 @@ async fn send_message_persists_and_broadcasts_to_author() {
             channel_id,
             author_id,
             content,
+            ..
         } => {
             assert_eq!(channel_id, channel);
             assert_eq!(author_id, Some(author));

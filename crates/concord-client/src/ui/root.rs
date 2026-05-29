@@ -15,7 +15,6 @@
 //! first consumer of the "entity handles passed to views, views subscribe via
 //! `cx.observe`" pattern that the per-feature views will follow.
 
-use chrono::Utc;
 use gpui::*;
 use gpui_component::{h_flex, v_flex};
 use uuid::Uuid;
@@ -200,12 +199,13 @@ impl ConcordApp {
                 channel_id,
                 author_id,
                 content,
+                created_at,
             } => {
                 if self.chat.read(cx).active_channel() != Some(*channel_id) {
                     return;
                 }
-                // The wire message carries neither the author profile nor a
-                // timestamp, so resolve the author locally and stamp it now.
+                // The wire message carries no author profile, so resolve it
+                // locally; the server-assigned `created_at` is taken as-is.
                 let author = (*author_id).and_then(|id| self.resolve_author(id, cx));
                 let message = MessageWithAuthor {
                     id: *id,
@@ -213,17 +213,17 @@ impl ConcordApp {
                     author,
                     content: content.clone(),
                     edited_at: None,
-                    created_at: Utc::now(),
+                    created_at: *created_at,
                 };
                 self.chat.update(cx, |c, cx| {
                     c.push_message(message);
                     cx.notify();
                 });
             }
-            ServerMsg::MessageEdited { message_id, content } => {
-                let (id, content, now) = (*message_id, content.clone(), Utc::now());
+            ServerMsg::MessageEdited { message_id, content, edited_at } => {
+                let (id, content, edited_at) = (*message_id, content.clone(), *edited_at);
                 self.chat.update(cx, |c, cx| {
-                    c.edit_message(id, content, now);
+                    c.edit_message(id, content, edited_at);
                     cx.notify();
                 });
             }
