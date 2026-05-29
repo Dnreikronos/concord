@@ -161,10 +161,23 @@ impl ConcordApp {
     /// socket has closed and the event loop should stop.
     fn on_ws_event(&mut self, event: &WsEvent, cx: &mut Context<Self>) -> bool {
         match event {
-            WsEvent::Connected { .. } => self.connection.update(cx, |c, cx| {
-                c.connected();
-                cx.notify();
-            }),
+            WsEvent::Connected { .. } => {
+                // A reconnect (as opposed to the first connect) may have missed
+                // live messages while the socket was down, so refetch the active
+                // channel's newest page. The initial connect needs no refetch —
+                // `load_initial_data` already loaded it.
+                let reconnected =
+                    self.connection.read(cx).status() == ConnectionStatus::Reconnecting;
+                self.connection.update(cx, |c, cx| {
+                    c.connected();
+                    cx.notify();
+                });
+                if reconnected {
+                    if let Some(channel_id) = self.chat.read(cx).active_channel() {
+                        self.load_history(channel_id, cx);
+                    }
+                }
+            }
             WsEvent::Disconnected { reason } => self.connection.update(cx, |c, cx| {
                 c.disconnected(Some(reason.clone()));
                 cx.notify();
