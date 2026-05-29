@@ -226,7 +226,7 @@ mod tests {
 
     /// Register a user, subscribe them to `channel`, return their event receiver.
     fn join(hub: &Hub, user: Uuid, channel: Uuid) -> UnboundedReceiver<ServerMsg> {
-        let (_conn, rx) = hub.register(user);
+        let (_conn, rx, _is_first) = hub.register(user);
         hub.subscribe(user, channel);
         rx
     }

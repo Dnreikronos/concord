@@ -54,6 +54,13 @@ pub enum ClientMsg {
     UpdateStatus { status: UserStatus },
 }
 
+/// A single peer's presence, used in `ServerMsg::PresenceSnapshot`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserPresence {
+    pub user_id: Uuid,
+    pub status: UserStatus,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 #[serde(rename_all = "snake_case")]
@@ -92,9 +99,15 @@ pub enum ServerMsg {
     },
 
     // Presence
-    PresenceUpdate {
+    UserStatusChanged {
         user_id: Uuid,
         status: UserStatus,
+    },
+    /// Initial presence of the connecting user's relevant peers (members of
+    /// shared servers), sent once right after authentication. Only non-offline
+    /// peers are listed; anyone absent is implicitly offline.
+    PresenceSnapshot {
+        users: Vec<UserPresence>,
     },
 
     // Membership
