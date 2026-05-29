@@ -1322,20 +1322,6 @@ pub async fn dm_member_count(pool: &PgPool, dm_channel_id: Uuid) -> Result<i64, 
     Ok(count)
 }
 
-pub async fn list_dm_member_ids(
-    pool: &PgPool,
-    dm_channel_id: Uuid,
-) -> Result<Vec<Uuid>, AppError> {
-    let ids = sqlx::query_scalar::<_, Uuid>(
-        "SELECT user_id FROM dm_members WHERE dm_channel_id = $1 ORDER BY joined_at, user_id",
-    )
-    .bind(dm_channel_id)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(ids)
-}
-
 /// Remove `target` from a group DM and repair invariants in one transaction:
 /// if the departing member owned the group, ownership passes to the
 /// earliest-joined survivor; if no members remain, the empty channel is
