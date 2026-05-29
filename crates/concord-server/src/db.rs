@@ -1487,7 +1487,6 @@ struct DmConversationRow {
     is_group: bool,
     owner_id: Option<Uuid>,
     created_at: DateTime<Utc>,
-    member_count: i64,
     last_message_id: Option<Uuid>,
     last_message_author_id: Option<Uuid>,
     last_message_author_username: Option<String>,
@@ -1529,8 +1528,6 @@ pub async fn list_dm_conversations(
     let rows = sqlx::query_as::<_, DmConversationRow>(
         "SELECT \
              dc.id, dc.name, dc.is_group, dc.owner_id, dc.created_at, \
-             (SELECT count(*) FROM dm_members m WHERE m.dm_channel_id = dc.id) \
-                 AS member_count, \
              lm.id AS last_message_id, \
              lm.author_id AS last_message_author_id, \
              au.username AS last_message_author_username, \
@@ -1596,14 +1593,20 @@ pub async fn list_dm_conversations(
                     _ => None,
                 };
 
+            // member_count is the resolved participant count rather than a
+            // separate COUNT(*): every dm_members row has a live users row
+            // (FK cascades on user delete), so the two are identical, and
+            // deriving it here keeps count and list from the same snapshot.
+            let members = participants.remove(&r.id).unwrap_or_default();
+
             DmConversation {
                 id: r.id,
                 name: r.name,
                 is_group: r.is_group,
                 owner_id: r.owner_id,
                 created_at: r.created_at,
-                member_count: r.member_count,
-                participants: participants.remove(&r.id).unwrap_or_default(),
+                member_count: members.len() as i64,
+                participants: members,
                 last_message,
                 unread: r.unread,
             }
