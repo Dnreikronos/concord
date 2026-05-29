@@ -1322,6 +1322,27 @@ pub async fn dm_member_count(pool: &PgPool, dm_channel_id: Uuid) -> Result<i64, 
     Ok(count)
 }
 
+/// Take a transaction-scoped advisory lock keyed on a single DM channel so that
+/// every membership mutation on that channel — adds and removes alike —
+/// serializes against the others. The lock releases automatically at
+/// commit/rollback. This is the channel-scoped counterpart to the unordered
+/// *pair* lock in [`find_or_create_dm_channel`]; both derive a bigint lock id
+/// the same way (`md5` → first 16 hex digits → `bit(64)` → `bigint`).
+async fn lock_dm_channel<'e, E>(executor: E, dm_channel_id: Uuid) -> Result<(), AppError>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(\
+             ('x' || substr(md5($1::text), 1, 16))::bit(64)::bigint)",
+    )
+    .bind(dm_channel_id)
+    .execute(executor)
+    .await?;
+
+    Ok(())
+}
+
 /// Outcome of an attempt to add a member to a group DM, decided inside the
 /// serialized critical section so the caller can map it to a status code.
 pub enum AddMemberOutcome {
@@ -1345,13 +1366,7 @@ pub async fn add_dm_member_checked(
     let mut tx = pool.begin().await.map_err(|e| AppError::Internal(e.to_string()))?;
 
     // One bigint lock id per channel; serializes concurrent adds on this DM.
-    sqlx::query(
-        "SELECT pg_advisory_xact_lock(\
-             ('x' || substr(md5($1::text), 1, 16))::bit(64)::bigint)",
-    )
-    .bind(dm_channel_id)
-    .execute(&mut *tx)
-    .await?;
+    lock_dm_channel(&mut *tx, dm_channel_id).await?;
 
     let already = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM dm_members WHERE dm_channel_id = $1 AND user_id = $2)",
@@ -1393,6 +1408,13 @@ pub async fn remove_dm_member(
     target: Uuid,
 ) -> Result<bool, AppError> {
     let mut tx = pool.begin().await.map_err(|e| AppError::Internal(e.to_string()))?;
+
+    // Serialize on the same per-channel lock the add path takes. Without it two
+    // concurrent leaves each delete their own row, then read a snapshot that
+    // still shows the other member: both take the `Some(survivor)` branch, so
+    // the now-empty channel is never deleted and ownership can land on a member
+    // who is also leaving. The lock also orders leaves against concurrent adds.
+    lock_dm_channel(&mut *tx, dm_channel_id).await?;
 
     let deleted = sqlx::query("DELETE FROM dm_members WHERE dm_channel_id = $1 AND user_id = $2")
         .bind(dm_channel_id)
