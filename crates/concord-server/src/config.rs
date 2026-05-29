@@ -97,12 +97,20 @@ impl Config {
 
         let redis_url = env::var("REDIS_URL").ok().filter(|s| !s.is_empty());
 
-        let presence_ttl = Duration::from_secs(
-            env::var("PRESENCE_TTL_SECONDS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(60),
+        let presence_ttl_secs: u64 = env::var("PRESENCE_TTL_SECONDS")
+            .unwrap_or_else(|_| "60".into())
+            .parse()
+            .expect("PRESENCE_TTL_SECONDS must be a valid u64");
+
+        // The heartbeat re-arms at half the TTL, floored at 1s. Below 2s the key
+        // can lapse before the first refresh (and 0 is a Redis `SET EX` error),
+        // so reject too-small values rather than ship broken presence.
+        assert!(
+            presence_ttl_secs >= 2,
+            "PRESENCE_TTL_SECONDS must be at least 2 seconds"
         );
+
+        let presence_ttl = Duration::from_secs(presence_ttl_secs);
 
         Self {
             database_url,

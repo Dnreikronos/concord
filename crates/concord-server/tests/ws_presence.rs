@@ -176,12 +176,18 @@ async fn expect_silence(ws: &mut ClientWs, window: Duration) {
                     panic!("expected silence, got {msg:?}");
                 }
                 Some(Ok(_)) => continue,
-                _ => return,
+                Some(Err(err)) => {
+                    panic!("connection errored while waiting for silence: {err:?}")
+                }
+                None => panic!("connection closed while waiting for silence"),
             }
         }
     };
-    // A timeout here is the success case: nothing showed up.
-    let _ = tokio::time::timeout(window, fut).await;
+    // A timeout is the only success case: a dropped socket must not pass as quiet.
+    assert!(
+        tokio::time::timeout(window, fut).await.is_err(),
+        "expected no server message for {window:?}",
+    );
 }
 
 /// Authenticate and consume the `Authenticated` + initial `PresenceSnapshot`
