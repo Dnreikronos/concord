@@ -14,6 +14,9 @@ path = "src/main.rs"
 name = "concord_client"
 path = "src/lib.rs"
 
+[features]
+gui = ["dep:gpui", "dep:gpui_platform", "dep:gpui-component", "dep:gpui-component-assets"]
+
 [dependencies]
 concord-shared = { path = "../concord-shared" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
@@ -24,6 +27,19 @@ futures-util.workspace = true
 uuid.workspace = true
 tracing.workspace = true
 rand.workspace = true
+
+# GPUI desktop stack. Compiled only with `--features gui`. gpui and
+# gpui-component track the same upstream zed revision, so both are left
+# unpinned here and frozen together in Cargo.lock.
+gpui = { git = "https://github.com/zed-industries/zed", optional = true }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
+    "font-kit",
+    "x11",
+    "wayland",
+    "runtime_shaders",
+], optional = true }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", optional = true }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros", "sync", "time"] }
