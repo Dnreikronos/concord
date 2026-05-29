@@ -108,9 +108,9 @@ struct ErrorBody {
 
 /// Shared HTTP client with a request timeout, so a stalled server can't leave
 /// the submit flow waiting forever. Built once and reused to keep the
-/// connection pool and TLS state warm across calls.
+/// connection pool and TLS state warm across calls. Shared with [`crate::api`].
 #[cfg(feature = "gui")]
-fn http_client() -> &'static reqwest::Client {
+pub(crate) fn http_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()

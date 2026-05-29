@@ -1,5 +1,6 @@
 use std::fmt;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -74,10 +75,12 @@ pub enum ServerMsg {
         channel_id: Uuid,
         author_id: Option<Uuid>,
         content: String,
+        created_at: DateTime<Utc>,
     },
     MessageEdited {
         message_id: Uuid,
         content: String,
+        edited_at: DateTime<Utc>,
     },
     MessageDeleted {
         message_id: Uuid,
@@ -126,6 +129,7 @@ pub enum ServerMsg {
         dm_channel_id: Uuid,
         author_id: Option<Uuid>,
         content: String,
+        created_at: DateTime<Utc>,
     },
     DmChannelCreated {
         dm_channel_id: Uuid,

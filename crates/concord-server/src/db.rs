@@ -273,18 +273,18 @@ pub async fn get_message_channel(
 }
 
 /// Atomically update content only if author_id matches. Returns the
-/// channel_id on success, None if the message doesn't exist or the
-/// caller isn't the author.
+/// `(channel_id, edited_at)` on success, None if the message doesn't exist or
+/// the caller isn't the author.
 pub async fn update_message_if_author(
     pool: &PgPool,
     message_id: Uuid,
     author_id: Uuid,
     content: &str,
-) -> Result<Option<Uuid>, AppError> {
-    let row = sqlx::query_scalar::<_, Uuid>(
+) -> Result<Option<(Uuid, DateTime<Utc>)>, AppError> {
+    let row = sqlx::query_as::<_, (Uuid, DateTime<Utc>)>(
         "UPDATE messages SET content = $2, edited_at = now() \
          WHERE id = $1 AND author_id = $3 \
-         RETURNING channel_id",
+         RETURNING channel_id, edited_at",
     )
     .bind(message_id)
     .bind(content)

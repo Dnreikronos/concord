@@ -173,6 +173,7 @@ async fn send_message_persists_and_broadcasts_to_author() {
     let url = spawn_server(pool.clone()).await;
     let mut ws = connect_authed(&url, author).await;
 
+    let before = chrono::Utc::now();
     send(
         &mut ws,
         &ClientMsg::SendMessage {
@@ -188,10 +189,17 @@ async fn send_message_persists_and_broadcasts_to_author() {
             channel_id,
             author_id,
             content,
+            created_at,
         } => {
             assert_eq!(channel_id, channel);
             assert_eq!(author_id, Some(author));
             assert_eq!(content, "hello world");
+
+            // The broadcast carries the server-stamped time, not a client
+            // guess: it lands within a sane window of the send, never the epoch
+            // default a missing or mis-wired field would produce.
+            assert!(created_at >= before - chrono::Duration::seconds(5));
+            assert!(created_at <= chrono::Utc::now() + chrono::Duration::seconds(5));
 
             // The broadcast id must point at a row actually persisted in this
             // channel — proves the insert happened, not just the fan-out.
