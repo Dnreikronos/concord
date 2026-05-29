@@ -1,5 +1,6 @@
 use std::env;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use secrecy::SecretString;
 
@@ -54,6 +55,14 @@ pub struct Config {
     pub jwt_secret: String,
     pub github_oauth: Option<GitHubOAuthConfig>,
     pub google_oauth: Option<GoogleOAuthConfig>,
+    /// Redis connection URL shared by the presence store and cross-instance
+    /// typing pub/sub. Optional: when unset, presence persistence is disabled
+    /// and typing indicators fan out in-process only.
+    pub redis_url: Option<String>,
+    /// How long a presence entry lives in Redis before expiring. The
+    /// per-connection heartbeat re-arms it at half this interval, so a value
+    /// comfortably larger than one heartbeat is required.
+    pub presence_ttl: Duration,
 }
 
 impl Config {
@@ -86,6 +95,32 @@ impl Config {
         let github_oauth = GitHubOAuthConfig::from_env();
         let google_oauth = GoogleOAuthConfig::from_env();
 
-        Self { database_url, addr, max_connections, jwt_secret, github_oauth, google_oauth }
+        let redis_url = env::var("REDIS_URL").ok().filter(|s| !s.is_empty());
+
+        let presence_ttl_secs: u64 = env::var("PRESENCE_TTL_SECONDS")
+            .unwrap_or_else(|_| "60".into())
+            .parse()
+            .expect("PRESENCE_TTL_SECONDS must be a valid u64");
+
+        // The heartbeat re-arms at half the TTL, floored at 1s. Below 2s the key
+        // can lapse before the first refresh (and 0 is a Redis `SET EX` error),
+        // so reject too-small values rather than ship broken presence.
+        assert!(
+            presence_ttl_secs >= 2,
+            "PRESENCE_TTL_SECONDS must be at least 2 seconds"
+        );
+
+        let presence_ttl = Duration::from_secs(presence_ttl_secs);
+
+        Self {
+            database_url,
+            addr,
+            max_connections,
+            jwt_secret,
+            github_oauth,
+            google_oauth,
+            redis_url,
+            presence_ttl,
+        }
     }
 }

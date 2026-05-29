@@ -2,7 +2,10 @@ use chrono::{DateTime, Utc};
 use sqlx::{Executor, PgPool, Postgres};
 use uuid::Uuid;
 
-use concord_shared::types::{Channel, DmChannel, MemberInfo, Server, ServerInvite, User};
+use concord_shared::types::{
+    Channel, DmChannel, DmParticipant, MemberInfo, MessageAuthor, MessageWithAuthor, Server,
+    ServerInvite, User,
+};
 
 use crate::error::AppError;
 
@@ -123,6 +126,137 @@ pub async fn insert_message(
     .await?;
 
     Ok(row)
+}
+
+/// Whether a user may read a channel's message history.
+///
+/// A path `{id}` may name either a server channel (`channels`) or a DM channel
+/// (`dm_channels`). Both id spaces are disjoint random UUIDs, so a single
+/// lookup resolves which kind it is and whether the caller belongs to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelAccess {
+    /// The caller is a member and may read the channel.
+    Authorized,
+    /// The channel exists but the caller is not a member.
+    Forbidden,
+    /// No channel — server or DM — has this id.
+    NotFound,
+}
+
+#[derive(sqlx::FromRow)]
+struct ChannelAccessRow {
+    channel_exists: bool,
+    is_member: bool,
+}
+
+pub async fn check_channel_read_access(
+    pool: &PgPool,
+    channel_id: Uuid,
+    user_id: Uuid,
+) -> Result<ChannelAccess, AppError> {
+    let row = sqlx::query_as::<_, ChannelAccessRow>(
+        "SELECT \
+             (EXISTS(SELECT 1 FROM channels WHERE id = $1) \
+                OR EXISTS(SELECT 1 FROM dm_channels WHERE id = $1)) AS channel_exists, \
+             EXISTS(\
+                 SELECT 1 FROM channels c \
+                 JOIN server_members sm ON sm.server_id = c.server_id \
+                 WHERE c.id = $1 AND sm.user_id = $2 \
+                 UNION ALL \
+                 SELECT 1 FROM dm_members \
+                 WHERE dm_channel_id = $1 AND user_id = $2\
+             ) AS is_member",
+    )
+    .bind(channel_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(if row.is_member {
+        ChannelAccess::Authorized
+    } else if row.channel_exists {
+        ChannelAccess::Forbidden
+    } else {
+        ChannelAccess::NotFound
+    })
+}
+
+#[derive(sqlx::FromRow)]
+struct MessageWithAuthorRow {
+    id: Uuid,
+    channel_id: Uuid,
+    author_id: Option<Uuid>,
+    content: String,
+    edited_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+    author_username: Option<String>,
+    author_avatar_url: Option<String>,
+}
+
+impl MessageWithAuthorRow {
+    fn into_message(self) -> MessageWithAuthor {
+        // author_id is NULL once the account is deleted (ON DELETE SET NULL);
+        // the LEFT JOIN then yields no username either. Both columns travel
+        // together, so matching on the pair keeps the author whole-or-absent.
+        let author = match (self.author_id, self.author_username) {
+            (Some(id), Some(username)) => Some(MessageAuthor {
+                id,
+                username,
+                avatar_url: self.author_avatar_url,
+            }),
+            _ => None,
+        };
+
+        MessageWithAuthor {
+            id: self.id,
+            channel_id: self.channel_id,
+            author,
+            content: self.content,
+            edited_at: self.edited_at,
+            created_at: self.created_at,
+        }
+    }
+}
+
+/// Fetch up to `limit` messages from a channel, newest first, paginating
+/// backwards from (but excluding) the `before` message when given.
+///
+/// The cursor compares the `(created_at, id)` tuple rather than `created_at`
+/// alone: message ids are random UUIDv4, not time-ordered, so two messages can
+/// share a `created_at`. The tuple gives a total order that matches the
+/// `ORDER BY` exactly, so pages never drop or repeat a row at a timestamp
+/// boundary. A `before` id that isn't in this channel yields no rows.
+pub async fn list_channel_messages(
+    pool: &PgPool,
+    channel_id: Uuid,
+    before: Option<Uuid>,
+    limit: i64,
+) -> Result<Vec<MessageWithAuthor>, AppError> {
+    let rows = sqlx::query_as::<_, MessageWithAuthorRow>(
+        "SELECT m.id, m.channel_id, m.author_id, m.content, \
+                m.edited_at, m.created_at, \
+                u.username AS author_username, \
+                u.avatar_url AS author_avatar_url \
+         FROM messages m \
+         LEFT JOIN users u ON u.id = m.author_id \
+         WHERE m.channel_id = $1 \
+           AND ($2::uuid IS NULL OR (m.created_at, m.id) < (\
+                   SELECT created_at, id FROM messages \
+                   WHERE id = $2 AND channel_id = $1\
+               )) \
+         ORDER BY m.created_at DESC, m.id DESC \
+         LIMIT $3",
+    )
+    .bind(channel_id)
+    .bind(before)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(MessageWithAuthorRow::into_message)
+        .collect())
 }
 
 pub async fn get_message_channel(
@@ -423,6 +557,27 @@ pub async fn list_channel_ids_for_user(
         "SELECT c.id FROM channels c \
          JOIN server_members sm ON sm.server_id = c.server_id \
          WHERE sm.user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(ids)
+}
+
+/// Distinct other users who share at least one server with `user_id`. These
+/// are the "relevant users" for presence: the people who should learn when
+/// `user_id` comes online, changes status, or goes offline. `user_id` itself
+/// is excluded.
+pub async fn list_shared_server_user_ids(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Vec<Uuid>, AppError> {
+    let ids = sqlx::query_scalar::<_, Uuid>(
+        "SELECT DISTINCT peer.user_id \
+         FROM server_members me \
+         JOIN server_members peer ON peer.server_id = me.server_id \
+         WHERE me.user_id = $1 AND peer.user_id <> $1",
     )
     .bind(user_id)
     .fetch_all(pool)
@@ -901,6 +1056,147 @@ pub async fn reorder_channels(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// dm_channels
+// ---------------------------------------------------------------------------
+
+#[derive(sqlx::FromRow)]
+struct DmChannelRow {
+    id: Uuid,
+    name: Option<String>,
+    is_group: bool,
+    owner_id: Option<Uuid>,
+    created_at: DateTime<Utc>,
+}
+
+impl DmChannelRow {
+    fn into_dm_channel(self) -> DmChannel {
+        DmChannel {
+            id: self.id,
+            name: self.name,
+            is_group: self.is_group,
+            owner_id: self.owner_id,
+            created_at: self.created_at,
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct DmParticipantRow {
+    user_id: Uuid,
+    username: String,
+    avatar_url: Option<String>,
+}
+
+impl DmParticipantRow {
+    fn into_participant(self) -> DmParticipant {
+        DmParticipant {
+            user_id: self.user_id,
+            username: self.username,
+            avatar_url: self.avatar_url,
+        }
+    }
+}
+
+pub async fn user_exists(pool: &PgPool, user_id: Uuid) -> Result<bool, AppError> {
+    let result = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(result)
+}
+
+/// Return the 1:1 DM channel between `user_a` and `user_b`, creating it (with
+/// both `dm_members` rows) if none exists. The `bool` is true when a new
+/// channel was inserted, false when an existing one was returned.
+///
+/// Find-or-create is inherently racy: two concurrent requests for the same
+/// pair could both miss the lookup and each insert a channel, leaving two 1:1
+/// DMs where the schema intends one (there is no unique constraint that would
+/// catch it — the pair lives across two `dm_members` rows). We serialize on a
+/// transaction-scoped advisory lock keyed on the *unordered* pair, so (A, B)
+/// and (B, A) contend for the same lock; the loser then sees the winner's
+/// channel in the lookup. The lock releases automatically at commit/rollback.
+pub async fn find_or_create_dm_channel(
+    pool: &PgPool,
+    user_a: Uuid,
+    user_b: Uuid,
+) -> Result<(DmChannel, bool), AppError> {
+    let mut tx = pool.begin().await.map_err(|e| AppError::Internal(e.to_string()))?;
+
+    // Canonical (order-independent) key for the pair → one bigint lock id.
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(\
+             ('x' || substr(\
+                 md5(LEAST($1::text, $2::text) || '|' || GREATEST($1::text, $2::text)), \
+                 1, 16))::bit(64)::bigint)",
+    )
+    .bind(user_a)
+    .bind(user_b)
+    .execute(&mut *tx)
+    .await?;
+
+    // A 1:1 DM is a non-group channel whose membership is exactly {a, b}: both
+    // present and no third member.
+    let existing = sqlx::query_as::<_, DmChannelRow>(
+        "SELECT dc.id, dc.name, dc.is_group, dc.owner_id, dc.created_at \
+         FROM dm_channels dc \
+         WHERE dc.is_group = false \
+           AND EXISTS(SELECT 1 FROM dm_members WHERE dm_channel_id = dc.id AND user_id = $1) \
+           AND EXISTS(SELECT 1 FROM dm_members WHERE dm_channel_id = dc.id AND user_id = $2) \
+           AND (SELECT count(*) FROM dm_members WHERE dm_channel_id = dc.id) = 2 \
+         LIMIT 1",
+    )
+    .bind(user_a)
+    .bind(user_b)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if let Some(row) = existing {
+        tx.commit().await.map_err(|e| AppError::Internal(e.to_string()))?;
+        return Ok((row.into_dm_channel(), false));
+    }
+
+    let channel = sqlx::query_as::<_, DmChannelRow>(
+        "INSERT INTO dm_channels (is_group) VALUES (false) \
+         RETURNING id, name, is_group, owner_id, created_at",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+
+    sqlx::query("INSERT INTO dm_members (dm_channel_id, user_id) VALUES ($1, $2), ($1, $3)")
+        .bind(channel.id)
+        .bind(user_a)
+        .bind(user_b)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await.map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok((channel.into_dm_channel(), true))
+}
+
+pub async fn list_dm_participants(
+    pool: &PgPool,
+    dm_channel_id: Uuid,
+) -> Result<Vec<DmParticipant>, AppError> {
+    let rows = sqlx::query_as::<_, DmParticipantRow>(
+        "SELECT u.id AS user_id, u.username, u.avatar_url \
+         FROM dm_members dm \
+         JOIN users u ON u.id = dm.user_id \
+         WHERE dm.dm_channel_id = $1 \
+         ORDER BY dm.joined_at, u.id",
+    )
+    .bind(dm_channel_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(DmParticipantRow::into_participant).collect())
+}
+
 impl UserRow {
     fn into_user(self) -> Result<User, AppError> {
         let status = self
@@ -932,27 +1228,6 @@ impl UserRow {
 // ---------------------------------------------------------------------------
 // direct messages (group DMs)
 // ---------------------------------------------------------------------------
-
-#[derive(sqlx::FromRow)]
-struct DmChannelRow {
-    id: Uuid,
-    name: Option<String>,
-    is_group: bool,
-    owner_id: Option<Uuid>,
-    created_at: DateTime<Utc>,
-}
-
-impl DmChannelRow {
-    fn into_dm_channel(self) -> DmChannel {
-        DmChannel {
-            id: self.id,
-            name: self.name,
-            is_group: self.is_group,
-            owner_id: self.owner_id,
-            created_at: self.created_at,
-        }
-    }
-}
 
 pub async fn insert_dm_channel<'e, E>(
     executor: E,
@@ -1001,15 +1276,6 @@ pub async fn existing_user_ids(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<Uuid>,
         .await?;
 
     Ok(rows)
-}
-
-pub async fn user_exists(pool: &PgPool, user_id: Uuid) -> Result<bool, AppError> {
-    let exists = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)")
-        .bind(user_id)
-        .fetch_one(pool)
-        .await?;
-
-    Ok(exists)
 }
 
 /// Fetch a group DM by id. Returns `None` for a missing channel or a 1:1 DM —

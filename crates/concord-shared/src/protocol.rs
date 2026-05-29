@@ -39,6 +39,7 @@ pub enum ClientMsg {
     JoinChannel { channel_id: Uuid },
     LeaveChannel { channel_id: Uuid },
     StartTyping { channel_id: Uuid },
+    StopTyping { channel_id: Uuid },
 
     // Servers
     CreateServer { name: String },
@@ -51,6 +52,13 @@ pub enum ClientMsg {
 
     // Presence
     UpdateStatus { status: UserStatus },
+}
+
+/// A single peer's presence, used in `ServerMsg::PresenceSnapshot`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserPresence {
+    pub user_id: Uuid,
+    pub status: UserStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,15 +84,30 @@ pub enum ServerMsg {
     },
 
     // Typing
-    UserTyping {
+    //
+    // Clients must self-expire a typing indicator a few seconds after the last
+    // `TypingStarted` rather than wait for `TypingStopped`: the server emits the
+    // stop on the happy path, but it can be lost if the originating instance
+    // crashes or a network partition drops the cross-instance event.
+    TypingStarted {
+        channel_id: Uuid,
+        user_id: Uuid,
+    },
+    TypingStopped {
         channel_id: Uuid,
         user_id: Uuid,
     },
 
     // Presence
-    PresenceUpdate {
+    UserStatusChanged {
         user_id: Uuid,
         status: UserStatus,
+    },
+    /// Initial presence of the connecting user's relevant peers (members of
+    /// shared servers), sent once right after authentication. Only non-offline
+    /// peers are listed; anyone absent is implicitly offline.
+    PresenceSnapshot {
+        users: Vec<UserPresence>,
     },
 
     // Membership

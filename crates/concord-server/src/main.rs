@@ -4,8 +4,10 @@ use sqlx::postgres::PgPoolOptions;
 
 use concord_server::config::Config;
 use concord_server::hub::Hub;
+use concord_server::presence::Presence;
 use concord_server::routes;
 use concord_server::state::AppState;
+use concord_server::typing::{self, Typing, SWEEP_INTERVAL, TYPING_TTL};
 
 #[tokio::main]
 async fn main() {
@@ -45,10 +47,52 @@ async fn main() {
             .set_redirect_uri(RedirectUrl::new(g.redirect_url).unwrap())
     });
 
+    let presence = match &cfg.redis_url {
+        Some(url) => match Presence::connect(url, cfg.presence_ttl).await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("redis unavailable, presence persistence disabled: {e}");
+                Presence::disabled()
+            }
+        },
+        None => {
+            eprintln!("REDIS_URL not set, presence persistence disabled");
+            Presence::disabled()
+        }
+    };
+
+    // Optional Redis: a connection manager for publishing typing events and a
+    // raw client for the pub/sub subscriber. On any failure we log and fall
+    // back to in-process fan-out rather than refusing to start.
+    let (redis_publisher, redis_client) = match cfg.redis_url.as_deref() {
+        None => (None, None),
+        Some(url) => match redis::Client::open(url) {
+            Ok(client) => match redis::aio::ConnectionManager::new(client.clone()).await {
+                Ok(manager) => (Some(manager), Some(client)),
+                Err(e) => {
+                    eprintln!("redis connection failed ({e}); typing falls back to in-process");
+                    (None, None)
+                }
+            },
+            Err(e) => {
+                eprintln!("invalid REDIS_URL ({e}); typing falls back to in-process");
+                (None, None)
+            }
+        },
+    };
+
     let hub = Arc::new(Hub::new());
+    let typing = Arc::new(Typing::new(Arc::clone(&hub), TYPING_TTL, redis_publisher));
+    Arc::clone(&typing).spawn_sweeper(SWEEP_INTERVAL);
+    if let Some(client) = redis_client {
+        typing::spawn_subscriber(client, Arc::clone(&typing));
+    }
+
     let state = Arc::new(AppState {
         pool,
         hub,
+        presence,
+        typing,
         jwt_secret: cfg.jwt_secret.into(),
         github_oauth,
         google_oauth,
