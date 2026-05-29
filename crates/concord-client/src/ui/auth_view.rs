@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::{h_flex, v_flex, Disableable};
+use gpui_component::{h_flex, v_flex, Disableable, Icon, IconName, Sizable};
 
 use concord_shared::types::OAuthProvider;
 use concord_shared::validation::{validate_email, validate_password, validate_username};
@@ -251,17 +251,40 @@ impl AuthView {
             .child(div().h(px(1.0)).flex_1().bg(color::border()))
     }
 
+    /// A branded OAuth button: provider icon + label on a solid colored
+    /// surface. Built as a styled row rather than a `Button` so the brand
+    /// colors aren't overridden by the component theme.
+    ///
+    /// `flex_1` (not `w_full`): the two buttons share the row. With `w_full`
+    /// each claims the full card width and the second overflows off the side.
+    #[allow(clippy::too_many_arguments)]
     fn oauth_button(
         &self,
         id: &'static str,
+        icon: Icon,
         label: &'static str,
+        bg: Hsla,
+        bg_hover: Hsla,
+        fg: Hsla,
         provider: OAuthProvider,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        Button::new(id)
-            .label(label)
-            .outline()
-            .w_full()
+        h_flex()
+            .id(id)
+            .flex_1()
+            .h(px(40.0))
+            .items_center()
+            .justify_center()
+            .gap(px(space::SM))
+            .rounded(px(space::XS))
+            .bg(bg)
+            .text_color(fg)
+            .text_size(px(font::SM))
+            .font_weight(FontWeight::MEDIUM)
+            .hover(move |s| s.bg(bg_hover))
+            .cursor_pointer()
+            .child(icon.small())
+            .child(label)
             .on_click(cx.listener(move |this, _, _, cx| this.start_oauth(provider, cx)))
     }
 
@@ -352,13 +375,23 @@ impl Render for AuthView {
                             .gap(px(space::SM))
                             .child(self.oauth_button(
                                 "oauth-github",
+                                Icon::new(IconName::Github).text_color(rgb(0xffffff)),
                                 "GitHub",
+                                rgb(0x24292f).into(),
+                                rgb(0x32383f).into(),
+                                rgb(0xffffff).into(),
                                 OAuthProvider::Github,
                                 cx,
                             ))
                             .child(self.oauth_button(
                                 "oauth-google",
+                                Icon::empty()
+                                    .path("icons/google.svg")
+                                    .text_color(rgb(0x4285f4)),
                                 "Google",
+                                rgb(0xffffff).into(),
+                                rgb(0xf2f2f2).into(),
+                                rgb(0x3c4043).into(),
                                 OAuthProvider::Google,
                                 cx,
                             )),
