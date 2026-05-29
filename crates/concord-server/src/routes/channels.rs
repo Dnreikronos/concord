@@ -1,19 +1,24 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::patch;
+use axum::routing::{get, patch};
 use axum::{Json, Router};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use concord_shared::types::{Channel, ChannelType};
+use concord_shared::types::{Channel, ChannelType, MessageWithAuthor};
 use concord_shared::validation::{validate_channel_name, validate_channel_topic};
 
-use crate::db;
+use crate::db::{self, ChannelAccess};
 use crate::error::AppError;
 use crate::extractors::AuthUser;
 use crate::state::AppState;
+
+/// Default page size when `?limit` is omitted.
+const DEFAULT_MESSAGE_LIMIT: i64 = 50;
+/// Upper bound on `?limit`; larger values are clamped down.
+const MAX_MESSAGE_LIMIT: i64 = 100;
 
 #[derive(Deserialize)]
 pub struct CreateChannelRequest {
@@ -43,8 +48,48 @@ where
     Ok(Some(Option::deserialize(deserializer)?))
 }
 
+#[derive(Deserialize)]
+struct MessageHistoryQuery {
+    /// Return messages strictly older than this message id (the cursor).
+    #[serde(default)]
+    before: Option<Uuid>,
+    /// Page size; clamped to `[1, MAX_MESSAGE_LIMIT]`, defaults to
+    /// `DEFAULT_MESSAGE_LIMIT`.
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
 pub fn router() -> Router<Arc<AppState>> {
-    Router::new().route("/{id}", patch(update_channel).delete(delete_channel))
+    Router::new()
+        .route("/{id}", patch(update_channel).delete(delete_channel))
+        .route("/{id}/messages", get(list_messages))
+}
+
+/// `GET /api/channels/{id}/messages` — cursor-paginated history, newest first.
+///
+/// Works for both server channels and DM channels; access is gated on
+/// membership of whichever kind `{id}` names.
+async fn list_messages(
+    State(state): State<Arc<AppState>>,
+    auth: AuthUser,
+    Path(channel_id): Path<Uuid>,
+    Query(query): Query<MessageHistoryQuery>,
+) -> Result<Json<Vec<MessageWithAuthor>>, AppError> {
+    match db::check_channel_read_access(&state.pool, channel_id, auth.user_id).await? {
+        ChannelAccess::Authorized => {}
+        ChannelAccess::Forbidden => return Err(AppError::Forbidden),
+        ChannelAccess::NotFound => return Err(AppError::NotFound),
+    }
+
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_MESSAGE_LIMIT)
+        .clamp(1, MAX_MESSAGE_LIMIT);
+
+    let messages =
+        db::list_channel_messages(&state.pool, channel_id, query.before, limit).await?;
+
+    Ok(Json(messages))
 }
 
 pub async fn create_channel(

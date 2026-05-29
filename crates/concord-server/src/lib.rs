@@ -7,3 +7,4 @@ pub mod jwt;
 pub mod presence;
 pub mod routes;
 pub mod state;
+pub mod typing;

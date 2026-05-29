@@ -8,6 +8,7 @@ use sqlx::PgPool;
 
 use crate::hub::Hub;
 use crate::presence::Presence;
+use crate::typing::Typing;
 
 pub type ConfiguredOAuthClient =
     BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
@@ -19,6 +20,7 @@ pub struct AppState {
     /// unreachable store degrades to in-process-only presence rather than
     /// breaking connections.
     pub presence: Presence,
+    pub typing: Arc<Typing>,
     pub jwt_secret: SecretString,
     pub github_oauth: Option<ConfiguredOAuthClient>,
     pub google_oauth: Option<ConfiguredOAuthClient>,

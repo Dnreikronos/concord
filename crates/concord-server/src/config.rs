@@ -55,8 +55,9 @@ pub struct Config {
     pub jwt_secret: String,
     pub github_oauth: Option<GitHubOAuthConfig>,
     pub google_oauth: Option<GoogleOAuthConfig>,
-    /// Redis connection URL for the presence store. Optional: when unset the
-    /// server runs with presence persistence disabled.
+    /// Redis connection URL shared by the presence store and cross-instance
+    /// typing pub/sub. Optional: when unset, presence persistence is disabled
+    /// and typing indicators fan out in-process only.
     pub redis_url: Option<String>,
     /// How long a presence entry lives in Redis before expiring. The
     /// per-connection heartbeat re-arms it at half this interval, so a value

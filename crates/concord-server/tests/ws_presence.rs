@@ -17,6 +17,7 @@ use concord_server::jwt;
 use concord_server::presence::Presence;
 use concord_server::routes;
 use concord_server::state::AppState;
+use concord_server::typing::{Typing, TYPING_TTL};
 use concord_shared::protocol::{ClientMsg, ServerMsg, Token};
 use concord_shared::types::UserStatus;
 
@@ -68,9 +69,12 @@ async fn test_presence() -> Presence {
 /// Bind the real router over loopback with the given pool + presence store and
 /// return the `ws://.../ws` URL.
 async fn spawn_server(pool: PgPool, presence: Presence) -> String {
+    let hub = Arc::new(Hub::new());
+    let typing = Arc::new(Typing::new(Arc::clone(&hub), TYPING_TTL, None));
     let state = Arc::new(AppState {
         pool,
-        hub: Arc::new(Hub::new()),
+        hub,
+        typing,
         presence,
         jwt_secret: secrecy::SecretString::from(JWT_SECRET),
         github_oauth: None,

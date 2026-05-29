@@ -2,7 +2,9 @@ use chrono::{DateTime, Utc};
 use sqlx::{Executor, PgPool, Postgres};
 use uuid::Uuid;
 
-use concord_shared::types::{Channel, MemberInfo, Server, ServerInvite, User};
+use concord_shared::types::{
+    Channel, MemberInfo, MessageAuthor, MessageWithAuthor, Server, ServerInvite, User,
+};
 
 use crate::error::AppError;
 
@@ -123,6 +125,137 @@ pub async fn insert_message(
     .await?;
 
     Ok(row)
+}
+
+/// Whether a user may read a channel's message history.
+///
+/// A path `{id}` may name either a server channel (`channels`) or a DM channel
+/// (`dm_channels`). Both id spaces are disjoint random UUIDs, so a single
+/// lookup resolves which kind it is and whether the caller belongs to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelAccess {
+    /// The caller is a member and may read the channel.
+    Authorized,
+    /// The channel exists but the caller is not a member.
+    Forbidden,
+    /// No channel — server or DM — has this id.
+    NotFound,
+}
+
+#[derive(sqlx::FromRow)]
+struct ChannelAccessRow {
+    channel_exists: bool,
+    is_member: bool,
+}
+
+pub async fn check_channel_read_access(
+    pool: &PgPool,
+    channel_id: Uuid,
+    user_id: Uuid,
+) -> Result<ChannelAccess, AppError> {
+    let row = sqlx::query_as::<_, ChannelAccessRow>(
+        "SELECT \
+             (EXISTS(SELECT 1 FROM channels WHERE id = $1) \
+                OR EXISTS(SELECT 1 FROM dm_channels WHERE id = $1)) AS channel_exists, \
+             EXISTS(\
+                 SELECT 1 FROM channels c \
+                 JOIN server_members sm ON sm.server_id = c.server_id \
+                 WHERE c.id = $1 AND sm.user_id = $2 \
+                 UNION ALL \
+                 SELECT 1 FROM dm_members \
+                 WHERE dm_channel_id = $1 AND user_id = $2\
+             ) AS is_member",
+    )
+    .bind(channel_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(if row.is_member {
+        ChannelAccess::Authorized
+    } else if row.channel_exists {
+        ChannelAccess::Forbidden
+    } else {
+        ChannelAccess::NotFound
+    })
+}
+
+#[derive(sqlx::FromRow)]
+struct MessageWithAuthorRow {
+    id: Uuid,
+    channel_id: Uuid,
+    author_id: Option<Uuid>,
+    content: String,
+    edited_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+    author_username: Option<String>,
+    author_avatar_url: Option<String>,
+}
+
+impl MessageWithAuthorRow {
+    fn into_message(self) -> MessageWithAuthor {
+        // author_id is NULL once the account is deleted (ON DELETE SET NULL);
+        // the LEFT JOIN then yields no username either. Both columns travel
+        // together, so matching on the pair keeps the author whole-or-absent.
+        let author = match (self.author_id, self.author_username) {
+            (Some(id), Some(username)) => Some(MessageAuthor {
+                id,
+                username,
+                avatar_url: self.author_avatar_url,
+            }),
+            _ => None,
+        };
+
+        MessageWithAuthor {
+            id: self.id,
+            channel_id: self.channel_id,
+            author,
+            content: self.content,
+            edited_at: self.edited_at,
+            created_at: self.created_at,
+        }
+    }
+}
+
+/// Fetch up to `limit` messages from a channel, newest first, paginating
+/// backwards from (but excluding) the `before` message when given.
+///
+/// The cursor compares the `(created_at, id)` tuple rather than `created_at`
+/// alone: message ids are random UUIDv4, not time-ordered, so two messages can
+/// share a `created_at`. The tuple gives a total order that matches the
+/// `ORDER BY` exactly, so pages never drop or repeat a row at a timestamp
+/// boundary. A `before` id that isn't in this channel yields no rows.
+pub async fn list_channel_messages(
+    pool: &PgPool,
+    channel_id: Uuid,
+    before: Option<Uuid>,
+    limit: i64,
+) -> Result<Vec<MessageWithAuthor>, AppError> {
+    let rows = sqlx::query_as::<_, MessageWithAuthorRow>(
+        "SELECT m.id, m.channel_id, m.author_id, m.content, \
+                m.edited_at, m.created_at, \
+                u.username AS author_username, \
+                u.avatar_url AS author_avatar_url \
+         FROM messages m \
+         LEFT JOIN users u ON u.id = m.author_id \
+         WHERE m.channel_id = $1 \
+           AND ($2::uuid IS NULL OR (m.created_at, m.id) < (\
+                   SELECT created_at, id FROM messages \
+                   WHERE id = $2 AND channel_id = $1\
+               )) \
+         ORDER BY m.created_at DESC, m.id DESC \
+         LIMIT $3",
+    )
+    .bind(channel_id)
+    .bind(before)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(MessageWithAuthorRow::into_message)
+        .collect())
 }
 
 pub async fn get_message_channel(
