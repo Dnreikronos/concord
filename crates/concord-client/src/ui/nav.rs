@@ -21,15 +21,6 @@ impl View {
             View::Settings => "Settings",
         }
     }
-
-    /// Short glyph used on the server-rail button.
-    pub fn glyph(self) -> &'static str {
-        match self {
-            View::Servers => "C",
-            View::DirectMessages => "DM",
-            View::Settings => "⚙",
-        }
-    }
 }
 
 /// Tracks which [`View`] is currently active.
