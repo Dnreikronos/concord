@@ -1,10 +1,12 @@
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use sqlx::{Executor, PgPool, Postgres};
 use uuid::Uuid;
 
 use concord_shared::types::{
-    Channel, DmChannel, DmParticipant, MemberInfo, MessageAuthor, MessageWithAuthor, Server,
-    ServerInvite, User,
+    Channel, DmChannel, DmConversation, DmLastMessage, DmParticipant, MemberInfo, MessageAuthor,
+    MessageWithAuthor, Server, ServerInvite, User,
 };
 
 use crate::error::AppError;
@@ -1472,4 +1474,198 @@ pub async fn remove_dm_member(
 
     tx.commit().await.map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// DM conversation list + read state (issue #24)
+// ---------------------------------------------------------------------------
+
+#[derive(sqlx::FromRow)]
+struct DmConversationRow {
+    id: Uuid,
+    name: Option<String>,
+    is_group: bool,
+    owner_id: Option<Uuid>,
+    created_at: DateTime<Utc>,
+    last_message_id: Option<Uuid>,
+    last_message_author_id: Option<Uuid>,
+    last_message_author_username: Option<String>,
+    last_message_author_avatar_url: Option<String>,
+    last_message_content: Option<String>,
+    last_message_created_at: Option<DateTime<Utc>>,
+    unread: bool,
+}
+
+#[derive(sqlx::FromRow)]
+struct DmListParticipantRow {
+    dm_channel_id: Uuid,
+    user_id: Uuid,
+    username: String,
+    avatar_url: Option<String>,
+}
+
+/// List every DM `user_id` belongs to — 1:1 and group alike — newest activity
+/// first, for the DM-list endpoint.
+///
+/// Each row carries the channel, its member count, a preview of the latest
+/// message (via a `LATERAL` top-1 over the shared `messages` table, keyed by
+/// the dm_channel id), and the caller's `unread` flag. Unread is true when a
+/// message from *another* member is newer than the caller's `last_read_at`; a
+/// member who never read the DM has no `dm_read_state` row, which the
+/// `COALESCE(..., '-infinity')` treats as "everything from others is unread".
+///
+/// Ordering is by last-message time, `NULLS LAST` so a conversation with no
+/// messages sorts below active ones, then by channel `created_at` as the
+/// tie-break (newest first), then `id` for a total, stable order.
+///
+/// Participants are resolved in a second query over the returned channel ids
+/// and stitched back in, so the whole list costs two round trips rather than
+/// one per conversation.
+pub async fn list_dm_conversations(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Vec<DmConversation>, AppError> {
+    let rows = sqlx::query_as::<_, DmConversationRow>(
+        "SELECT \
+             dc.id, dc.name, dc.is_group, dc.owner_id, dc.created_at, \
+             lm.id AS last_message_id, \
+             lm.author_id AS last_message_author_id, \
+             au.username AS last_message_author_username, \
+             au.avatar_url AS last_message_author_avatar_url, \
+             lm.content AS last_message_content, \
+             lm.created_at AS last_message_created_at, \
+             EXISTS( \
+                 SELECT 1 FROM messages msg \
+                 WHERE msg.channel_id = dc.id \
+                   AND msg.author_id IS DISTINCT FROM $1 \
+                   AND msg.created_at > COALESCE(rs.last_read_at, '-infinity'::timestamptz) \
+             ) AS unread \
+         FROM dm_channels dc \
+         JOIN dm_members me ON me.dm_channel_id = dc.id AND me.user_id = $1 \
+         LEFT JOIN dm_read_state rs ON rs.dm_channel_id = dc.id AND rs.user_id = $1 \
+         LEFT JOIN LATERAL ( \
+             SELECT id, author_id, content, created_at \
+             FROM messages \
+             WHERE channel_id = dc.id \
+             ORDER BY created_at DESC, id DESC \
+             LIMIT 1 \
+         ) lm ON true \
+         LEFT JOIN users au ON au.id = lm.author_id \
+         ORDER BY lm.created_at DESC NULLS LAST, dc.created_at DESC, dc.id DESC",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+    let mut participants = list_participants_for_channels(pool, &ids).await?;
+
+    let conversations = rows
+        .into_iter()
+        .map(|r| {
+            // The three message columns travel together (all from the LATERAL
+            // top-1 row), so matching on the trio keeps the preview whole or
+            // absent. author resolves independently: a deleted sender leaves
+            // author_id NULL and the LEFT JOIN yields no username.
+            let last_message =
+                match (r.last_message_id, r.last_message_content, r.last_message_created_at) {
+                    (Some(id), Some(content), Some(created_at)) => {
+                        let author =
+                            match (r.last_message_author_id, r.last_message_author_username) {
+                                (Some(aid), Some(username)) => Some(MessageAuthor {
+                                    id: aid,
+                                    username,
+                                    avatar_url: r.last_message_author_avatar_url,
+                                }),
+                                _ => None,
+                            };
+                        Some(DmLastMessage {
+                            id,
+                            author,
+                            content,
+                            created_at,
+                        })
+                    }
+                    _ => None,
+                };
+
+            // member_count is the resolved participant count rather than a
+            // separate COUNT(*): every dm_members row has a live users row
+            // (FK cascades on user delete), so the two are identical, and
+            // deriving it here keeps count and list from the same snapshot.
+            let members = participants.remove(&r.id).unwrap_or_default();
+
+            DmConversation {
+                id: r.id,
+                name: r.name,
+                is_group: r.is_group,
+                owner_id: r.owner_id,
+                created_at: r.created_at,
+                member_count: members.len() as i64,
+                participants: members,
+                last_message,
+                unread: r.unread,
+            }
+        })
+        .collect();
+
+    Ok(conversations)
+}
+
+/// Resolve the participants of every channel in `ids` in one query, grouped by
+/// channel. Members within a channel keep the `joined_at, id` order used by
+/// [`list_dm_participants`].
+async fn list_participants_for_channels(
+    pool: &PgPool,
+    ids: &[Uuid],
+) -> Result<HashMap<Uuid, Vec<DmParticipant>>, AppError> {
+    let rows = sqlx::query_as::<_, DmListParticipantRow>(
+        "SELECT dm.dm_channel_id, u.id AS user_id, u.username, u.avatar_url \
+         FROM dm_members dm \
+         JOIN users u ON u.id = dm.user_id \
+         WHERE dm.dm_channel_id = ANY($1) \
+         ORDER BY dm.dm_channel_id, dm.joined_at, u.id",
+    )
+    .bind(ids)
+    .fetch_all(pool)
+    .await?;
+
+    let mut by_channel: HashMap<Uuid, Vec<DmParticipant>> = HashMap::new();
+    for row in rows {
+        by_channel
+            .entry(row.dm_channel_id)
+            .or_default()
+            .push(DmParticipant {
+                user_id: row.user_id,
+                username: row.username,
+                avatar_url: row.avatar_url,
+            });
+    }
+
+    Ok(by_channel)
+}
+
+/// Mark a DM read for `user_id` as of now: a conversation with no message from
+/// another member newer than this becomes "read". Upserts the high-water mark,
+/// so calling it repeatedly just advances `last_read_at`.
+pub async fn mark_dm_read(
+    pool: &PgPool,
+    dm_channel_id: Uuid,
+    user_id: Uuid,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "INSERT INTO dm_read_state (dm_channel_id, user_id, last_read_at) \
+         VALUES ($1, $2, now()) \
+         ON CONFLICT (dm_channel_id, user_id) DO UPDATE SET last_read_at = now()",
+    )
+    .bind(dm_channel_id)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+
+    Ok(())
 }
