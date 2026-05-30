@@ -1571,7 +1571,23 @@ fn render_message(
             .child(initial)
             .into_any_element()
     } else {
-        div().w(px(AVATAR_SIZE)).flex_shrink_0().into_any_element()
+        // Grouped messages leave the avatar slot blank, but reveal their
+        // send time there while the row is hovered (Discord-style).
+        div()
+            .w(px(AVATAR_SIZE))
+            .flex_shrink_0()
+            .flex()
+            .justify_center()
+            .pt(px(3.0))
+            .child(
+                div()
+                    .opacity(0.0)
+                    .group_hover("message", |s| s.opacity(1.0))
+                    .text_size(px(11.0))
+                    .text_color(color::text_faint())
+                    .child(timestamp.clone()),
+            )
+            .into_any_element()
     };
 
     let mut content_col = v_flex().flex_1().min_w(px(0.0)).gap(px(2.0));
@@ -1617,6 +1633,7 @@ fn render_message(
 
     div()
         .w_full()
+        .group("message")
         .px(px(space::MD))
         .pt(px(if show_header { space::MD } else { 1.0 }))
         .pb(px(1.0))
