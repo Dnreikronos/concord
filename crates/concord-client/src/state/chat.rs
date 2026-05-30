@@ -55,6 +55,17 @@ impl ChatState {
         self.loading = false;
     }
 
+    /// Clear the active channel and its history. Used when switching to a
+    /// server that has no text channel to show, so the pane stops rendering
+    /// the previous channel's messages.
+    pub fn close_channel(&mut self) {
+        self.active_channel = None;
+        self.messages.clear();
+        self.typing.clear();
+        self.has_more = false;
+        self.loading = false;
+    }
+
     /// The loaded messages, oldest first.
     pub fn messages(&self) -> &[MessageWithAuthor] {
         &self.messages

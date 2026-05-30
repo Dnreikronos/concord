@@ -109,6 +109,14 @@ pub mod space {
     pub const HEADER: f32 = 48.0;
     /// Side length of a circular rail button.
     pub const RAIL_BUTTON: f32 = 48.0;
+    /// Glyph size of an icon inside a rail button.
+    pub const RAIL_ICON: f32 = 20.0;
+    /// Width of the active-item indicator pill on the server rail.
+    pub const RAIL_PILL_WIDTH: f32 = 4.0;
+    /// Height of the active-item indicator pill.
+    pub const RAIL_PILL_HEIGHT: f32 = 40.0;
+    /// Width of the divider rule under the home / DM shortcut.
+    pub const RAIL_DIVIDER: f32 = 32.0;
 }
 
 /// Font settings in logical pixels.
