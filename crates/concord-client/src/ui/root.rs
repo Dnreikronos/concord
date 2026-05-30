@@ -1754,22 +1754,26 @@ impl ConcordApp {
 
     // -- Member panel -----------------------------------------------------
 
-    /// The chat header's member-list toggle: a person icon that shows or hides
-    /// the right-hand panel, lit brighter while the panel is open.
+    /// The chat header's member-list toggle: a two-person icon that shows or
+    /// hides the right-hand panel. Discord-clean — no filled hover box, the icon
+    /// just brightens from muted to full on hover. Idle muted in both states so
+    /// the brighten reads the same whether the panel is open or closed; the open
+    /// state is conveyed by the panel's presence and the tooltip, not the icon.
     fn member_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let shown = self.show_members;
+        let tooltip: SharedString =
+            if shown { "Hide Member List" } else { "Show Member List" }.into();
         div()
             .id("member-toggle")
             .size(px(32.0))
             .flex()
             .items_center()
             .justify_center()
-            .rounded(px(space::XS))
-            .text_color(if shown { color::text() } else { color::text_muted() })
+            .text_color(color::text_muted())
             .cursor_pointer()
-            .hover(|s| s.bg(color::hover()).text_color(color::text()))
-            .child(Icon::new(IconName::User).with_size(px(20.0)))
-            .tooltip(|window, cx| Tooltip::new("Toggle Member List").build(window, cx))
+            .hover(|s| s.text_color(color::text()))
+            .child(Icon::empty().path("icons/users.svg").with_size(px(20.0)))
+            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_members(cx)))
     }
 
