@@ -922,6 +922,23 @@ impl CategoryRow {
     }
 }
 
+pub async fn list_categories_for_server(
+    pool: &PgPool,
+    server_id: Uuid,
+) -> Result<Vec<concord_shared::types::ChannelCategory>, AppError> {
+    let rows = sqlx::query_as::<_, CategoryRow>(
+        "SELECT id, server_id, name, position, created_at \
+         FROM channel_categories \
+         WHERE server_id = $1 \
+         ORDER BY position, created_at",
+    )
+    .bind(server_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(CategoryRow::into_category).collect())
+}
+
 pub async fn insert_category(
     pool: &PgPool,
     server_id: Uuid,

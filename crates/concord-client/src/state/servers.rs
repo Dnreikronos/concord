@@ -10,14 +10,15 @@ use std::collections::HashMap;
 
 use uuid::Uuid;
 
-use concord_shared::types::{Channel, MemberInfo, Server};
+use concord_shared::types::{Channel, ChannelCategory, MemberInfo, Server};
 
-/// The server list plus per-server channels and members.
+/// The server list plus per-server channels, categories, and members.
 #[derive(Default)]
 pub struct ServersState {
     servers: Vec<Server>,
     active: Option<Uuid>,
     channels: HashMap<Uuid, Vec<Channel>>,
+    categories: HashMap<Uuid, Vec<ChannelCategory>>,
     members: HashMap<Uuid, Vec<MemberInfo>>,
     /// True while the initial server/channel fetch is in flight.
     loading: bool,
@@ -109,6 +110,29 @@ impl ServersState {
         self.channels.insert(server_id, channels);
     }
 
+    /// Categories loaded for `server_id` (empty if none loaded yet).
+    pub fn categories_for(&self, server_id: Uuid) -> &[ChannelCategory] {
+        self.categories
+            .get(&server_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Categories for the active server.
+    pub fn active_categories(&self) -> &[ChannelCategory] {
+        match self.active {
+            Some(id) => self.categories_for(id),
+            None => &[],
+        }
+    }
+
+    /// Store the categories for `server_id`, sorted by `(position, name)` so the
+    /// sidebar renders them in a stable order regardless of fetch order.
+    pub fn set_categories(&mut self, server_id: Uuid, mut categories: Vec<ChannelCategory>) {
+        categories.sort_by(|a, b| a.position.cmp(&b.position).then_with(|| a.name.cmp(&b.name)));
+        self.categories.insert(server_id, categories);
+    }
+
     /// Members loaded for `server_id` (empty if none loaded yet).
     pub fn members_for(&self, server_id: Uuid) -> &[MemberInfo] {
         self.members
@@ -127,7 +151,7 @@ impl ServersState {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use concord_shared::types::{ChannelType, Server};
+    use concord_shared::types::{ChannelCategory, ChannelType, Server};
 
     fn server(name: &str) -> Server {
         Server {
@@ -147,6 +171,16 @@ mod tests {
             name: name.into(),
             topic: None,
             channel_type: ChannelType::Text,
+            position,
+            created_at: Utc::now(),
+        }
+    }
+
+    fn category(server_id: Uuid, name: &str, position: i32) -> ChannelCategory {
+        ChannelCategory {
+            id: Uuid::new_v4(),
+            server_id,
+            name: name.into(),
             position,
             created_at: Utc::now(),
         }
@@ -199,11 +233,31 @@ mod tests {
     }
 
     #[test]
-    fn missing_channels_and_members_are_empty() {
+    fn categories_are_sorted_by_position_then_name() {
+        let mut s = ServersState::new();
+        let srv = server("alpha");
+        let id = srv.id;
+        s.set_servers(vec![srv]);
+        s.set_categories(
+            id,
+            vec![
+                category(id, "zeta", 1),
+                category(id, "alpha", 1),
+                category(id, "first", 0),
+            ],
+        );
+        let names: Vec<_> = s.active_categories().iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["first", "alpha", "zeta"]);
+    }
+
+    #[test]
+    fn missing_channels_categories_and_members_are_empty() {
         let s = ServersState::new();
         assert!(s.channels_for(Uuid::new_v4()).is_empty());
+        assert!(s.categories_for(Uuid::new_v4()).is_empty());
         assert!(s.members_for(Uuid::new_v4()).is_empty());
         assert!(s.active_channels().is_empty());
+        assert!(s.active_categories().is_empty());
     }
 
     #[test]

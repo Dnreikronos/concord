@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use concord_shared::types::{Channel, MemberInfo, MessageWithAuthor, Server};
+use concord_shared::types::{Channel, ChannelCategory, MemberInfo, MessageWithAuthor, Server};
 
 use crate::auth::{api_base_url, http_client};
 
@@ -122,6 +122,15 @@ pub async fn list_channels(
     server_id: Uuid,
 ) -> Result<Vec<Channel>, ApiError> {
     get_json(base_url, token, &format!("api/servers/{server_id}/channels")).await
+}
+
+/// `GET /api/servers/{id}/categories` — the channel categories of `server_id`.
+pub async fn list_categories(
+    base_url: &str,
+    token: &str,
+    server_id: Uuid,
+) -> Result<Vec<ChannelCategory>, ApiError> {
+    get_json(base_url, token, &format!("api/servers/{server_id}/categories")).await
 }
 
 /// `GET /api/servers/{id}/members` — the members of `server_id`.
