@@ -15,13 +15,17 @@
 //! first consumer of the "entity handles passed to views, views subscribe via
 //! `cx.observe`" pattern that the per-feature views will follow.
 
+use std::collections::HashSet;
+
 use gpui::*;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{h_flex, v_flex, Icon, IconName, Sizable};
 use uuid::Uuid;
 
 use concord_shared::protocol::{ServerMsg, Token};
-use concord_shared::types::{ChannelType, MessageAuthor, MessageWithAuthor, Server};
+use concord_shared::types::{
+    Channel, ChannelCategory, ChannelType, MessageAuthor, MessageWithAuthor, Server,
+};
 
 use crate::api;
 use crate::auth;
@@ -50,6 +54,9 @@ pub struct ConcordApp {
     screen: Screen,
     auth: Entity<AuthView>,
     nav: NavState,
+    /// Channel categories the user has collapsed in the sidebar, by id. Pure
+    /// view state: it survives re-renders but is not persisted across sessions.
+    collapsed_categories: HashSet<Uuid>,
 
     // Shared application state, handed to views as entity handles.
     auth_state: Entity<AuthState>,
@@ -89,6 +96,7 @@ impl ConcordApp {
             screen: Screen::Auth,
             auth,
             nav: NavState::new(),
+            collapsed_categories: HashSet::new(),
             auth_state,
             servers,
             chat,
@@ -345,6 +353,9 @@ impl ConcordApp {
             for (server_id, channels) in data.channels {
                 s.set_channels(server_id, channels);
             }
+            for (server_id, categories) in data.categories {
+                s.set_categories(server_id, categories);
+            }
             cx.notify();
         });
 
@@ -439,6 +450,15 @@ impl ConcordApp {
             cx.notify();
         });
         self.load_history(channel_id, cx);
+    }
+
+    /// Collapse or expand a sidebar channel category, toggling its membership in
+    /// the collapsed set.
+    fn toggle_category(&mut self, category_id: Uuid, cx: &mut Context<Self>) {
+        if !self.collapsed_categories.insert(category_id) {
+            self.collapsed_categories.remove(&category_id);
+        }
+        cx.notify();
     }
 
     /// Fetch the newest page of history for `channel_id`.
@@ -732,35 +752,103 @@ impl ConcordApp {
             .child(body)
     }
 
-    /// The active server's channel rows, with loading and empty states.
+    /// The active server's channels, grouped under collapsible category headers.
+    /// Uncategorized channels render first (Discord-style, with no header), then
+    /// each category in turn; loading and empty states replace the whole list.
     fn channel_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let active_channel = self.chat.read(cx).active_channel();
         // Collect owned data first so the `servers` borrow is dropped before the
         // per-row `cx.listener` calls reborrow `cx`.
-        let (loading, channels): (bool, Vec<(Uuid, String, ChannelType)>) = {
+        let (loading, channels, categories) = {
             let servers = self.servers.read(cx);
-            (
-                servers.is_loading(),
-                servers
-                    .active_channels()
-                    .iter()
-                    .map(|c| (c.id, c.name.clone(), c.channel_type))
-                    .collect(),
-            )
+            let channels: Vec<(Uuid, String, ChannelType, Option<Uuid>)> = servers
+                .active_channels()
+                .iter()
+                .map(|c| (c.id, c.name.clone(), c.channel_type, c.category_id))
+                .collect();
+            let categories: Vec<(Uuid, String)> = servers
+                .active_categories()
+                .iter()
+                .map(|c| (c.id, c.name.clone()))
+                .collect();
+            (servers.is_loading(), channels, categories)
         };
 
-        let mut list = v_flex().flex_1().p(px(space::SM)).gap(px(space::XS));
+        let mut list = v_flex()
+            .id("channel-list")
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .p(px(space::SM))
+            .gap(px(space::XS));
+
         if loading {
-            list = list.child(Self::muted_row("Loading…"));
-        } else if channels.is_empty() {
-            list = list.child(Self::muted_row("No channels yet."));
-        } else {
-            for (id, name, channel_type) in channels {
-                let selected = active_channel == Some(id);
-                list = list.child(self.channel_row(id, &name, channel_type, selected, cx));
+            return list.child(Self::muted_row("Loading…"));
+        }
+        if channels.is_empty() && categories.is_empty() {
+            return list.child(Self::muted_row("No channels yet."));
+        }
+
+        // A channel is "ungrouped" when it has no category, or references one
+        // that did not load; those render at the top with no header so a failed
+        // category fetch never hides channels entirely.
+        let known: HashSet<Uuid> = categories.iter().map(|(id, _)| *id).collect();
+        for (id, name, channel_type, _) in channels
+            .iter()
+            .filter(|c| c.3.is_none_or(|cid| !known.contains(&cid)))
+        {
+            let selected = active_channel == Some(*id);
+            list = list.child(self.channel_row(*id, name, *channel_type, selected, cx));
+        }
+
+        // Then each category, with its channels nested under a collapsible head.
+        for (category_id, category_name) in &categories {
+            let collapsed = self.collapsed_categories.contains(category_id);
+            list = list.child(self.category_header(*category_id, category_name, collapsed, cx));
+            if collapsed {
+                continue;
+            }
+            for (id, name, channel_type, _) in channels.iter().filter(|c| c.3 == Some(*category_id))
+            {
+                let selected = active_channel == Some(*id);
+                list = list.child(self.channel_row(*id, name, *channel_type, selected, cx));
             }
         }
         list
+    }
+
+    /// A clickable category header: a chevron (down when expanded, right when
+    /// collapsed) beside the uppercased category name. Clicking toggles whether
+    /// the category's channels are shown.
+    fn category_header(
+        &self,
+        id: Uuid,
+        name: &str,
+        collapsed: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let chevron = if collapsed {
+            IconName::ChevronRight
+        } else {
+            IconName::ChevronDown
+        };
+        let label = SharedString::from(name.to_uppercase());
+        h_flex()
+            .id(SharedString::from(format!("category-{id}")))
+            .w_full()
+            .mt(px(space::SM))
+            .px(px(space::XS))
+            .py(px(space::XS))
+            .gap(px(space::XS))
+            .items_center()
+            .text_color(color::text_muted())
+            .text_size(px(font::SM))
+            .font_weight(FontWeight::SEMIBOLD)
+            .hover(|s| s.text_color(color::text()))
+            .cursor_pointer()
+            .child(Icon::new(chevron).with_size(px(space::MD)))
+            .child(label)
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_category(id, cx)))
     }
 
     /// A single, clickable channel row; clicking opens the channel.
@@ -1045,34 +1133,50 @@ impl Render for ConcordApp {
     }
 }
 
-/// Servers plus their channels, fetched together on login.
+/// Servers plus their channels and categories, fetched together on login.
 struct InitialData {
     servers: Vec<Server>,
-    channels: Vec<(Uuid, Vec<concord_shared::types::Channel>)>,
+    channels: Vec<(Uuid, Vec<Channel>)>,
+    categories: Vec<(Uuid, Vec<ChannelCategory>)>,
 }
 
-/// Load the server list and each server's channels. A failed per-server channel
-/// fetch is logged and skipped rather than failing the whole load.
+/// Load the server list and, for each server, its channels and categories. The
+/// per-server fetches all run concurrently; a failed channel or category fetch
+/// is logged and skipped rather than failing the whole load.
 async fn load_servers_and_channels(base: &str, token: &str) -> Result<InitialData, api::ApiError> {
     let servers = api::list_servers(base, token).await?;
-    // Fetch every server's channels concurrently rather than serially; a failed
-    // per-server fetch is logged and skipped rather than failing the whole load.
     let fetches = servers.iter().map(|server| {
         let id = server.id;
         async move {
-            match api::list_channels(base, token, id).await {
+            let (channels, categories) = futures_util::future::join(
+                api::list_channels(base, token, id),
+                api::list_categories(base, token, id),
+            )
+            .await;
+            let channels = match channels {
                 Ok(list) => Some((id, list)),
                 Err(err) => {
                     tracing::warn!(server = %id, error = %err, "failed to load channels");
                     None
                 }
-            }
+            };
+            let categories = match categories {
+                Ok(list) => Some((id, list)),
+                Err(err) => {
+                    tracing::warn!(server = %id, error = %err, "failed to load categories");
+                    None
+                }
+            };
+            (channels, categories)
         }
     });
-    let channels = futures_util::future::join_all(fetches)
-        .await
-        .into_iter()
-        .flatten()
-        .collect();
-    Ok(InitialData { servers, channels })
+    let (channels, categories) = futures_util::future::join_all(fetches).await.into_iter().fold(
+        (Vec::new(), Vec::new()),
+        |(mut channels, mut categories), (channel, category)| {
+            channels.extend(channel);
+            categories.extend(category);
+            (channels, categories)
+        },
+    );
+    Ok(InitialData { servers, channels, categories })
 }
