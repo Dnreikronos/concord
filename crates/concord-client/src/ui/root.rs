@@ -17,17 +17,20 @@
 
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, NaiveDate, Utc};
 use gpui::*;
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{h_flex, v_flex, Icon, IconName, Sizable};
 use uuid::Uuid;
 
-use concord_shared::protocol::{ServerMsg, Token};
+use concord_shared::protocol::{ClientMsg, ServerMsg, Token};
 use concord_shared::types::{
     Channel, ChannelCategory, ChannelType, MessageAuthor, MessageWithAuthor, Server,
 };
+use concord_shared::validation::validate_message_content;
 
 use crate::api;
 use crate::auth;
@@ -54,6 +57,13 @@ const GROUP_GAP_MINUTES: i64 = 7;
 /// Side length of a message author's avatar; also the width of the blank gutter
 /// that keeps grouped (header-less) messages aligned under it.
 const AVATAR_SIZE: f32 = 40.0;
+/// While the user keeps typing, re-announce `StartTyping` no more often than
+/// this. Comfortably inside the server's typing TTL so the indicator never
+/// lapses mid-sentence, but far above a keystroke so we don't flood the socket.
+const TYPING_REFRESH: Duration = Duration::from_secs(3);
+/// How long the composer must sit idle after the last keystroke before we send
+/// `StopTyping` to clear the indicator for everyone else.
+const TYPING_IDLE: Duration = Duration::from_secs(3);
 
 /// Which top-level screen the app is showing.
 enum Screen {
@@ -88,16 +98,27 @@ pub struct ConcordApp {
     /// up; surfaces the "new messages" jump button.
     unseen_messages: bool,
 
+    /// The message composer at the foot of the chat pane.
+    composer: Entity<InputState>,
+    /// Channel we currently have an open `StartTyping` session in, if any — so
+    /// we know which channel to `StopTyping`, and whether a refresh is due.
+    typing_channel: Option<Uuid>,
+    /// When we last announced `StartTyping`, to throttle the refreshes.
+    last_typing_sent: Option<Instant>,
+    /// Bumped on every keystroke. The idle timer only sends `StopTyping` if this
+    /// still matches when it wakes, so a later keystroke cancels an earlier arm.
+    typing_seq: u64,
+
     // Shared application state, handed to views as entity handles.
     auth_state: Entity<AuthState>,
     servers: Entity<ServersState>,
     chat: Entity<ChatState>,
     connection: Entity<ConnectionState>,
 
-    /// The live connection handle. Held so the background task's command
-    /// channel stays open (it exits once every handle drops); later work sends
-    /// outgoing messages through it.
-    _ws_handle: Option<ConnectionHandle>,
+    /// The live connection handle: outgoing messages are sent through it, and
+    /// holding it keeps the background task's command channel open (the task
+    /// exits once every handle drops).
+    ws_handle: Option<ConnectionHandle>,
     /// Auth-view and state observers; dropped together with the view.
     _subscriptions: Vec<Subscription>,
 }
@@ -111,6 +132,15 @@ impl ConcordApp {
         let servers = cx.new(|_| ServersState::new());
         let chat = cx.new(|_| ChatState::new());
         let connection = cx.new(|_| ConnectionState::new());
+
+        // The composer: an auto-growing textarea where a plain Enter submits and
+        // Shift+Enter inserts a newline (`submit_on_enter` flips that default).
+        let composer = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Message")
+                .auto_grow(1, 6)
+                .submit_on_enter(true)
+        });
 
         // Bottom-aligned, tail-following list — a chat log. The scroll handler
         // drives scroll-back paging and dismisses the "new messages" hint once
@@ -129,6 +159,7 @@ impl ConcordApp {
         // shared state changes; chat changes also reconcile the message list.
         let subscriptions = vec![
             cx.subscribe(&auth, Self::on_auth_event),
+            cx.subscribe_in(&composer, window, Self::on_composer_event),
             cx.observe(&auth_state, |_, _, cx| cx.notify()),
             cx.observe(&servers, |_, _, cx| cx.notify()),
             cx.observe(&chat, |this, _, cx| {
@@ -147,11 +178,15 @@ impl ConcordApp {
             message_rows: Rc::new(Vec::new()),
             synced_channel: None,
             unseen_messages: false,
+            composer,
+            typing_channel: None,
+            last_typing_sent: None,
+            typing_seq: 0,
             auth_state,
             servers,
             chat,
             connection,
-            _ws_handle: None,
+            ws_handle: None,
             _subscriptions: subscriptions,
         }
     }
@@ -191,7 +226,7 @@ impl ConcordApp {
             let _guard = rt.enter();
             ConnectionHandle::spawn(WS_EVENT_BUFFER)
         };
-        self._ws_handle = Some(handle.clone());
+        self.ws_handle = Some(handle.clone());
         self.connection.update(cx, |c, cx| {
             c.connecting();
             cx.notify();
@@ -289,8 +324,20 @@ impl ConcordApp {
                     edited_at: None,
                     created_at: *created_at,
                 };
+                let author_id = *author_id;
                 self.chat.update(cx, |c, cx| {
-                    c.push_message(message);
+                    // The server echoes our own messages back; if this confirms
+                    // one we already showed optimistically, reconcile it in
+                    // place instead of appending a duplicate.
+                    if !c.confirm_optimistic(
+                        message.channel_id,
+                        message.id,
+                        author_id,
+                        &message.content,
+                        message.created_at,
+                    ) {
+                        c.push_message(message);
+                    }
                     cx.notify();
                 });
             }
@@ -670,6 +717,135 @@ impl ConcordApp {
         self.message_list.set_follow_mode(FollowMode::Tail);
         self.unseen_messages = false;
         cx.notify();
+    }
+
+    // -- Composer ---------------------------------------------------------
+
+    /// Handle composer input events: a plain Enter sends the message, Shift+Enter
+    /// has already inserted a newline, and any change drives the typing indicator.
+    fn on_composer_event(
+        &mut self,
+        _state: &Entity<InputState>,
+        event: &InputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            InputEvent::Change => self.on_composer_change(cx),
+            // A plain Enter submits; Shift+Enter has already inserted a newline.
+            InputEvent::PressEnter { shift, .. } if !shift => self.send_message(window, cx),
+            _ => {}
+        }
+    }
+
+    /// Send the composer's contents to the active channel: show the message
+    /// optimistically, hand it to the socket, clear the box, and end the typing
+    /// session. Blank or over-long input is ignored.
+    fn send_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(channel_id) = self.chat.read(cx).active_channel() else {
+            return;
+        };
+        let content = self.composer.read(cx).value().trim().to_string();
+        // Mirror the server's validation so blank or over-long input never
+        // leaves the machine — nor shows optimistically.
+        if validate_message_content(&content).is_err() {
+            return;
+        }
+
+        // Optimistic echo: show it now under a client-generated id, which the
+        // server's `NewMessage` reconciles away once it arrives.
+        let optimistic = MessageWithAuthor {
+            id: Uuid::new_v4(),
+            channel_id,
+            author: self.local_author(cx),
+            content: content.clone(),
+            edited_at: None,
+            created_at: Utc::now(),
+        };
+        self.chat.update(cx, |c, cx| {
+            c.push_optimistic(optimistic);
+            cx.notify();
+        });
+        self.send_ws(ClientMsg::SendMessage { channel_id, content });
+
+        self.composer.update(cx, |input, cx| input.set_value("", window, cx));
+        self.stop_typing();
+    }
+
+    /// React to a keystroke in the composer: announce / refresh `StartTyping`
+    /// while there is text, and (re)arm the idle timer that later sends
+    /// `StopTyping`. An empty box stops typing right away.
+    fn on_composer_change(&mut self, cx: &mut Context<Self>) {
+        let Some(channel_id) = self.chat.read(cx).active_channel() else {
+            return;
+        };
+        if self.composer.read(cx).value().trim().is_empty() {
+            self.stop_typing();
+            return;
+        }
+
+        // Announce on the first keystroke and refresh periodically, but not on
+        // every character; a change of channel also forces a fresh announce.
+        let now = Instant::now();
+        let refresh_due = self.typing_channel != Some(channel_id)
+            || self
+                .last_typing_sent
+                .is_none_or(|t| now.duration_since(t) >= TYPING_REFRESH);
+        if refresh_due {
+            if self.typing_channel.is_some_and(|c| c != channel_id) {
+                self.stop_typing();
+            }
+            self.send_ws(ClientMsg::StartTyping { channel_id });
+            self.typing_channel = Some(channel_id);
+            self.last_typing_sent = Some(now);
+        }
+
+        // (Re)arm the idle timer; only the latest keystroke's arm survives, since
+        // each bumps the sequence the timer checks before firing.
+        self.typing_seq = self.typing_seq.wrapping_add(1);
+        let seq = self.typing_seq;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(TYPING_IDLE).await;
+            let _ = this.update(cx, |this, _cx| {
+                if this.typing_seq == seq {
+                    this.stop_typing();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// End the current typing session, telling the server to clear our
+    /// indicator. Bumps the sequence so any armed idle timer becomes a no-op.
+    fn stop_typing(&mut self) {
+        self.last_typing_sent = None;
+        self.typing_seq = self.typing_seq.wrapping_add(1);
+        if let Some(channel_id) = self.typing_channel.take() {
+            self.send_ws(ClientMsg::StopTyping { channel_id });
+        }
+    }
+
+    /// Fire-and-forget an outgoing `ClientMsg` over the socket. The send runs on
+    /// the shared tokio runtime; with no live handle the message is dropped.
+    fn send_ws(&self, msg: ClientMsg) {
+        let Some(handle) = self.ws_handle.clone() else {
+            return;
+        };
+        api::runtime().spawn(async move {
+            if let Err(err) = handle.send(msg).await {
+                tracing::warn!(error = %err, "failed to send ws message");
+            }
+        });
+    }
+
+    /// The signed-in user as a [`MessageAuthor`], for stamping optimistic
+    /// messages before the server's echo resolves the real author.
+    fn local_author(&self, cx: &Context<Self>) -> Option<MessageAuthor> {
+        self.auth_state.read(cx).user().map(|u| MessageAuthor {
+            id: u.id,
+            username: u.username.clone(),
+            avatar_url: u.avatar_url.clone(),
+        })
     }
 
     // -- Layout -----------------------------------------------------------
@@ -1087,8 +1263,8 @@ impl ConcordApp {
         }
     }
 
-    /// The chat pane: header, the virtualized message list, and a footer with
-    /// typing and connection status.
+    /// The chat pane: header, the virtualized message list, and the composer
+    /// (with its typing indicator) pinned at the foot.
     fn chat_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let active_channel = self.chat.read(cx).active_channel();
         let title: SharedString = active_channel
@@ -1106,13 +1282,7 @@ impl ConcordApp {
             let chat = self.chat.read(cx);
             (chat.is_loading(), chat.is_empty())
         };
-        let typing = self.chat.read(cx).typing_count();
         let status = self.connection.read(cx).status();
-        let username = self
-            .auth_state
-            .read(cx)
-            .user()
-            .map(|u| SharedString::from(u.username.clone()));
 
         let body: AnyElement = if active_channel.is_none() {
             Self::message_notice("Pick a channel from the sidebar.").into_any_element()
@@ -1123,6 +1293,9 @@ impl ConcordApp {
         } else {
             self.message_list_area(cx).into_any_element()
         };
+
+        // The composer only makes sense once a channel is open.
+        let composer = active_channel.map(|_| self.chat_composer(cx).into_any_element());
 
         v_flex()
             .flex_1()
@@ -1147,7 +1320,68 @@ impl ConcordApp {
                     .child(Self::connection_indicator(status)),
             )
             .child(body)
-            .child(Self::chat_footer(typing, username))
+            .children(composer)
+    }
+
+    /// The composer at the foot of the chat pane: the "<user> is typing…" line
+    /// (when others are typing) stacked above the message input.
+    fn chat_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .w_full()
+            .flex_shrink_0()
+            .px(px(space::LG))
+            .pb(px(space::MD))
+            .gap(px(space::XS))
+            .children(self.typing_line(cx))
+            .child(Input::new(&self.composer).w_full())
+    }
+
+    /// The "<user> is typing…" line shown just above the composer, naming a
+    /// couple of typists and summarising any others. `None` when nobody is.
+    fn typing_line(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
+        let mut typists: Vec<Uuid> = self.chat.read(cx).typing_users().collect();
+        if typists.is_empty() {
+            return None;
+        }
+        // The set has no inherent order; sort so names don't shuffle each frame.
+        typists.sort();
+        Some(
+            div()
+                .text_color(color::text_muted())
+                .text_size(px(font::SM))
+                .child(self.typing_label(&typists, cx)),
+        )
+    }
+
+    /// Phrase a set of typing users into a sentence, naming up to two and
+    /// summarising the rest.
+    fn typing_label(&self, typists: &[Uuid], cx: &Context<Self>) -> SharedString {
+        match typists {
+            [only] => format!("{} is typing…", self.username_for(*only, cx)).into(),
+            [a, b] => format!(
+                "{} and {} are typing…",
+                self.username_for(*a, cx),
+                self.username_for(*b, cx)
+            )
+            .into(),
+            _ => "Several people are typing…".into(),
+        }
+    }
+
+    /// Resolve a user's display name from the active server's members, falling
+    /// back to a neutral label when they aren't loaded.
+    fn username_for(&self, user_id: Uuid, cx: &Context<Self>) -> String {
+        let servers = self.servers.read(cx);
+        servers
+            .active_server()
+            .and_then(|server| {
+                servers
+                    .members_for(server)
+                    .iter()
+                    .find(|m| m.user_id == user_id)
+                    .map(|m| m.username.clone())
+            })
+            .unwrap_or_else(|| "Someone".to_string())
     }
 
     /// The scrollable list of messages, overlaid with the "new messages" jump
@@ -1220,35 +1454,6 @@ impl ConcordApp {
                     .text_size(px(font::SM))
                     .child(status.label()),
             )
-    }
-
-    /// Footer line: a typing indicator (left) and the signed-in user (right).
-    fn chat_footer(typing: usize, username: Option<SharedString>) -> impl IntoElement {
-        let typing_label: Option<SharedString> = match typing {
-            0 => None,
-            1 => Some("Someone is typing…".into()),
-            n => Some(format!("{n} people are typing…").into()),
-        };
-        h_flex()
-            .h(px(space::HEADER))
-            .w_full()
-            .px(px(space::LG))
-            .items_center()
-            .justify_between()
-            .border_t_1()
-            .border_color(color::border())
-            .child(
-                div()
-                    .text_color(color::text_muted())
-                    .text_size(px(font::SM))
-                    .children(typing_label),
-            )
-            .children(username.map(|name| {
-                div()
-                    .text_color(color::text_faint())
-                    .text_size(px(font::SM))
-                    .child(SharedString::from(format!("Signed in as {name}")))
-            }))
     }
 
     /// A centered placeholder pane (header + title + body) for unbuilt views.
