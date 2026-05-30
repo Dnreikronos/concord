@@ -416,6 +416,13 @@ impl ConcordApp {
             .map(|c| c.id);
         if let Some(channel_id) = first_channel {
             self.open_channel(channel_id, cx);
+        } else {
+            // Voice-only server, or its channel fetch failed at login: clear
+            // the chat so it stops showing the previous server's messages.
+            self.chat.update(cx, |c, cx| {
+                c.close_channel();
+                cx.notify();
+            });
         }
         cx.notify();
     }
