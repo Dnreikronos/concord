@@ -2,8 +2,9 @@
 //!
 //! Overlays the client's own bundled icons on top of gpui-component's set.
 //! gpui-component ships a GitHub mark but no Google one, so the Google icon is
-//! bundled here and served by path; everything else falls through to the
-//! component library's assets.
+//! bundled here and served by path; the component set also lacks a pencil, so
+//! the message "edit" affordance ships its own. Everything else falls through
+//! to the component library's assets.
 
 use std::borrow::Cow;
 
@@ -14,6 +15,10 @@ use gpui_component_assets::Assets as ComponentAssets;
 /// shows tinted (see the OAuth button), not in the four brand colors.
 const GOOGLE_SVG: &[u8] = include_bytes!("../../assets/icons/google.svg");
 
+/// A pencil mark for the message "edit" hover action. gpui-component's icon set
+/// has a trash (delete) glyph but no pencil, so it is bundled here.
+const PENCIL_SVG: &[u8] = include_bytes!("../../assets/icons/pencil.svg");
+
 /// Asset source serving the client's own icons, delegating the rest to
 /// gpui-component.
 pub struct ConcordAssets;
@@ -22,6 +27,7 @@ impl AssetSource for ConcordAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         match path {
             "icons/google.svg" => Ok(Some(Cow::Borrowed(GOOGLE_SVG))),
+            "icons/pencil.svg" => Ok(Some(Cow::Borrowed(PENCIL_SVG))),
             _ => ComponentAssets.load(path),
         }
     }
