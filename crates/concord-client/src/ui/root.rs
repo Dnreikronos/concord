@@ -100,6 +100,9 @@ pub struct ConcordApp {
 
     /// The message composer at the foot of the chat pane.
     composer: Entity<InputState>,
+    /// Channel the composer's placeholder currently names, so it is only
+    /// rewritten on an actual channel switch rather than every chat change.
+    composer_channel: Option<Uuid>,
     /// Channel we currently have an open `StartTyping` session in, if any — so
     /// we know which channel to `StopTyping`, and whether a refresh is due.
     typing_channel: Option<Uuid>,
@@ -162,8 +165,9 @@ impl ConcordApp {
             cx.subscribe_in(&composer, window, Self::on_composer_event),
             cx.observe(&auth_state, |_, _, cx| cx.notify()),
             cx.observe(&servers, |_, _, cx| cx.notify()),
-            cx.observe(&chat, |this, _, cx| {
+            cx.observe_in(&chat, window, |this, _, window, cx| {
                 this.sync_messages(cx);
+                this.refresh_composer_placeholder(window, cx);
                 cx.notify();
             }),
             cx.observe(&connection, |_, _, cx| cx.notify()),
@@ -179,6 +183,7 @@ impl ConcordApp {
             synced_channel: None,
             unseen_messages: false,
             composer,
+            composer_channel: None,
             typing_channel: None,
             last_typing_sent: None,
             typing_seq: 0,
@@ -1324,16 +1329,76 @@ impl ConcordApp {
     }
 
     /// The composer at the foot of the chat pane: the "<user> is typing…" line
-    /// (when others are typing) stacked above the message input.
+    /// (when others are typing) stacked above a Discord-style input bar — a
+    /// rounded, raised surface holding a leading add button and the borderless
+    /// input.
     fn chat_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .w_full()
             .flex_shrink_0()
             .px(px(space::LG))
-            .pb(px(space::MD))
+            .pb(px(space::LG))
             .gap(px(space::XS))
             .children(self.typing_line(cx))
-            .child(Input::new(&self.composer).w_full())
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap(px(space::MD))
+                    .px(px(space::LG))
+                    .py(px(space::MD))
+                    .rounded(px(space::SM))
+                    .bg(color::elevated())
+                    .child(Self::composer_add_button(cx))
+                    .child(Input::new(&self.composer).appearance(false).flex_1()),
+            )
+    }
+
+    /// The leading "+" in the composer — Discord's attachment affordance. The
+    /// upload flow lands in later work, so this is a styled stub for now.
+    fn composer_add_button(cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("composer-add")
+            .size(px(24.0))
+            .flex_shrink_0()
+            .rounded_full()
+            .bg(color::text_muted())
+            .text_color(color::elevated())
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|s| s.bg(color::text()))
+            .child(Icon::new(IconName::Plus).with_size(px(16.0)))
+            .on_click(cx.listener(|_, _, _, _| {
+                tracing::debug!("composer add clicked; attachments land in later work")
+            }))
+    }
+
+    /// Keep the composer's placeholder in step with the active channel, naming it
+    /// Discord-style ("Message #general"). Rewritten only on an actual switch, so
+    /// routine chat updates (new messages, typing) don't churn the input.
+    fn refresh_composer_placeholder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let active = self.chat.read(cx).active_channel();
+        if active == self.composer_channel {
+            return;
+        }
+        self.composer_channel = active;
+        let placeholder: SharedString = match active {
+            Some(id) => {
+                let servers = self.servers.read(cx);
+                servers
+                    .active_channels()
+                    .iter()
+                    .find(|c| c.id == id)
+                    .map(|c| format!("Message #{}", c.name))
+                    .unwrap_or_else(|| "Message".to_string())
+                    .into()
+            }
+            None => "Message".into(),
+        };
+        self.composer
+            .update(cx, |input, cx| input.set_placeholder(placeholder, window, cx));
     }
 
     /// The "<user> is typing…" line shown just above the composer, naming a
