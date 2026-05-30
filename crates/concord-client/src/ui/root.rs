@@ -28,13 +28,16 @@ use uuid::Uuid;
 
 use concord_shared::protocol::{ClientMsg, ServerMsg, Token};
 use concord_shared::types::{
-    Channel, ChannelCategory, ChannelType, MessageAuthor, MessageWithAuthor, Server,
+    Channel, ChannelCategory, ChannelType, MemberInfo, MessageAuthor, MessageWithAuthor, Server,
+    UserStatus,
 };
 use concord_shared::validation::validate_message_content;
 
 use crate::api;
 use crate::auth;
-use crate::state::{AuthState, ChatState, ConnectionState, ConnectionStatus, ServersState};
+use crate::state::{
+    AuthState, ChatState, ConnectionState, ConnectionStatus, PresenceState, ServersState,
+};
 use crate::ui::auth_view::{AuthEvent, AuthView};
 use crate::ui::nav::{NavState, View};
 use crate::ui::theme::{color, font, space};
@@ -57,6 +60,12 @@ const GROUP_GAP_MINUTES: i64 = 7;
 /// Side length of a message author's avatar; also the width of the blank gutter
 /// that keeps grouped (header-less) messages aligned under it.
 const AVATAR_SIZE: f32 = 40.0;
+/// Side length of a member panel avatar.
+const MEMBER_AVATAR_SIZE: f32 = 32.0;
+/// Diameter of the presence dot overlaid on a member panel avatar.
+const MEMBER_STATUS_DOT: f32 = 10.0;
+/// Width of the ring that sets the presence dot off from the avatar.
+const MEMBER_STATUS_RING: f32 = 3.0;
 /// While the user keeps typing, re-announce `StartTyping` no more often than
 /// this. Comfortably inside the server's typing TTL so the indicator never
 /// lapses mid-sentence, but far above a keystroke so we don't flood the socket.
@@ -82,6 +91,9 @@ pub struct ConcordApp {
     /// Channel categories the user has collapsed in the sidebar, by id. Pure
     /// view state: it survives re-renders but is not persisted across sessions.
     collapsed_categories: HashSet<Uuid>,
+    /// Whether the right-hand member list panel is shown. Pure view state,
+    /// toggled from the chat header; defaults to shown, Discord-style.
+    show_members: bool,
 
     /// Virtualized list backing the chat pane. Bottom-aligned and tail-following
     /// like a chat log; its item set is kept in lockstep with
@@ -124,6 +136,7 @@ pub struct ConcordApp {
     servers: Entity<ServersState>,
     chat: Entity<ChatState>,
     connection: Entity<ConnectionState>,
+    presence: Entity<PresenceState>,
 
     /// The live connection handle: outgoing messages are sent through it, and
     /// holding it keeps the background task's command channel open (the task
@@ -142,6 +155,7 @@ impl ConcordApp {
         let servers = cx.new(|_| ServersState::new());
         let chat = cx.new(|_| ChatState::new());
         let connection = cx.new(|_| ConnectionState::new());
+        let presence = cx.new(|_| PresenceState::new());
 
         // The composer: an auto-growing textarea where a plain Enter submits and
         // Shift+Enter inserts a newline (`submit_on_enter` flips that default).
@@ -187,6 +201,7 @@ impl ConcordApp {
                 cx.notify();
             }),
             cx.observe(&connection, |_, _, cx| cx.notify()),
+            cx.observe(&presence, |_, _, cx| cx.notify()),
         ];
 
         Self {
@@ -194,6 +209,7 @@ impl ConcordApp {
             auth,
             nav: NavState::new(),
             collapsed_categories: HashSet::new(),
+            show_members: true,
             message_list,
             message_rows: Rc::new(Vec::new()),
             synced_channel: None,
@@ -209,6 +225,7 @@ impl ConcordApp {
             servers,
             chat,
             connection,
+            presence,
             ws_handle: None,
             _subscriptions: subscriptions,
         }
@@ -322,8 +339,8 @@ impl ConcordApp {
     }
 
     /// Apply a decoded server message. Only the events the loaded state can
-    /// represent are handled; server/membership/presence/DM events are folded
-    /// in by later work.
+    /// represent are handled; server/membership/DM events are folded in by
+    /// later work.
     fn on_server_msg(&mut self, msg: &ServerMsg, cx: &mut Context<Self>) {
         match msg {
             ServerMsg::NewMessage {
@@ -393,6 +410,22 @@ impl ConcordApp {
                 let user = *user_id;
                 self.chat.update(cx, |c, cx| {
                     c.stop_typing(user);
+                    cx.notify();
+                });
+            }
+            // Initial presence of our peers, sent once per (re)connect; it is
+            // authoritative, so it replaces whatever we held.
+            ServerMsg::PresenceSnapshot { users } => {
+                let users = users.clone();
+                self.presence.update(cx, |p, cx| {
+                    p.set_snapshot(users);
+                    cx.notify();
+                });
+            }
+            ServerMsg::UserStatusChanged { user_id, status } => {
+                let (user_id, status) = (*user_id, *status);
+                self.presence.update(cx, |p, cx| {
+                    p.set_status(user_id, status);
                     cx.notify();
                 });
             }
@@ -579,6 +612,19 @@ impl ConcordApp {
             self.collapsed_categories.remove(&category_id);
         }
         cx.notify();
+    }
+
+    /// Show or hide the right-hand member list panel.
+    fn toggle_members(&mut self, cx: &mut Context<Self>) {
+        self.show_members = !self.show_members;
+        cx.notify();
+    }
+
+    /// Open a direct message with `user_id`, clicked from the member panel. The
+    /// DM view itself lands in later work, so for now this only records the
+    /// intent — the affordance is wired so the panel is complete.
+    fn open_dm(&mut self, user_id: Uuid, _cx: &mut Context<Self>) {
+        tracing::debug!(%user_id, "open-DM clicked; the DM view lands in later work");
     }
 
     /// Fetch the newest page of history for `channel_id`.
@@ -1451,7 +1497,13 @@ impl ConcordApp {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(title),
                     )
-                    .child(Self::connection_indicator(status)),
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap(px(space::MD))
+                            .child(Self::connection_indicator(status))
+                            .child(self.member_toggle(cx)),
+                    ),
             )
             .child(body)
             .children(composer)
@@ -1700,8 +1752,151 @@ impl ConcordApp {
             )
     }
 
-    /// The main three-column layout (server rail · sidebar · content).
+    // -- Member panel -----------------------------------------------------
+
+    /// The chat header's member-list toggle: a two-person icon that shows or
+    /// hides the right-hand panel. Discord-clean — no filled hover box, the icon
+    /// just brightens from muted to full on hover. Idle muted in both states so
+    /// the brighten reads the same whether the panel is open or closed; the open
+    /// state is conveyed by the panel's presence and the tooltip, not the icon.
+    fn member_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let shown = self.show_members;
+        let tooltip: SharedString =
+            if shown { "Hide Member List" } else { "Show Member List" }.into();
+        div()
+            .id("member-toggle")
+            .size(px(32.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(color::text_muted())
+            .cursor_pointer()
+            .hover(|s| s.text_color(color::text()))
+            .child(Icon::empty().path("icons/users.svg").with_size(px(20.0)))
+            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_members(cx)))
+    }
+
+    /// The right-hand panel: the active server's members grouped by role (owner,
+    /// admin, member), online first and offline dimmed within each group. Each
+    /// row carries an avatar, a presence dot, and the username; clicking it opens
+    /// a direct message with that member.
+    fn member_panel(&self, server_id: Uuid, cx: &mut Context<Self>) -> impl IntoElement {
+        // Group + order off owned data so the `servers`/`presence` borrows drop
+        // before the per-row `cx.listener`s reborrow `cx`.
+        let (loading, groups) = {
+            let servers = self.servers.read(cx);
+            let presence = self.presence.read(cx);
+            (
+                servers.is_loading(),
+                group_members(servers.members_for(server_id), presence),
+            )
+        };
+
+        let mut list = v_flex()
+            .id("member-list")
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .p(px(space::SM))
+            .gap(px(space::XS));
+
+        if groups.is_empty() {
+            let notice = if loading { "Loading…" } else { "No members." };
+            list = list.child(Self::muted_row(notice));
+        } else {
+            for (role, members) in groups {
+                list = list.child(Self::member_group_header(role, members.len()));
+                for member in members {
+                    list = list.child(self.member_row(member, cx));
+                }
+            }
+        }
+
+        v_flex()
+            .w(px(space::MEMBER_PANEL))
+            .h_full()
+            .flex_shrink_0()
+            .bg(color::sidebar())
+            .child(
+                h_flex()
+                    .h(px(space::HEADER))
+                    .w_full()
+                    .px(px(space::MD))
+                    .items_center()
+                    .border_b_1()
+                    .border_color(color::border())
+                    .text_color(color::text())
+                    .text_size(px(font::LG))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Members"),
+            )
+            .child(list)
+    }
+
+    /// A role section header: the uppercased role and its member count, muted.
+    fn member_group_header(role: String, count: usize) -> impl IntoElement {
+        div()
+            .w_full()
+            .mt(px(space::SM))
+            .px(px(space::XS))
+            .py(px(space::XS))
+            .text_color(color::text_muted())
+            .text_size(px(font::SM))
+            .font_weight(FontWeight::SEMIBOLD)
+            .child(SharedString::from(format!("{role} — {count}")))
+    }
+
+    /// One member row: an avatar with a presence dot, then the username. Offline
+    /// members are dimmed; clicking the row opens a DM with that member.
+    fn member_row(&self, member: PanelMember, cx: &mut Context<Self>) -> impl IntoElement {
+        let user_id = member.user_id;
+        let offline = member.status == UserStatus::Offline;
+        let tint = author_tint(Some(user_id));
+        let initial = author_initial(&member.username);
+        let username = SharedString::from(member.username);
+        let tip = SharedString::from(format!("Message @{username}"));
+
+        let mut row = h_flex()
+            .id(SharedString::from(user_id.to_string()))
+            .w_full()
+            .px(px(space::SM))
+            .py(px(space::XS))
+            .gap(px(space::SM))
+            .items_center()
+            .rounded(px(space::XS))
+            .text_color(color::text());
+        // Offline members read as present-but-away: the whole row dims, dot and
+        // all, Discord-style.
+        if offline {
+            row = row.opacity(0.45);
+        }
+        row.hover(|s| s.bg(color::hover()))
+            .cursor_pointer()
+            .child(member_avatar(initial, tint, member.status))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .text_size(px(font::MD))
+                    .child(username),
+            )
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .on_click(cx.listener(move |this, _, _, cx| this.open_dm(user_id, cx)))
+    }
+
+    /// The main layout: server rail · sidebar · content, plus the member list
+    /// panel on the right when it is toggled on and a server is in view.
     fn main_layout(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // Members belong to a server, so the panel only rides alongside the
+        // servers view, and only once a server is selected.
+        let active_server = self.servers.read(cx).active_server();
+        let members_panel = match (self.show_members, self.nav.is_active(View::Servers), active_server)
+        {
+            (true, true, Some(server_id)) => Some(self.member_panel(server_id, cx)),
+            _ => None,
+        };
+
         h_flex()
             .size_full()
             .bg(color::chat())
@@ -1710,6 +1905,7 @@ impl ConcordApp {
             .child(self.server_rail(cx))
             .child(self.channel_sidebar(cx))
             .child(self.content(cx))
+            .children(members_panel)
     }
 }
 
@@ -1931,6 +2127,113 @@ fn author_tint(author_id: Option<Uuid>) -> u8 {
     author_id
         .map(|id| (id.as_u128() % AVATAR_PALETTE.len() as u128) as u8)
         .unwrap_or(0)
+}
+
+/// A member as the panel renders them: identity plus current presence.
+#[derive(Clone, PartialEq)]
+struct PanelMember {
+    user_id: Uuid,
+    username: String,
+    status: UserStatus,
+}
+
+/// Sort rank for a role string: owner first, then admin, then member, then any
+/// unrecognised role last.
+fn role_rank(role: &str) -> u8 {
+    match role.to_ascii_lowercase().as_str() {
+        "owner" => 0,
+        "admin" => 1,
+        "member" => 2,
+        _ => 3,
+    }
+}
+
+/// Group members for the panel: bucketed by role (owner, admin, member, then any
+/// other), the buckets in that order, and within each bucket online members
+/// first then alphabetical (case-insensitive). Each entry is the uppercased role
+/// label paired with its ordered members.
+fn group_members(
+    members: &[MemberInfo],
+    presence: &PresenceState,
+) -> Vec<(String, Vec<PanelMember>)> {
+    let mut roles: Vec<&str> = members.iter().map(|m| m.role.as_str()).collect();
+    roles.sort_by(|a, b| role_rank(a).cmp(&role_rank(b)).then_with(|| a.cmp(b)));
+    roles.dedup();
+
+    roles
+        .into_iter()
+        .map(|role| {
+            let mut group: Vec<PanelMember> = members
+                .iter()
+                .filter(|m| m.role == role)
+                .map(|m| PanelMember {
+                    user_id: m.user_id,
+                    username: m.username.clone(),
+                    status: presence.status_for(m.user_id),
+                })
+                .collect();
+            group.sort_by(|a, b| {
+                let a_off = a.status == UserStatus::Offline;
+                let b_off = b.status == UserStatus::Offline;
+                a_off
+                    .cmp(&b_off)
+                    .then_with(|| a.username.to_lowercase().cmp(&b.username.to_lowercase()))
+            });
+            (role.to_uppercase(), group)
+        })
+        .collect()
+}
+
+/// The presence dot colour for a status: green online, amber idle, red
+/// do-not-disturb, grey offline.
+fn status_color(status: UserStatus) -> Hsla {
+    match status {
+        UserStatus::Online => color::online(),
+        UserStatus::Idle => color::idle(),
+        UserStatus::Dnd => color::danger(),
+        UserStatus::Offline => color::text_faint(),
+    }
+}
+
+/// A member avatar — a tinted circle with their initial — overlaid at its
+/// bottom-right with a presence dot, ringed in the panel background so it reads
+/// as separate from the avatar.
+fn member_avatar(initial: SharedString, tint: u8, status: UserStatus) -> impl IntoElement {
+    div()
+        .relative()
+        .size(px(MEMBER_AVATAR_SIZE))
+        .flex_shrink_0()
+        .child(
+            div()
+                .size(px(MEMBER_AVATAR_SIZE))
+                .rounded_full()
+                .bg(avatar_color(tint))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(color::interactive_active())
+                .text_size(px(font::SM))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(initial),
+        )
+        .child(
+            div()
+                .absolute()
+                .bottom(px(-1.0))
+                .right(px(-1.0))
+                .size(px(MEMBER_STATUS_DOT + 2.0 * MEMBER_STATUS_RING))
+                .rounded_full()
+                .bg(color::sidebar())
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .size(px(MEMBER_STATUS_DOT))
+                        .rounded_full()
+                        .bg(status_color(status)),
+                ),
+        )
 }
 
 /// Whether `me` may edit a message authored by `author_id`: only its own author,
@@ -2262,12 +2565,15 @@ mod tests {
     // re-globs `gpui::*` into this module, which blows the recursion limit when
     // the `#[test]` harness expands.
     use super::{
-        build_message_rows, can_delete_message, can_edit_message, diff_splice, MessageRow,
+        build_message_rows, can_delete_message, can_edit_message, diff_splice, group_members,
+        role_rank, MessageRow,
     };
 
     use chrono::{DateTime, Local, TimeZone, Utc};
-    use concord_shared::types::{MessageAuthor, MessageWithAuthor};
+    use concord_shared::types::{MemberInfo, MessageAuthor, MessageWithAuthor, UserStatus};
     use uuid::Uuid;
+
+    use crate::state::PresenceState;
 
     fn at(year: i32, month: u32, day: u32, hour: u32, min: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(year, month, day, hour, min, 0).unwrap()
@@ -2473,5 +2779,53 @@ mod tests {
         assert!(can_delete_message(None, Some(me), true));
         // A non-admin cannot delete someone else's.
         assert!(!can_delete_message(Some(other), Some(me), false));
+    }
+
+    fn member(n: u8, name: &str, role: &str) -> MemberInfo {
+        MemberInfo {
+            user_id: id_for(n),
+            username: name.into(),
+            avatar_url: None,
+            role: role.into(),
+            joined_at: at(2026, 5, 30, 12, 0),
+        }
+    }
+
+    #[test]
+    fn role_rank_orders_owner_admin_member_then_other() {
+        assert!(role_rank("owner") < role_rank("admin"));
+        assert!(role_rank("admin") < role_rank("member"));
+        assert!(role_rank("member") < role_rank("guest"));
+        // Matching is case-insensitive.
+        assert_eq!(role_rank("OWNER"), role_rank("owner"));
+    }
+
+    #[test]
+    fn groups_members_by_role_in_order() {
+        let members = vec![
+            member(1, "carol", "member"),
+            member(2, "dave", "owner"),
+            member(3, "alice", "admin"),
+        ];
+        let groups = group_members(&members, &PresenceState::new());
+        let labels: Vec<&str> = groups.iter().map(|(role, _)| role.as_str()).collect();
+        assert_eq!(labels, vec!["OWNER", "ADMIN", "MEMBER"]);
+    }
+
+    #[test]
+    fn online_members_sort_before_offline_then_alphabetically() {
+        let members = vec![
+            member(1, "zoe", "member"),
+            member(2, "amy", "member"),
+            member(3, "bob", "member"),
+        ];
+        let mut presence = PresenceState::new();
+        // zoe and bob are present (idle still counts as online); amy is offline.
+        presence.set_status(members[0].user_id, UserStatus::Online);
+        presence.set_status(members[2].user_id, UserStatus::Idle);
+        let groups = group_members(&members, &presence);
+        // One MEMBER group: online first (bob, zoe alphabetical), then offline amy.
+        let names: Vec<&str> = groups[0].1.iter().map(|m| m.username.as_str()).collect();
+        assert_eq!(names, vec!["bob", "zoe", "amy"]);
     }
 }
