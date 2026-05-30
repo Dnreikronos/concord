@@ -399,8 +399,8 @@ impl ConcordApp {
             cx.notify();
         });
         if already_active {
-            // Re-clicking the active server just re-reveals the servers view.
-            cx.notify();
+            // Re-clicking the active server just re-reveals the servers view;
+            // the servers.update above already notified our observer.
             return;
         }
 
