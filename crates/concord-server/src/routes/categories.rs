@@ -50,6 +50,25 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new().route("/{id}", patch(rename_category).delete(delete_category))
 }
 
+/// `GET /api/servers/{id}/categories` — the channel categories of `server_id`,
+/// ordered by position. Any member may read them; the sidebar groups channels
+/// under these.
+pub async fn list_categories(
+    State(state): State<Arc<AppState>>,
+    auth: AuthUser,
+    Path(server_id): Path<Uuid>,
+) -> Result<Json<Vec<ChannelCategory>>, AppError> {
+    if !db::is_server_member(&state.pool, server_id, auth.user_id).await? {
+        if !db::server_exists(&state.pool, server_id).await? {
+            return Err(AppError::NotFound);
+        }
+        return Err(AppError::Forbidden);
+    }
+
+    let categories = db::list_categories_for_server(&state.pool, server_id).await?;
+    Ok(Json(categories))
+}
+
 pub async fn create_category(
     State(state): State<Arc<AppState>>,
     auth: AuthUser,
