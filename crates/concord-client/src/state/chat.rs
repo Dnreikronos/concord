@@ -29,6 +29,10 @@ pub struct ChatState {
     loading: bool,
     /// Users currently typing in the active channel.
     typing: HashSet<Uuid>,
+    /// Ids of optimistically-shown messages still awaiting the server's echo.
+    /// Each is a client-generated id that [`Self::confirm_optimistic`] swaps for
+    /// the server's once the matching `NewMessage` arrives.
+    pending: HashSet<Uuid>,
 }
 
 impl ChatState {
@@ -51,6 +55,7 @@ impl ChatState {
         self.active_channel = Some(channel_id);
         self.messages.clear();
         self.typing.clear();
+        self.pending.clear();
         self.has_more = false;
         self.loading = false;
     }
@@ -62,6 +67,7 @@ impl ChatState {
         self.active_channel = None;
         self.messages.clear();
         self.typing.clear();
+        self.pending.clear();
         self.has_more = false;
         self.loading = false;
     }
@@ -138,6 +144,56 @@ impl ChatState {
             return;
         }
         self.messages.push(message);
+    }
+
+    /// Show a locally-authored message immediately, before the server confirms
+    /// it. The message carries a client-generated id; once the server echoes it
+    /// back, [`Self::confirm_optimistic`] swaps in the real id and timestamp.
+    /// Dropped if it isn't for the active channel.
+    pub fn push_optimistic(&mut self, message: MessageWithAuthor) {
+        if self.active_channel != Some(message.channel_id) {
+            return;
+        }
+        self.pending.insert(message.id);
+        self.messages.push(message);
+    }
+
+    /// Reconcile a server `NewMessage` with a still-pending optimistic message:
+    /// the oldest pending message with the same author and content adopts the
+    /// server's id and timestamp. Returns `true` when one was reconciled, so the
+    /// caller skips the normal insert; `false` leaves it to
+    /// [`Self::push_message`]. Matching only pending messages keeps a resent
+    /// duplicate from clobbering an already-confirmed message of the same text.
+    pub fn confirm_optimistic(
+        &mut self,
+        channel_id: Uuid,
+        server_id: Uuid,
+        author_id: Option<Uuid>,
+        content: &str,
+        created_at: DateTime<Utc>,
+    ) -> bool {
+        if self.active_channel != Some(channel_id) {
+            return false;
+        }
+        let pending = &self.pending;
+        let Some(pos) = self.messages.iter().position(|m| {
+            pending.contains(&m.id)
+                && m.author.as_ref().map(|a| a.id) == author_id
+                && m.content == content
+        }) else {
+            return false;
+        };
+        let old_id = self.messages[pos].id;
+        self.pending.remove(&old_id);
+        // If the confirmed id is already present (a duplicate echo), drop the
+        // optimistic copy rather than leave two rows sharing one id.
+        if old_id != server_id && self.messages.iter().any(|m| m.id == server_id) {
+            self.messages.remove(pos);
+        } else {
+            self.messages[pos].id = server_id;
+            self.messages[pos].created_at = created_at;
+        }
+        true
     }
 
     /// Apply an edit to a loaded message, if present.
@@ -264,6 +320,72 @@ mod tests {
         // A message for another channel is dropped.
         chat.push_message(msg(Uuid::new_v4(), 2, "other"));
         assert_eq!(chat.messages().len(), 1);
+    }
+
+    fn mine(channel_id: Uuid, author: Uuid, content: &str) -> MessageWithAuthor {
+        let mut m = msg(channel_id, 0, content);
+        m.id = Uuid::new_v4();
+        m.author = Some(MessageAuthor {
+            id: author,
+            username: "me".into(),
+            avatar_url: None,
+        });
+        m
+    }
+
+    #[test]
+    fn confirm_optimistic_swaps_in_server_id() {
+        let mut chat = ChatState::new();
+        let ch = Uuid::new_v4();
+        let author = Uuid::new_v4();
+        chat.open_channel(ch);
+        chat.push_optimistic(mine(ch, author, "hello"));
+        assert_eq!(chat.messages().len(), 1);
+
+        let server_id = Uuid::new_v4();
+        let reconciled = chat.confirm_optimistic(ch, server_id, Some(author), "hello", Utc::now());
+        assert!(reconciled);
+        assert_eq!(chat.messages().len(), 1);
+        assert_eq!(chat.messages()[0].id, server_id);
+
+        // The confirmed echo, now sharing the server id, dedupes to a no-op.
+        let mut echo = mine(ch, author, "hello");
+        echo.id = server_id;
+        chat.push_message(echo);
+        assert_eq!(chat.messages().len(), 1);
+    }
+
+    #[test]
+    fn confirm_optimistic_without_match_leaves_it_to_push() {
+        let mut chat = ChatState::new();
+        let ch = Uuid::new_v4();
+        chat.open_channel(ch);
+        let reconciled =
+            chat.confirm_optimistic(ch, Uuid::new_v4(), Some(Uuid::new_v4()), "hi", Utc::now());
+        assert!(!reconciled);
+        assert!(chat.is_empty());
+    }
+
+    #[test]
+    fn confirm_optimistic_reconciles_oldest_pending_first() {
+        let mut chat = ChatState::new();
+        let ch = Uuid::new_v4();
+        let author = Uuid::new_v4();
+        chat.open_channel(ch);
+        let second_id = {
+            let first = mine(ch, author, "ok");
+            let second = mine(ch, author, "ok");
+            let id = second.id;
+            chat.push_optimistic(first);
+            chat.push_optimistic(second);
+            id
+        };
+
+        let server_first = Uuid::new_v4();
+        assert!(chat.confirm_optimistic(ch, server_first, Some(author), "ok", Utc::now()));
+        // The first "ok" adopted the server id; the second still awaits its echo.
+        assert_eq!(chat.messages()[0].id, server_first);
+        assert_eq!(chat.messages()[1].id, second_id);
     }
 
     #[test]
