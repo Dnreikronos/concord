@@ -51,6 +51,9 @@ const MESSAGE_LIST_OVERDRAW: f32 = 300.0;
 /// Minutes between two messages from the same author beyond which the later one
 /// starts a fresh header instead of joining the previous group.
 const GROUP_GAP_MINUTES: i64 = 7;
+/// Side length of a message author's avatar; also the width of the blank gutter
+/// that keeps grouped (header-less) messages aligned under it.
+const AVATAR_SIZE: f32 = 40.0;
 
 /// Which top-level screen the app is showing.
 enum Screen {
@@ -1375,6 +1378,8 @@ enum MessageRow {
         content: SharedString,
         show_header: bool,
         edited: bool,
+        /// Palette index for the author's avatar and name colour.
+        tint: u8,
     },
 }
 
@@ -1415,6 +1420,7 @@ fn build_message_rows(messages: &[MessageWithAuthor], today: NaiveDate) -> Vec<M
             content: m.content.clone().into(),
             show_header,
             edited: m.edited_at.is_some(),
+            tint: author_tint(author_id),
         });
 
         prev_date = Some(date);
@@ -1462,6 +1468,35 @@ fn diff_splice(old: &[MessageRow], new: &[MessageRow]) -> Option<(std::ops::Rang
     }
 }
 
+/// A small palette of bright accents for avatars and author names, picked by
+/// author id so the same person always reads the same colour (we have no role
+/// colours to key off, as Discord does).
+const AVATAR_PALETTE: [u32; 8] = [
+    0x5865f2, 0x3ba55d, 0xe67e22, 0xeb459e, 0xed4245, 0x1abc9c, 0xfaa61a, 0x9b59b6,
+];
+
+/// The accent for a given palette index.
+fn avatar_color(tint: u8) -> Hsla {
+    rgb(AVATAR_PALETTE[tint as usize % AVATAR_PALETTE.len()]).into()
+}
+
+/// A stable palette index for an author (or a default for an unknown sender).
+fn author_tint(author_id: Option<Uuid>) -> u8 {
+    author_id
+        .map(|id| (id.as_u128() % AVATAR_PALETTE.len() as u128) as u8)
+        .unwrap_or(0)
+}
+
+/// The uppercase initial shown on an avatar with no image.
+fn author_initial(author: &str) -> SharedString {
+    author
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().collect::<String>())
+        .unwrap_or_else(|| "?".to_string())
+        .into()
+}
+
 /// Render a single list row.
 fn render_message_row(row: &MessageRow) -> AnyElement {
     match row {
@@ -1472,13 +1507,16 @@ fn render_message_row(row: &MessageRow) -> AnyElement {
             content,
             show_header,
             edited,
+            tint,
             ..
         } => render_message(
             author.clone(),
+            author_initial(author),
             timestamp.clone(),
             content.clone(),
             *show_header,
             *edited,
+            *tint,
         ),
     }
 }
@@ -1505,17 +1543,63 @@ fn render_date_separator(label: SharedString) -> AnyElement {
         .into_any_element()
 }
 
-/// A message row: an author/time header for group openers, then the content
-/// (with a trailing "(edited)" marker when applicable).
+/// A message row, Discord-style: a left avatar gutter, then the content column.
+/// Group openers carry an avatar and an author/time header; grouped messages
+/// leave the gutter blank so their text stays aligned under the opener. The
+/// whole row spans full width and lifts on hover.
 fn render_message(
     author: SharedString,
+    initial: SharedString,
     timestamp: SharedString,
     content: SharedString,
     show_header: bool,
     edited: bool,
+    tint: u8,
 ) -> AnyElement {
+    let gutter = if show_header {
+        div()
+            .size(px(AVATAR_SIZE))
+            .flex_shrink_0()
+            .rounded_full()
+            .bg(avatar_color(tint))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(color::interactive_active())
+            .text_size(px(font::MD))
+            .font_weight(FontWeight::SEMIBOLD)
+            .child(initial)
+            .into_any_element()
+    } else {
+        div().w(px(AVATAR_SIZE)).flex_shrink_0().into_any_element()
+    };
+
+    let mut content_col = v_flex().flex_1().min_w(px(0.0)).gap(px(2.0));
+    if show_header {
+        content_col = content_col.child(
+            h_flex()
+                .items_baseline()
+                .gap(px(space::SM))
+                .child(
+                    div()
+                        .text_color(avatar_color(tint))
+                        .text_size(px(font::MD))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(author),
+                )
+                .child(
+                    div()
+                        .text_color(color::text_faint())
+                        .text_size(px(font::SM))
+                        .child(timestamp),
+                ),
+        );
+    }
+
     let mut content_line = h_flex().w_full().items_baseline().gap(px(space::SM)).child(
         div()
+            .flex_1()
+            .min_w(px(0.0))
             .text_color(color::text())
             .text_size(px(font::MD))
             .child(content),
@@ -1529,34 +1613,23 @@ fn render_message(
                 .child("(edited)"),
         );
     }
+    content_col = content_col.child(content_line);
 
-    let mut col = v_flex().w_full().px(px(space::MD)).gap(px(space::XS));
-    col = if show_header {
-        col.pt(px(space::SM))
-    } else {
-        col.pt(px(2.0))
-    };
-    if show_header {
-        col = col.child(
+    div()
+        .w_full()
+        .px(px(space::MD))
+        .pt(px(if show_header { space::MD } else { 1.0 }))
+        .pb(px(1.0))
+        .hover(|s| s.bg(color::hover()))
+        .child(
             h_flex()
-                .items_baseline()
-                .gap(px(space::SM))
-                .child(
-                    div()
-                        .text_color(color::text())
-                        .text_size(px(font::MD))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(author),
-                )
-                .child(
-                    div()
-                        .text_color(color::text_faint())
-                        .text_size(px(font::SM))
-                        .child(timestamp),
-                ),
-        );
-    }
-    col.child(content_line).into_any_element()
+                .w_full()
+                .gap(px(space::MD))
+                .items_start()
+                .child(gutter)
+                .child(content_col),
+        )
+        .into_any_element()
 }
 
 #[cfg(test)]
@@ -1665,6 +1738,7 @@ mod tests {
             content: content.into(),
             show_header: true,
             edited: false,
+            tint: 0,
         }
     }
 
