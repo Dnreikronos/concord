@@ -2,9 +2,10 @@
 //!
 //! Overlays the client's own bundled icons on top of gpui-component's set.
 //! gpui-component ships a GitHub mark but no Google one, so the Google icon is
-//! bundled here and served by path; the component set also lacks a pencil, so
-//! the message "edit" affordance ships its own. Everything else falls through
-//! to the component library's assets.
+//! bundled here and served by path; the component set also lacks a pencil (the
+//! message "edit" affordance) and a two-person "users" glyph (the member-list
+//! toggle), so those ship their own. Everything else falls through to the
+//! component library's assets.
 
 use std::borrow::Cow;
 
@@ -19,6 +20,10 @@ const GOOGLE_SVG: &[u8] = include_bytes!("../../assets/icons/google.svg");
 /// has a trash (delete) glyph but no pencil, so it is bundled here.
 const PENCIL_SVG: &[u8] = include_bytes!("../../assets/icons/pencil.svg");
 
+/// A two-person "users" glyph for the member-list toggle. The component set
+/// ships only a single-person `user`, so the Discord-style pair is bundled here.
+const USERS_SVG: &[u8] = include_bytes!("../../assets/icons/users.svg");
+
 /// Asset source serving the client's own icons, delegating the rest to
 /// gpui-component.
 pub struct ConcordAssets;
@@ -28,6 +33,7 @@ impl AssetSource for ConcordAssets {
         match path {
             "icons/google.svg" => Ok(Some(Cow::Borrowed(GOOGLE_SVG))),
             "icons/pencil.svg" => Ok(Some(Cow::Borrowed(PENCIL_SVG))),
+            "icons/users.svg" => Ok(Some(Cow::Borrowed(USERS_SVG))),
             _ => ComponentAssets.load(path),
         }
     }
