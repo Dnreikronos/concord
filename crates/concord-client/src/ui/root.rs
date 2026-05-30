@@ -103,6 +103,13 @@ pub struct ConcordApp {
     /// Channel the composer's placeholder currently names, so it is only
     /// rewritten on an actual channel switch rather than every chat change.
     composer_channel: Option<Uuid>,
+    /// The message currently being edited inline, if any. Its row swaps its text
+    /// for [`Self::editor`]; folded into the row model so the list re-measures
+    /// the taller editor on entry and the restored text on exit.
+    editing: Option<Uuid>,
+    /// The single inline editor reused across rows: only the message named by
+    /// [`Self::editing`] renders it, so one entity serves every row.
+    editor: Entity<InputState>,
     /// Channel we currently have an open `StartTyping` session in, if any — so
     /// we know which channel to `StopTyping`, and whether a refresh is due.
     typing_channel: Option<Uuid>,
@@ -145,6 +152,14 @@ impl ConcordApp {
                 .submit_on_enter(true)
         });
 
+        // The inline message editor, shared across rows. Like the composer, a
+        // plain Enter saves and Shift+Enter inserts a newline.
+        let editor = cx.new(|cx| {
+            InputState::new(window, cx)
+                .auto_grow(1, 8)
+                .submit_on_enter(true)
+        });
+
         // Bottom-aligned, tail-following list — a chat log. The scroll handler
         // drives scroll-back paging and dismisses the "new messages" hint once
         // the bottom is back in view.
@@ -163,6 +178,7 @@ impl ConcordApp {
         let subscriptions = vec![
             cx.subscribe(&auth, Self::on_auth_event),
             cx.subscribe_in(&composer, window, Self::on_composer_event),
+            cx.subscribe_in(&editor, window, Self::on_editor_event),
             cx.observe(&auth_state, |_, _, cx| cx.notify()),
             cx.observe(&servers, |_, _, cx| cx.notify()),
             cx.observe_in(&chat, window, |this, _, window, cx| {
@@ -184,6 +200,8 @@ impl ConcordApp {
             unseen_messages: false,
             composer,
             composer_channel: None,
+            editing: None,
+            editor,
             typing_channel: None,
             last_typing_sent: None,
             typing_seq: 0,
@@ -615,9 +633,11 @@ impl ConcordApp {
     fn sync_messages(&mut self, cx: &mut Context<Self>) {
         let active = self.chat.read(cx).active_channel();
         let today = Local::now().date_naive();
-        let new_rows = build_message_rows(self.chat.read(cx).messages(), today);
+        let new_rows = build_message_rows(self.chat.read(cx).messages(), today, self.editing);
 
         if active != self.synced_channel {
+            // A channel switch abandons any in-progress edit; its row is gone.
+            self.editing = None;
             self.message_list.reset(new_rows.len());
             self.message_list.set_follow_mode(FollowMode::Tail);
             self.synced_channel = active;
@@ -741,6 +761,115 @@ impl ConcordApp {
             InputEvent::PressEnter { shift, .. } if !shift => self.send_message(window, cx),
             _ => {}
         }
+    }
+
+    // -- Message actions --------------------------------------------------
+
+    /// React to the inline editor: a plain Enter saves the edit; losing focus
+    /// (clicking away) cancels it. Shift+Enter falls through to insert a newline.
+    fn on_editor_event(
+        &mut self,
+        _state: &Entity<InputState>,
+        event: &InputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            InputEvent::PressEnter { shift, .. } if !shift => self.save_edit(window, cx),
+            InputEvent::Blur => self.cancel_edit(cx),
+            _ => {}
+        }
+    }
+
+    /// Open the inline editor on `message_id`, seeding it with the current text
+    /// and focusing it. Re-syncs the rows so the editor's row re-measures.
+    fn start_editing(&mut self, message_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(content) = self
+            .chat
+            .read(cx)
+            .messages()
+            .iter()
+            .find(|m| m.id == message_id)
+            .map(|m| m.content.clone())
+        else {
+            return;
+        };
+        self.editing = Some(message_id);
+        self.editor.update(cx, |editor, cx| {
+            editor.set_value(content, window, cx);
+            editor.focus(window, cx);
+        });
+        self.sync_messages(cx);
+        cx.notify();
+    }
+
+    /// Commit the inline edit: validate, echo the change locally, and send it.
+    /// An unchanged or blank/over-long value just closes the editor without a
+    /// round-trip — the server would reject the latter and ignore the former.
+    fn save_edit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(message_id) = self.editing else {
+            return;
+        };
+        let content = self.editor.read(cx).value().trim().to_string();
+        let unchanged = self
+            .chat
+            .read(cx)
+            .messages()
+            .iter()
+            .find(|m| m.id == message_id)
+            .is_some_and(|m| m.content == content);
+        if unchanged || validate_message_content(&content).is_err() {
+            self.cancel_edit(cx);
+            return;
+        }
+
+        self.editing = None;
+        // Echo the edit locally so it lands at once; the server's `MessageEdited`
+        // reconciles the authoritative `edited_at` when it arrives.
+        self.chat.update(cx, |c, cx| {
+            c.edit_message(message_id, content.clone(), Utc::now());
+            cx.notify();
+        });
+        self.send_ws(ClientMsg::EditMessage { message_id, content });
+        self.sync_messages(cx);
+        cx.notify();
+    }
+
+    /// Close the inline editor without saving, restoring the row's text.
+    fn cancel_edit(&mut self, cx: &mut Context<Self>) {
+        if self.editing.take().is_some() {
+            self.sync_messages(cx);
+            cx.notify();
+        }
+    }
+
+    /// Delete `message_id`. The server re-checks the author/admin rule and
+    /// broadcasts `MessageDeleted`, which removes the row, so this only sends.
+    fn delete_message_action(&mut self, message_id: Uuid, cx: &mut Context<Self>) {
+        // Close the inline editor first if it was open on this message, so its
+        // row doesn't linger as an editor between the send and the server echo.
+        if self.editing == Some(message_id) {
+            self.cancel_edit(cx);
+        }
+        self.send_ws(ClientMsg::DeleteMessage { message_id });
+    }
+
+    /// Whether the signed-in user may moderate the active server — its owner or
+    /// an admin member. Mirrors the server's delete rule so the trash affordance
+    /// only shows where a delete would actually be allowed.
+    fn is_active_server_admin(&self, cx: &Context<Self>) -> bool {
+        let Some(me) = self.auth_state.read(cx).user().map(|u| u.id) else {
+            return false;
+        };
+        let servers = self.servers.read(cx);
+        let Some(server) = servers.active_server_info() else {
+            return false;
+        };
+        server.owner_id == me
+            || servers
+                .members_for(server.id)
+                .iter()
+                .any(|m| m.user_id == me && m.role.eq_ignore_ascii_case("admin"))
     }
 
     /// Send the composer's contents to the active channel: show the message
@@ -1453,9 +1582,18 @@ impl ConcordApp {
     /// button while the user is scrolled up past freshly arrived messages.
     fn message_list_area(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let rows = self.message_rows.clone();
+        // Everything a row needs to render its hover actions and inline editor.
+        // Permissions are resolved here, per render, rather than baked into the
+        // rows, so they track membership/auth loading without rebuilding rows.
+        let ctx = RowRender {
+            view: cx.weak_entity(),
+            me: self.auth_state.read(cx).user().map(|u| u.id),
+            is_admin: self.is_active_server_admin(cx),
+            editor: self.editor.clone(),
+        };
         let list = list(self.message_list.clone(), move |ix, _window, _cx| {
             rows.get(ix)
-                .map(render_message_row)
+                .map(|row| render_message_row(row, &ctx))
                 .unwrap_or_else(|| div().into_any_element())
         })
         .flex_1()
@@ -1635,7 +1773,7 @@ async fn load_servers_and_channels(base: &str, token: &str) -> Result<InitialDat
 /// One rendered row in the message list: a day separator, or a message that
 /// carries an author/time header only when it opens a group. Equality drives the
 /// splice diff, so it deliberately covers every field that affects a row's
-/// rendered height (header, content, "edited" marker).
+/// rendered height (header, content, "edited" marker, the inline editor).
 #[derive(Clone, PartialEq)]
 enum MessageRow {
     DateSeparator {
@@ -1643,21 +1781,47 @@ enum MessageRow {
     },
     Message {
         id: Uuid,
+        /// The author's user id, or `None` for a deleted account. Drives the
+        /// edit/delete permission check at render time.
+        author_id: Option<Uuid>,
         author: SharedString,
         timestamp: SharedString,
         content: SharedString,
         show_header: bool,
-        edited: bool,
+        /// A "last edited …" tooltip label when the message has been edited,
+        /// otherwise `None` (no "(edited)" marker shown).
+        edited: Option<SharedString>,
+        /// True while this message is open in the inline editor.
+        editing: bool,
         /// Palette index for the author's avatar and name colour.
         tint: u8,
     },
+}
+
+/// Everything a message row needs to render its interactive parts, resolved
+/// once per list render and shared (by reference) into every row. Click
+/// handlers reach the root view through [`Self::view`]; permissions are read
+/// from [`Self::me`] and [`Self::is_admin`]; the editing row borrows the shared
+/// [`Self::editor`].
+struct RowRender {
+    view: WeakEntity<ConcordApp>,
+    /// The signed-in user's id, for the own-message edit/delete check.
+    me: Option<Uuid>,
+    /// Whether the viewer can moderate the active server (owner or admin).
+    is_admin: bool,
+    /// The shared inline editor, rendered only by the row being edited.
+    editor: Entity<InputState>,
 }
 
 /// Flatten loaded messages (oldest first) into renderable rows: a date
 /// separator before the first message of each calendar day, then one row per
 /// message. Consecutive messages from the same author within
 /// [`GROUP_GAP_MINUTES`] are "grouped" — only the first carries a header.
-fn build_message_rows(messages: &[MessageWithAuthor], today: NaiveDate) -> Vec<MessageRow> {
+fn build_message_rows(
+    messages: &[MessageWithAuthor],
+    today: NaiveDate,
+    editing: Option<Uuid>,
+) -> Vec<MessageRow> {
     let yesterday = today.pred_opt();
     let mut rows = Vec::with_capacity(messages.len());
     let mut prev_date: Option<NaiveDate> = None;
@@ -1685,11 +1849,13 @@ fn build_message_rows(messages: &[MessageWithAuthor], today: NaiveDate) -> Vec<M
             .unwrap_or_else(|| "unknown".into());
         rows.push(MessageRow::Message {
             id: m.id,
+            author_id,
             author: author.into(),
             timestamp: local.format("%H:%M").to_string().into(),
             content: m.content.clone().into(),
             show_header,
-            edited: m.edited_at.is_some(),
+            edited: m.edited_at.map(edit_tooltip),
+            editing: editing == Some(m.id),
             tint: author_tint(author_id),
         });
 
@@ -1710,6 +1876,16 @@ fn date_label(date: NaiveDate, today: NaiveDate, yesterday: Option<NaiveDate>) -
     } else {
         date.format("%B %-d, %Y").to_string()
     }
+}
+
+/// The tooltip shown on an edited message's "(edited)" marker: the absolute
+/// local time the edit landed.
+fn edit_tooltip(edited_at: DateTime<Utc>) -> SharedString {
+    edited_at
+        .with_timezone(&Local)
+        .format("Last edited %b %-d, %Y at %H:%M")
+        .to_string()
+        .into()
 }
 
 /// The minimal splice turning `old` into `new`: the range of `old` to replace
@@ -1757,6 +1933,19 @@ fn author_tint(author_id: Option<Uuid>) -> u8 {
         .unwrap_or(0)
 }
 
+/// Whether `me` may edit a message authored by `author_id`: only its own author,
+/// and only when both identities are known (no editing a deleted account's
+/// messages, nor while signed out).
+fn can_edit_message(author_id: Option<Uuid>, me: Option<Uuid>) -> bool {
+    matches!((author_id, me), (Some(a), Some(m)) if a == m)
+}
+
+/// Whether `me` may delete a message: its author, or a server admin/owner.
+/// Mirrors the server's rule so the affordance only shows where it would work.
+fn can_delete_message(author_id: Option<Uuid>, me: Option<Uuid>, is_admin: bool) -> bool {
+    is_admin || can_edit_message(author_id, me)
+}
+
 /// The uppercase initial shown on an avatar with no image.
 fn author_initial(author: &str) -> SharedString {
     author
@@ -1768,25 +1957,34 @@ fn author_initial(author: &str) -> SharedString {
 }
 
 /// Render a single list row.
-fn render_message_row(row: &MessageRow) -> AnyElement {
+fn render_message_row(row: &MessageRow, ctx: &RowRender) -> AnyElement {
     match row {
         MessageRow::DateSeparator { label } => render_date_separator(label.clone()),
         MessageRow::Message {
+            id,
+            author_id,
             author,
             timestamp,
             content,
             show_header,
             edited,
+            editing,
             tint,
-            ..
         } => render_message(
-            author.clone(),
-            author_initial(author),
-            timestamp.clone(),
-            content.clone(),
-            *show_header,
-            *edited,
-            *tint,
+            MessageProps {
+                id: *id,
+                author: author.clone(),
+                initial: author_initial(author),
+                timestamp: timestamp.clone(),
+                content: content.clone(),
+                show_header: *show_header,
+                edited: edited.clone(),
+                editing: *editing,
+                tint: *tint,
+                can_edit: can_edit_message(*author_id, ctx.me),
+                can_delete: can_delete_message(*author_id, ctx.me, ctx.is_admin),
+            },
+            ctx,
         ),
     }
 }
@@ -1813,19 +2011,43 @@ fn render_date_separator(label: SharedString) -> AnyElement {
         .into_any_element()
 }
 
-/// A message row, Discord-style: a left avatar gutter, then the content column.
-/// Group openers carry an avatar and an author/time header; grouped messages
-/// leave the gutter blank so their text stays aligned under the opener. The
-/// whole row spans full width and lifts on hover.
-fn render_message(
+/// Fields needed to render one message row, bundled to keep the call site
+/// readable. Permissions (`can_edit` / `can_delete`) are resolved by the caller
+/// from the row's author and the viewer.
+struct MessageProps {
+    id: Uuid,
     author: SharedString,
     initial: SharedString,
     timestamp: SharedString,
     content: SharedString,
     show_header: bool,
-    edited: bool,
+    edited: Option<SharedString>,
+    editing: bool,
     tint: u8,
-) -> AnyElement {
+    can_edit: bool,
+    can_delete: bool,
+}
+
+/// A message row, Discord-style: a left avatar gutter, then the content column,
+/// with a floating edit/delete toolbar revealed on hover. Group openers carry an
+/// avatar and an author/time header; grouped messages leave the gutter blank so
+/// their text stays aligned under the opener. While `editing`, the content line
+/// swaps for the shared inline editor. The whole row lifts on hover.
+fn render_message(props: MessageProps, ctx: &RowRender) -> AnyElement {
+    let MessageProps {
+        id,
+        author,
+        initial,
+        timestamp,
+        content,
+        show_header,
+        edited,
+        editing,
+        tint,
+        can_edit,
+        can_delete,
+    } = props;
+
     let gutter = if show_header {
         div()
             .size(px(AVATAR_SIZE))
@@ -1882,27 +2104,54 @@ fn render_message(
         );
     }
 
-    let mut content_line = h_flex().w_full().items_baseline().gap(px(space::SM)).child(
-        div()
-            .flex_1()
-            .min_w(px(0.0))
-            .text_color(color::text())
-            .text_size(px(font::MD))
-            .child(content),
-    );
-    if edited {
-        content_line = content_line.child(
-            div()
-                .flex_shrink_0()
-                .text_size(px(font::SM))
-                .text_color(color::text_faint())
-                .child("(edited)"),
+    if editing {
+        // The row hands its text to the shared inline editor.
+        content_col = content_col.child(
+            v_flex()
+                .w_full()
+                .gap(px(space::XS))
+                .child(Input::new(&ctx.editor).w_full())
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(color::text_faint())
+                        .child("enter to save • click away to cancel"),
+                ),
         );
+    } else {
+        let mut content_line = h_flex().w_full().items_baseline().gap(px(space::SM)).child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .text_color(color::text())
+                .text_size(px(font::MD))
+                .child(content),
+        );
+        if let Some(tip) = edited {
+            // The "(edited)" marker carries the exact edit time in its tooltip.
+            content_line = content_line.child(
+                div()
+                    .id(SharedString::from(format!("edited-{id}")))
+                    .flex_shrink_0()
+                    .text_size(px(font::SM))
+                    .text_color(color::text_faint())
+                    .child("(edited)")
+                    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx)),
+            );
+        }
+        content_col = content_col.child(content_line);
     }
-    content_col = content_col.child(content_line);
+
+    // No hover toolbar while the row is itself the editor.
+    let actions = if editing {
+        None
+    } else {
+        message_actions(id, can_edit, can_delete, ctx)
+    };
 
     div()
         .w_full()
+        .relative()
         .group("message")
         .px(px(space::MD))
         .pt(px(if show_header { space::MD } else { 1.0 }))
@@ -1916,7 +2165,95 @@ fn render_message(
                 .child(gutter)
                 .child(content_col),
         )
+        .children(actions)
         .into_any_element()
+}
+
+/// The floating hover toolbar at a row's top-right: an edit pencil (own
+/// messages) and a delete trash (own messages, or any message for a server
+/// admin). Revealed on row hover, Discord-style. `None` when the viewer can do
+/// neither.
+fn message_actions(
+    id: Uuid,
+    can_edit: bool,
+    can_delete: bool,
+    ctx: &RowRender,
+) -> Option<AnyElement> {
+    if !can_edit && !can_delete {
+        return None;
+    }
+
+    let mut bar = h_flex()
+        .absolute()
+        .top(px(-space::SM))
+        .right(px(space::MD))
+        .gap(px(space::XS))
+        .p(px(space::XS))
+        .rounded(px(space::XS))
+        .bg(color::elevated())
+        .border_1()
+        .border_color(color::border())
+        .opacity(0.0)
+        .group_hover("message", |s| s.opacity(1.0));
+
+    if can_edit {
+        let view = ctx.view.clone();
+        bar = bar.child(
+            message_action_button(
+                SharedString::from(format!("edit-{id}")),
+                Icon::empty()
+                    .path("icons/pencil.svg")
+                    .with_size(px(16.0))
+                    .into_any_element(),
+                "Edit".into(),
+                false,
+            )
+            .on_click(move |_, window, cx| {
+                let _ = view.update(cx, |this, cx| this.start_editing(id, window, cx));
+            }),
+        );
+    }
+    if can_delete {
+        let view = ctx.view.clone();
+        bar = bar.child(
+            message_action_button(
+                SharedString::from(format!("delete-{id}")),
+                Icon::new(IconName::Delete)
+                    .with_size(px(16.0))
+                    .into_any_element(),
+                "Delete".into(),
+                true,
+            )
+            .on_click(move |_, _window, cx| {
+                let _ = view.update(cx, |this, cx| this.delete_message_action(id, cx));
+            }),
+        );
+    }
+    Some(bar.into_any_element())
+}
+
+/// A single round-cornered icon button for the message hover toolbar, returned
+/// as a stateful div so the caller can attach the action's `on_click`. `danger`
+/// tints the icon red on hover (used by delete).
+fn message_action_button(
+    id: SharedString,
+    icon: AnyElement,
+    tooltip: SharedString,
+    danger: bool,
+) -> Stateful<Div> {
+    let hover_fg = if danger { color::danger() } else { color::text() };
+    div()
+        .id(id)
+        .size(px(28.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(space::XS))
+        .text_color(color::text_muted())
+        .cursor_pointer()
+        .hover(move |s| s.bg(color::hover()).text_color(hover_fg))
+        .child(icon)
+        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
 }
 
 #[cfg(test)]
@@ -1924,7 +2261,9 @@ mod tests {
     // Import only what the tests need rather than `use super::*`: the latter
     // re-globs `gpui::*` into this module, which blows the recursion limit when
     // the `#[test]` harness expands.
-    use super::{build_message_rows, diff_splice, MessageRow};
+    use super::{
+        build_message_rows, can_delete_message, can_edit_message, diff_splice, MessageRow,
+    };
 
     use chrono::{DateTime, Local, TimeZone, Utc};
     use concord_shared::types::{MessageAuthor, MessageWithAuthor};
@@ -1970,6 +2309,7 @@ mod tests {
         let rows = build_message_rows(
             &[msg(1, Some(1), "hi", t), msg(2, Some(1), "again", t)],
             Local::now().date_naive(),
+            None,
         );
         // One separator, then a header opener and a grouped (header-less) reply.
         assert_eq!(rows.len(), 3);
@@ -1986,6 +2326,7 @@ mod tests {
                 msg(2, Some(1), "new", at(2026, 5, 30, 12, 0)),
             ],
             Local::now().date_naive(),
+            None,
         );
         // A separator opens each day, and the second day's message gets a header.
         assert_eq!(separators(&rows), 2);
@@ -1998,6 +2339,7 @@ mod tests {
         let rows = build_message_rows(
             &[msg(1, Some(1), "a", t), msg(2, Some(2), "b", t)],
             Local::now().date_naive(),
+            None,
         );
         assert_eq!(rows.len(), 3);
         assert!(is_header(&rows[2], true));
@@ -2011,6 +2353,7 @@ mod tests {
                 msg(2, Some(1), "b", at(2026, 5, 30, 12, 8)),
             ],
             Local::now().date_naive(),
+            None,
         );
         assert!(is_header(&rows[2], true));
     }
@@ -2020,12 +2363,23 @@ mod tests {
         bytes[15] = id;
         MessageRow::Message {
             id: Uuid::from_bytes(bytes),
+            author_id: None,
             author: "alice".into(),
             timestamp: "12:00".into(),
             content: content.into(),
             show_header: true,
-            edited: false,
+            edited: None,
+            editing: false,
             tint: 0,
+        }
+    }
+
+    /// The `editing` flag and `edited` tooltip a row carries, when it is a
+    /// message row (panics otherwise — tests pass a known index).
+    fn edit_state(row: &MessageRow) -> (bool, bool) {
+        match row {
+            MessageRow::Message { editing, edited, .. } => (*editing, edited.is_some()),
+            _ => panic!("expected a message row"),
         }
     }
 
@@ -2061,5 +2415,63 @@ mod tests {
         let old = vec![row_msg(1, "a"), row_msg(2, "b"), row_msg(3, "c")];
         let new = vec![row_msg(1, "a"), row_msg(3, "c")];
         assert_eq!(diff_splice(&old, &new), Some((1..2, 0)));
+    }
+
+    fn id_for(n: u8) -> Uuid {
+        let mut bytes = [0u8; 16];
+        bytes[15] = n;
+        Uuid::from_bytes(bytes)
+    }
+
+    #[test]
+    fn marks_only_the_editing_message() {
+        let t = at(2026, 5, 30, 12, 0);
+        let rows = build_message_rows(
+            &[msg(1, Some(1), "a", t), msg(2, Some(1), "b", t)],
+            Local::now().date_naive(),
+            Some(id_for(2)),
+        );
+        // rows[0] is the day separator; the openers are the two messages.
+        assert_eq!(edit_state(&rows[1]).0, false);
+        assert_eq!(edit_state(&rows[2]).0, true);
+    }
+
+    #[test]
+    fn surfaces_an_edited_marker_with_a_tooltip() {
+        let t = at(2026, 5, 30, 12, 0);
+        let mut edited = msg(1, Some(1), "a", t);
+        edited.edited_at = Some(t);
+        let rows = build_message_rows(
+            &[edited, msg(2, Some(2), "b", t)],
+            Local::now().date_naive(),
+            None,
+        );
+        // The first message is edited; the second (different author) is not.
+        assert_eq!(edit_state(&rows[1]).1, true);
+        assert_eq!(edit_state(&rows[2]).1, false);
+    }
+
+    #[test]
+    fn edit_is_allowed_only_for_the_author() {
+        let me = id_for(1);
+        let other = id_for(2);
+        assert!(can_edit_message(Some(me), Some(me)));
+        assert!(!can_edit_message(Some(other), Some(me)));
+        // A deleted author or a signed-out viewer can never edit.
+        assert!(!can_edit_message(None, Some(me)));
+        assert!(!can_edit_message(Some(me), None));
+    }
+
+    #[test]
+    fn delete_is_allowed_for_author_or_admin() {
+        let me = id_for(1);
+        let other = id_for(2);
+        // The author can always delete their own message.
+        assert!(can_delete_message(Some(me), Some(me), false));
+        // An admin can delete anyone's, including a deleted author's.
+        assert!(can_delete_message(Some(other), Some(me), true));
+        assert!(can_delete_message(None, Some(me), true));
+        // A non-admin cannot delete someone else's.
+        assert!(!can_delete_message(Some(other), Some(me), false));
     }
 }
