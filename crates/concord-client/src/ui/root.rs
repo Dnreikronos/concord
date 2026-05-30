@@ -16,7 +16,9 @@
 //! `cx.observe`" pattern that the per-feature views will follow.
 
 use std::collections::HashSet;
+use std::rc::Rc;
 
+use chrono::{DateTime, Local, NaiveDate, Utc};
 use gpui::*;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{h_flex, v_flex, Icon, IconName, Sizable};
@@ -39,6 +41,16 @@ use crate::ws::{ConnectionHandle, WsEvent};
 const WS_EVENT_BUFFER: usize = 256;
 /// Page size requested for channel history.
 const MESSAGE_PAGE: i64 = 50;
+/// How many rows from the top of the message list trigger loading an older
+/// page. Kept well below a page so the fetch starts before the user reaches the
+/// very top.
+const LOAD_OLDER_THRESHOLD: usize = 8;
+/// Pixels of off-screen content the message list measures above and below the
+/// viewport, to soften pop-in while scrolling.
+const MESSAGE_LIST_OVERDRAW: f32 = 300.0;
+/// Minutes between two messages from the same author beyond which the later one
+/// starts a fresh header instead of joining the previous group.
+const GROUP_GAP_MINUTES: i64 = 7;
 
 /// Which top-level screen the app is showing.
 enum Screen {
@@ -57,6 +69,21 @@ pub struct ConcordApp {
     /// Channel categories the user has collapsed in the sidebar, by id. Pure
     /// view state: it survives re-renders but is not persisted across sessions.
     collapsed_categories: HashSet<Uuid>,
+
+    /// Virtualized list backing the chat pane. Bottom-aligned and tail-following
+    /// like a chat log; its item set is kept in lockstep with
+    /// [`Self::message_rows`] by [`Self::sync_messages`].
+    message_list: ListState,
+    /// The rows the list renders — date separators interleaved with messages —
+    /// rebuilt whenever the chat state changes. Shared into the list's render
+    /// closure as an `Rc`.
+    message_rows: Rc<Vec<MessageRow>>,
+    /// Channel whose history is currently mirrored into `message_list`, used to
+    /// tell a channel switch (reset) from an in-place update (splice).
+    synced_channel: Option<Uuid>,
+    /// Set when messages arrive below the viewport while the user has scrolled
+    /// up; surfaces the "new messages" jump button.
+    unseen_messages: bool,
 
     // Shared application state, handed to views as entity handles.
     auth_state: Entity<AuthState>,
@@ -82,13 +109,29 @@ impl ConcordApp {
         let chat = cx.new(|_| ChatState::new());
         let connection = cx.new(|_| ConnectionState::new());
 
+        // Bottom-aligned, tail-following list — a chat log. The scroll handler
+        // drives scroll-back paging and dismisses the "new messages" hint once
+        // the bottom is back in view.
+        let message_list =
+            ListState::new(0, ListAlignment::Bottom, px(MESSAGE_LIST_OVERDRAW));
+        message_list.set_follow_mode(FollowMode::Tail);
+        let weak = cx.weak_entity();
+        message_list.set_scroll_handler(move |event, _window, cx| {
+            let (start, end, count) =
+                (event.visible_range.start, event.visible_range.end, event.count);
+            let _ = weak.update(cx, |this, cx| this.on_message_scroll(start, end, count, cx));
+        });
+
         // Re-render the layout whenever the auth view fires or any piece of
-        // shared state changes.
+        // shared state changes; chat changes also reconcile the message list.
         let subscriptions = vec![
             cx.subscribe(&auth, Self::on_auth_event),
             cx.observe(&auth_state, |_, _, cx| cx.notify()),
             cx.observe(&servers, |_, _, cx| cx.notify()),
-            cx.observe(&chat, |_, _, cx| cx.notify()),
+            cx.observe(&chat, |this, _, cx| {
+                this.sync_messages(cx);
+                cx.notify();
+            }),
             cx.observe(&connection, |_, _, cx| cx.notify()),
         ];
 
@@ -97,6 +140,10 @@ impl ConcordApp {
             auth,
             nav: NavState::new(),
             collapsed_categories: HashSet::new(),
+            message_list,
+            message_rows: Rc::new(Vec::new()),
+            synced_channel: None,
+            unseen_messages: false,
             auth_state,
             servers,
             chat,
@@ -175,8 +222,8 @@ impl ConcordApp {
                 // live messages while the socket was down, so refetch the active
                 // channel's newest page. The initial connect needs no refetch —
                 // `load_initial_data` already loaded it. This replaces history
-                // with the newest page; once scroll-back (`prepend_older`) is
-                // wired (#31), reconnect should merge rather than clobber it.
+                // with the newest page, discarding any older pages the user had
+                // scrolled back to; merging on reconnect is left to later work.
                 let reconnected =
                     self.connection.read(cx).status() == ConnectionStatus::Reconnecting;
                 self.connection.update(cx, |c, cx| {
@@ -502,6 +549,124 @@ impl ConcordApp {
             });
         })
         .detach();
+    }
+
+    // -- Message list -----------------------------------------------------
+
+    /// Reconcile the virtualized [`Self::message_list`] with the current chat
+    /// state. A channel switch resets the list and re-arms tail-following; an
+    /// in-place change (new message, older page, edit, delete) is applied as the
+    /// minimal splice, so cached measurements and the scroll position survive.
+    fn sync_messages(&mut self, cx: &mut Context<Self>) {
+        let active = self.chat.read(cx).active_channel();
+        let today = Local::now().date_naive();
+        let new_rows = build_message_rows(self.chat.read(cx).messages(), today);
+
+        if active != self.synced_channel {
+            self.message_list.reset(new_rows.len());
+            self.message_list.set_follow_mode(FollowMode::Tail);
+            self.synced_channel = active;
+            self.unseen_messages = false;
+            self.message_rows = Rc::new(new_rows);
+            return;
+        }
+
+        if let Some((range, count)) = diff_splice(&self.message_rows, &new_rows) {
+            // A non-empty insert at the very end, with the viewport scrolled up,
+            // is a freshly arrived message the user has not seen.
+            let appended_at_tail = range.start == self.message_rows.len() && range.is_empty();
+            if appended_at_tail && count > 0 && !self.message_list.is_following_tail() {
+                self.unseen_messages = true;
+            }
+            self.message_list.splice(range, count);
+        }
+        self.message_rows = Rc::new(new_rows);
+    }
+
+    /// React to a user scroll of the message list: pull an older page when near
+    /// the top, and clear the "new messages" hint once the bottom is back in
+    /// view. Must not touch `message_list` — it runs while that element holds
+    /// the list state mutably borrowed.
+    fn on_message_scroll(
+        &mut self,
+        visible_start: usize,
+        visible_end: usize,
+        count: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let (has_more, loading, active) = {
+            let chat = self.chat.read(cx);
+            (chat.has_more(), chat.is_loading(), chat.active_channel())
+        };
+        if visible_start <= LOAD_OLDER_THRESHOLD && has_more && !loading {
+            if let Some(channel_id) = active {
+                self.load_older(channel_id, cx);
+            }
+        }
+        if self.unseen_messages && visible_end >= count {
+            self.unseen_messages = false;
+            cx.notify();
+        }
+    }
+
+    /// Fetch the page just older than the oldest loaded message and prepend it.
+    /// Guards on `has_more`/`is_loading` so the frequent scroll handler can call
+    /// it freely; the prepend splice preserves the visible scroll position.
+    fn load_older(&mut self, channel_id: Uuid, cx: &mut Context<Self>) {
+        let before = match self.chat.read(cx).oldest_cursor() {
+            Some(before) => before,
+            None => return,
+        };
+        let Some(token) = self.auth_state.read(cx).access_token().map(str::to_owned) else {
+            return;
+        };
+        self.chat.update(cx, |c, cx| {
+            c.set_loading(true);
+            cx.notify();
+        });
+
+        let base = auth::api_base_url();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        api::runtime().spawn(async move {
+            let result =
+                api::list_messages(&base, &token, channel_id, Some(before), Some(MESSAGE_PAGE)).await;
+            let _ = tx.send(result);
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = rx.await;
+            let _ = this.update(cx, |this, cx| {
+                this.chat.update(cx, |c, cx| {
+                    match outcome {
+                        Ok(Ok(page)) => {
+                            // A full page means older messages may still remain.
+                            let has_more = page.len() as i64 == MESSAGE_PAGE;
+                            c.prepend_older(channel_id, page, has_more);
+                        }
+                        Ok(Err(err)) => {
+                            if c.active_channel() == Some(channel_id) {
+                                c.set_loading(false);
+                            }
+                            tracing::warn!(error = %err, "failed to load older messages");
+                        }
+                        Err(_canceled) => {
+                            if c.active_channel() == Some(channel_id) {
+                                c.set_loading(false);
+                            }
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Snap the list back to the newest message and re-arm tail-following,
+    /// dismissing the "new messages" hint.
+    fn jump_to_latest(&mut self, cx: &mut Context<Self>) {
+        self.message_list.set_follow_mode(FollowMode::Tail);
+        self.unseen_messages = false;
+        cx.notify();
     }
 
     // -- Layout -----------------------------------------------------------
@@ -919,8 +1084,8 @@ impl ConcordApp {
         }
     }
 
-    /// The chat pane: header, message list, and a footer with typing and
-    /// connection status.
+    /// The chat pane: header, the virtualized message list, and a footer with
+    /// typing and connection status.
     fn chat_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let active_channel = self.chat.read(cx).active_channel();
         let title: SharedString = active_channel
@@ -934,22 +1099,9 @@ impl ConcordApp {
             })
             .unwrap_or_else(|| "Select a channel".into());
 
-        let (loading, messages): (bool, Vec<(SharedString, SharedString)>) = {
+        let (loading, empty) = {
             let chat = self.chat.read(cx);
-            (
-                chat.is_loading(),
-                chat.messages()
-                    .iter()
-                    .map(|m| {
-                        let author = m
-                            .author
-                            .as_ref()
-                            .map(|a| a.username.clone())
-                            .unwrap_or_else(|| "unknown".into());
-                        (SharedString::from(author), SharedString::from(m.content.clone()))
-                    })
-                    .collect(),
-            )
+            (chat.is_loading(), chat.is_empty())
         };
         let typing = self.chat.read(cx).typing_count();
         let status = self.connection.read(cx).status();
@@ -959,22 +1111,15 @@ impl ConcordApp {
             .user()
             .map(|u| SharedString::from(u.username.clone()));
 
-        let mut body = v_flex()
-            .flex_1()
-            .p(px(space::MD))
-            .gap(px(space::SM))
-            .overflow_hidden();
-        if active_channel.is_none() {
-            body = body.child(Self::muted_row("Pick a channel from the sidebar."));
-        } else if loading {
-            body = body.child(Self::muted_row("Loading messages…"));
-        } else if messages.is_empty() {
-            body = body.child(Self::muted_row("No messages yet — say hello!"));
+        let body: AnyElement = if active_channel.is_none() {
+            Self::message_notice("Pick a channel from the sidebar.").into_any_element()
+        } else if empty && loading {
+            Self::message_notice("Loading messages…").into_any_element()
+        } else if empty {
+            Self::message_notice("No messages yet — say hello!").into_any_element()
         } else {
-            for (author, content) in messages {
-                body = body.child(Self::message_row(author, content));
-            }
-        }
+            self.message_list_area(cx).into_any_element()
+        };
 
         v_flex()
             .flex_1()
@@ -1002,24 +1147,57 @@ impl ConcordApp {
             .child(Self::chat_footer(typing, username))
     }
 
-    /// One message row: bold author then content.
-    fn message_row(author: SharedString, content: SharedString) -> impl IntoElement {
+    /// The scrollable list of messages, overlaid with the "new messages" jump
+    /// button while the user is scrolled up past freshly arrived messages.
+    fn message_list_area(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let rows = self.message_rows.clone();
+        let list = list(self.message_list.clone(), move |ix, _window, _cx| {
+            rows.get(ix)
+                .map(render_message_row)
+                .unwrap_or_else(|| div().into_any_element())
+        })
+        .flex_1()
+        .py(px(space::SM));
+
+        let mut area = v_flex().relative().flex_1().min_h(px(0.0)).child(list);
+        if self.unseen_messages {
+            area = area.child(self.jump_to_latest_button(cx));
+        }
+        area
+    }
+
+    /// The pill that drops the user back to the newest messages, shown floating
+    /// above the footer when there are unseen messages below the viewport.
+    fn jump_to_latest_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("jump-to-latest")
+            .absolute()
+            .bottom(px(space::SM))
+            .right(px(space::LG))
+            .px(px(space::MD))
+            .py(px(space::XS))
+            .rounded(px(space::LG))
+            .bg(color::accent())
+            .text_color(color::interactive_active())
+            .text_size(px(font::SM))
+            .font_weight(FontWeight::SEMIBOLD)
+            .cursor_pointer()
+            .hover(|s| s.bg(color::accent_hover()))
+            .child("New messages ↓")
+            .on_click(cx.listener(|this, _, _, cx| this.jump_to_latest(cx)))
+    }
+
+    /// A muted, centered notice filling the message area (no channel, loading,
+    /// or empty states).
+    fn message_notice(text: impl Into<SharedString>) -> impl IntoElement {
         v_flex()
-            .w_full()
-            .gap(px(space::XS))
-            .child(
-                div()
-                    .text_color(color::text())
-                    .text_size(px(font::SM))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(author),
-            )
-            .child(
-                div()
-                    .text_color(color::text())
-                    .text_size(px(font::MD))
-                    .child(content),
-            )
+            .flex_1()
+            .min_h(px(0.0))
+            .items_center()
+            .justify_center()
+            .text_color(color::text_muted())
+            .text_size(px(font::MD))
+            .child(text.into())
     }
 
     /// A colored dot plus label reflecting the WebSocket status.
@@ -1179,4 +1357,348 @@ async fn load_servers_and_channels(base: &str, token: &str) -> Result<InitialDat
         },
     );
     Ok(InitialData { servers, channels, categories })
+}
+
+/// One rendered row in the message list: a day separator, or a message that
+/// carries an author/time header only when it opens a group. Equality drives the
+/// splice diff, so it deliberately covers every field that affects a row's
+/// rendered height (header, content, "edited" marker).
+#[derive(Clone, PartialEq)]
+enum MessageRow {
+    DateSeparator {
+        label: SharedString,
+    },
+    Message {
+        id: Uuid,
+        author: SharedString,
+        timestamp: SharedString,
+        content: SharedString,
+        show_header: bool,
+        edited: bool,
+    },
+}
+
+/// Flatten loaded messages (oldest first) into renderable rows: a date
+/// separator before the first message of each calendar day, then one row per
+/// message. Consecutive messages from the same author within
+/// [`GROUP_GAP_MINUTES`] are "grouped" — only the first carries a header.
+fn build_message_rows(messages: &[MessageWithAuthor], today: NaiveDate) -> Vec<MessageRow> {
+    let yesterday = today.pred_opt();
+    let mut rows = Vec::with_capacity(messages.len());
+    let mut prev_date: Option<NaiveDate> = None;
+    let mut prev_author: Option<Uuid> = None;
+    let mut prev_at: Option<DateTime<Utc>> = None;
+
+    for m in messages {
+        let local = m.created_at.with_timezone(&Local);
+        let date = local.date_naive();
+        let new_day = prev_date != Some(date);
+        if new_day {
+            rows.push(MessageRow::DateSeparator {
+                label: date_label(date, today, yesterday).into(),
+            });
+        }
+
+        let author_id = m.author.as_ref().map(|a| a.id);
+        let gap = prev_at.is_none_or(|p| (m.created_at - p).num_minutes() >= GROUP_GAP_MINUTES);
+        let show_header = new_day || author_id != prev_author || gap;
+
+        let author = m
+            .author
+            .as_ref()
+            .map(|a| a.username.clone())
+            .unwrap_or_else(|| "unknown".into());
+        rows.push(MessageRow::Message {
+            id: m.id,
+            author: author.into(),
+            timestamp: local.format("%H:%M").to_string().into(),
+            content: m.content.clone().into(),
+            show_header,
+            edited: m.edited_at.is_some(),
+        });
+
+        prev_date = Some(date);
+        prev_author = author_id;
+        prev_at = Some(m.created_at);
+    }
+    rows
+}
+
+/// A human label for a day separator: "Today" / "Yesterday" for the obvious
+/// cases, otherwise an absolute date like "May 30, 2026".
+fn date_label(date: NaiveDate, today: NaiveDate, yesterday: Option<NaiveDate>) -> String {
+    if date == today {
+        "Today".to_string()
+    } else if Some(date) == yesterday {
+        "Yesterday".to_string()
+    } else {
+        date.format("%B %-d, %Y").to_string()
+    }
+}
+
+/// The minimal splice turning `old` into `new`: the range of `old` to replace
+/// and how many `new` rows replace it, or `None` when they are identical.
+/// Messages only grow at the head (older pages) or tail (live messages), with
+/// the occasional in-place edit or delete, so a common-prefix / common-suffix
+/// diff captures every case in a single splice.
+fn diff_splice(old: &[MessageRow], new: &[MessageRow]) -> Option<(std::ops::Range<usize>, usize)> {
+    let mut prefix = 0;
+    while prefix < old.len() && prefix < new.len() && old[prefix] == new[prefix] {
+        prefix += 1;
+    }
+    let mut suffix = 0;
+    while suffix < old.len() - prefix
+        && suffix < new.len() - prefix
+        && old[old.len() - 1 - suffix] == new[new.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    let range = prefix..(old.len() - suffix);
+    let count = new.len() - suffix - prefix;
+    if range.is_empty() && count == 0 {
+        None
+    } else {
+        Some((range, count))
+    }
+}
+
+/// Render a single list row.
+fn render_message_row(row: &MessageRow) -> AnyElement {
+    match row {
+        MessageRow::DateSeparator { label } => render_date_separator(label.clone()),
+        MessageRow::Message {
+            author,
+            timestamp,
+            content,
+            show_header,
+            edited,
+            ..
+        } => render_message(
+            author.clone(),
+            timestamp.clone(),
+            content.clone(),
+            *show_header,
+            *edited,
+        ),
+    }
+}
+
+/// A day separator: the label centered between two hairline rules.
+fn render_date_separator(label: SharedString) -> AnyElement {
+    let rule = || div().flex_1().h(px(1.0)).bg(color::border());
+    h_flex()
+        .w_full()
+        .px(px(space::MD))
+        .py(px(space::SM))
+        .items_center()
+        .gap(px(space::SM))
+        .child(rule())
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(font::SM))
+                .text_color(color::text_muted())
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(label),
+        )
+        .child(rule())
+        .into_any_element()
+}
+
+/// A message row: an author/time header for group openers, then the content
+/// (with a trailing "(edited)" marker when applicable).
+fn render_message(
+    author: SharedString,
+    timestamp: SharedString,
+    content: SharedString,
+    show_header: bool,
+    edited: bool,
+) -> AnyElement {
+    let mut content_line = h_flex().w_full().items_baseline().gap(px(space::SM)).child(
+        div()
+            .text_color(color::text())
+            .text_size(px(font::MD))
+            .child(content),
+    );
+    if edited {
+        content_line = content_line.child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(font::SM))
+                .text_color(color::text_faint())
+                .child("(edited)"),
+        );
+    }
+
+    let mut col = v_flex().w_full().px(px(space::MD)).gap(px(space::XS));
+    col = if show_header {
+        col.pt(px(space::SM))
+    } else {
+        col.pt(px(2.0))
+    };
+    if show_header {
+        col = col.child(
+            h_flex()
+                .items_baseline()
+                .gap(px(space::SM))
+                .child(
+                    div()
+                        .text_color(color::text())
+                        .text_size(px(font::MD))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(author),
+                )
+                .child(
+                    div()
+                        .text_color(color::text_faint())
+                        .text_size(px(font::SM))
+                        .child(timestamp),
+                ),
+        );
+    }
+    col.child(content_line).into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    // Import only what the tests need rather than `use super::*`: the latter
+    // re-globs `gpui::*` into this module, which blows the recursion limit when
+    // the `#[test]` harness expands.
+    use super::{build_message_rows, diff_splice, MessageRow};
+
+    use chrono::{DateTime, Local, TimeZone, Utc};
+    use concord_shared::types::{MessageAuthor, MessageWithAuthor};
+    use uuid::Uuid;
+
+    fn at(year: i32, month: u32, day: u32, hour: u32, min: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(year, month, day, hour, min, 0).unwrap()
+    }
+
+    fn msg(id: u8, author: Option<u8>, content: &str, created_at: DateTime<Utc>) -> MessageWithAuthor {
+        let with_byte = |n: u8| {
+            let mut bytes = [0u8; 16];
+            bytes[15] = n;
+            Uuid::from_bytes(bytes)
+        };
+        MessageWithAuthor {
+            id: with_byte(id),
+            channel_id: Uuid::nil(),
+            author: author.map(|a| MessageAuthor {
+                id: with_byte(a),
+                username: "alice".into(),
+                avatar_url: None,
+            }),
+            content: content.into(),
+            edited_at: None,
+            created_at,
+        }
+    }
+
+    fn is_header(row: &MessageRow, expected: bool) -> bool {
+        matches!(row, MessageRow::Message { show_header, .. } if *show_header == expected)
+    }
+
+    fn separators(rows: &[MessageRow]) -> usize {
+        rows.iter()
+            .filter(|r| matches!(r, MessageRow::DateSeparator { .. }))
+            .count()
+    }
+
+    #[test]
+    fn groups_consecutive_same_author_messages() {
+        let t = at(2026, 5, 30, 12, 0);
+        let rows = build_message_rows(
+            &[msg(1, Some(1), "hi", t), msg(2, Some(1), "again", t)],
+            Local::now().date_naive(),
+        );
+        // One separator, then a header opener and a grouped (header-less) reply.
+        assert_eq!(rows.len(), 3);
+        assert_eq!(separators(&rows), 1);
+        assert!(is_header(&rows[1], true));
+        assert!(is_header(&rows[2], false));
+    }
+
+    #[test]
+    fn separates_messages_across_days() {
+        let rows = build_message_rows(
+            &[
+                msg(1, Some(1), "old", at(2026, 5, 28, 12, 0)),
+                msg(2, Some(1), "new", at(2026, 5, 30, 12, 0)),
+            ],
+            Local::now().date_naive(),
+        );
+        // A separator opens each day, and the second day's message gets a header.
+        assert_eq!(separators(&rows), 2);
+        assert!(is_header(&rows[3], true));
+    }
+
+    #[test]
+    fn different_author_starts_a_new_group() {
+        let t = at(2026, 5, 30, 12, 0);
+        let rows = build_message_rows(
+            &[msg(1, Some(1), "a", t), msg(2, Some(2), "b", t)],
+            Local::now().date_naive(),
+        );
+        assert_eq!(rows.len(), 3);
+        assert!(is_header(&rows[2], true));
+    }
+
+    #[test]
+    fn long_gap_starts_a_new_group() {
+        let rows = build_message_rows(
+            &[
+                msg(1, Some(1), "a", at(2026, 5, 30, 12, 0)),
+                msg(2, Some(1), "b", at(2026, 5, 30, 12, 8)),
+            ],
+            Local::now().date_naive(),
+        );
+        assert!(is_header(&rows[2], true));
+    }
+
+    fn row_msg(id: u8, content: &str) -> MessageRow {
+        let mut bytes = [0u8; 16];
+        bytes[15] = id;
+        MessageRow::Message {
+            id: Uuid::from_bytes(bytes),
+            author: "alice".into(),
+            timestamp: "12:00".into(),
+            content: content.into(),
+            show_header: true,
+            edited: false,
+        }
+    }
+
+    #[test]
+    fn diff_identical_is_none() {
+        let rows = vec![row_msg(1, "a"), row_msg(2, "b")];
+        assert_eq!(diff_splice(&rows, &rows), None);
+    }
+
+    #[test]
+    fn diff_detects_tail_append() {
+        let old = vec![row_msg(1, "a")];
+        let new = vec![row_msg(1, "a"), row_msg(2, "b")];
+        assert_eq!(diff_splice(&old, &new), Some((1..1, 1)));
+    }
+
+    #[test]
+    fn diff_detects_head_prepend() {
+        let old = vec![row_msg(2, "b")];
+        let new = vec![row_msg(1, "a"), row_msg(2, "b")];
+        assert_eq!(diff_splice(&old, &new), Some((0..0, 1)));
+    }
+
+    #[test]
+    fn diff_detects_in_place_edit() {
+        let old = vec![row_msg(1, "a"), row_msg(2, "b"), row_msg(3, "c")];
+        let new = vec![row_msg(1, "a"), row_msg(2, "EDIT"), row_msg(3, "c")];
+        assert_eq!(diff_splice(&old, &new), Some((1..2, 1)));
+    }
+
+    #[test]
+    fn diff_detects_delete() {
+        let old = vec![row_msg(1, "a"), row_msg(2, "b"), row_msg(3, "c")];
+        let new = vec![row_msg(1, "a"), row_msg(3, "c")];
+        assert_eq!(diff_splice(&old, &new), Some((1..2, 0)));
+    }
 }
