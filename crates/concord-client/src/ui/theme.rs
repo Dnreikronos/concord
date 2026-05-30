@@ -82,7 +82,12 @@ pub mod color {
         rgb(0x23a55a).into()
     }
 
-    /// Danger / destructive.
+    /// Idle presence (the amber "away" status dot).
+    pub fn idle() -> Hsla {
+        rgb(0xf0b232).into()
+    }
+
+    /// Danger / destructive — also the "do not disturb" presence dot.
     pub fn danger() -> Hsla {
         rgb(0xf23f43).into()
     }
@@ -105,6 +110,8 @@ pub mod space {
     pub const SERVER_RAIL: f32 = 72.0;
     /// Width of the channel / DM sidebar.
     pub const SIDEBAR: f32 = 240.0;
+    /// Width of the right-hand member list panel.
+    pub const MEMBER_PANEL: f32 = 240.0;
     /// Height of the top bar / channel header.
     pub const HEADER: f32 = 48.0;
     /// Side length of a circular rail button.
