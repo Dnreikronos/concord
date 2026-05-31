@@ -222,6 +222,41 @@ pub struct DmChannelInfo {
     pub participants: Vec<DmParticipant>,
 }
 
+/// The newest message in a DM, as a preview for the conversation list. `author`
+/// is `None` when the sender's account was deleted (`messages.author_id` is
+/// `ON DELETE SET NULL`), matching `MessageWithAuthor`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DmLastMessage {
+    pub id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<MessageAuthor>,
+    pub content: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// One row of the DM-list endpoint: a conversation the caller belongs to, with
+/// its participants, member count, last-message preview, and the caller's
+/// unread flag. Conversations are returned newest-activity-first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DmConversation {
+    pub id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub is_group: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    /// Total members, including the caller. The headline figure for group DMs.
+    pub member_count: i64,
+    pub participants: Vec<DmParticipant>,
+    /// The most recent message, or `None` for a conversation with no messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_message: Option<DmLastMessage>,
+    /// True when a message from another member is newer than the caller's
+    /// last read of this conversation (or the caller has never read it).
+    pub unread: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerInvite {
     pub id: Uuid,

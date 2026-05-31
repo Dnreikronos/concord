@@ -14,15 +14,18 @@
 //! - [`ChatState`] — messages, pagination, and typing for the active channel.
 //! - [`ConnectionState`] — the WebSocket link's status.
 //! - [`PresenceState`] — the online status of the users we can see.
+//! - [`DmsState`] — the DM conversation list and the open conversation.
 
 pub mod auth;
 pub mod chat;
 pub mod connection;
+pub mod dms;
 pub mod presence;
 pub mod servers;
 
 pub use auth::AuthState;
 pub use chat::ChatState;
 pub use connection::{ConnectionState, ConnectionStatus};
+pub use dms::DmsState;
 pub use presence::PresenceState;
 pub use servers::ServersState;

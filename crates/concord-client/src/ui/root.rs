@@ -28,15 +28,15 @@ use uuid::Uuid;
 
 use concord_shared::protocol::{ClientMsg, ServerMsg, Token};
 use concord_shared::types::{
-    Channel, ChannelCategory, ChannelType, MemberInfo, MessageAuthor, MessageWithAuthor, Server,
-    UserStatus,
+    Channel, ChannelCategory, ChannelType, DmConversation, MemberInfo, MessageAuthor,
+    MessageWithAuthor, Server, UserStatus,
 };
 use concord_shared::validation::validate_message_content;
 
 use crate::api;
 use crate::auth;
 use crate::state::{
-    AuthState, ChatState, ConnectionState, ConnectionStatus, PresenceState, ServersState,
+    AuthState, ChatState, ConnectionState, ConnectionStatus, DmsState, PresenceState, ServersState,
 };
 use crate::ui::auth_view::{AuthEvent, AuthView};
 use crate::ui::nav::{NavState, View};
@@ -62,6 +62,8 @@ const GROUP_GAP_MINUTES: i64 = 7;
 const AVATAR_SIZE: f32 = 40.0;
 /// Side length of a member panel avatar.
 const MEMBER_AVATAR_SIZE: f32 = 32.0;
+/// Side length of a DM conversation-list avatar.
+const DM_AVATAR_SIZE: f32 = 36.0;
 /// Diameter of the presence dot overlaid on a member panel avatar.
 const MEMBER_STATUS_DOT: f32 = 10.0;
 /// Width of the ring that sets the presence dot off from the avatar.
@@ -137,6 +139,7 @@ pub struct ConcordApp {
     chat: Entity<ChatState>,
     connection: Entity<ConnectionState>,
     presence: Entity<PresenceState>,
+    dms: Entity<DmsState>,
 
     /// The live connection handle: outgoing messages are sent through it, and
     /// holding it keeps the background task's command channel open (the task
@@ -156,6 +159,7 @@ impl ConcordApp {
         let chat = cx.new(|_| ChatState::new());
         let connection = cx.new(|_| ConnectionState::new());
         let presence = cx.new(|_| PresenceState::new());
+        let dms = cx.new(|_| DmsState::new());
 
         // The composer: an auto-growing textarea where a plain Enter submits and
         // Shift+Enter inserts a newline (`submit_on_enter` flips that default).
@@ -202,6 +206,7 @@ impl ConcordApp {
             }),
             cx.observe(&connection, |_, _, cx| cx.notify()),
             cx.observe(&presence, |_, _, cx| cx.notify()),
+            cx.observe(&dms, |_, _, cx| cx.notify()),
         ];
 
         Self {
@@ -226,6 +231,7 @@ impl ConcordApp {
             chat,
             connection,
             presence,
+            dms,
             ws_handle: None,
             _subscriptions: subscriptions,
         }
@@ -429,6 +435,57 @@ impl ConcordApp {
                     cx.notify();
                 });
             }
+            ServerMsg::NewDirectMessage {
+                id,
+                dm_channel_id,
+                author_id,
+                content,
+                created_at,
+            } => {
+                let me = self.auth_state.read(cx).user().map(|u| u.id);
+                let from_me = matches!((*author_id, me), (Some(a), Some(m)) if a == m);
+                // The wire message carries no author profile; resolve it against
+                // the conversation's participants (or the signed-in user).
+                let author = (*author_id).and_then(|aid| self.resolve_dm_author(*dm_channel_id, aid, cx));
+                // Refresh the conversation list: bump the preview, reorder, and
+                // flag unread unless this DM is open or the message is our own.
+                self.dms.update(cx, |d, cx| {
+                    d.apply_new_message(
+                        *dm_channel_id,
+                        *id,
+                        author.clone(),
+                        content.clone(),
+                        *created_at,
+                        from_me,
+                    );
+                    cx.notify();
+                });
+                // When the DM is the open chat, fold it into the message list the
+                // same way a channel `NewMessage` is — reconciling our own echo.
+                if self.chat.read(cx).active_channel() == Some(*dm_channel_id) {
+                    let message = MessageWithAuthor {
+                        id: *id,
+                        channel_id: *dm_channel_id,
+                        author,
+                        content: content.clone(),
+                        edited_at: None,
+                        created_at: *created_at,
+                    };
+                    let author_id = *author_id;
+                    self.chat.update(cx, |c, cx| {
+                        if !c.confirm_optimistic(
+                            message.channel_id,
+                            message.id,
+                            author_id,
+                            &message.content,
+                            message.created_at,
+                        ) {
+                            c.push_message(message);
+                        }
+                        cx.notify();
+                    });
+                }
+            }
             _ => {}
         }
     }
@@ -455,6 +512,39 @@ impl ConcordApp {
                 id: m.user_id,
                 username: m.username.clone(),
                 avatar_url: m.avatar_url.clone(),
+            })
+    }
+
+    /// Author profile for a live DM message: the signed-in user, or one of the
+    /// conversation's participants, else `None` (a deleted account, or a
+    /// conversation we don't hold).
+    fn resolve_dm_author(
+        &self,
+        dm_channel_id: Uuid,
+        author_id: Uuid,
+        cx: &Context<Self>,
+    ) -> Option<MessageAuthor> {
+        if let Some(user) = self.auth_state.read(cx).user() {
+            if user.id == author_id {
+                return Some(MessageAuthor {
+                    id: user.id,
+                    username: user.username.clone(),
+                    avatar_url: user.avatar_url.clone(),
+                });
+            }
+        }
+        self.dms
+            .read(cx)
+            .conversation(dm_channel_id)
+            .and_then(|conv| {
+                conv.participants
+                    .iter()
+                    .find(|p| p.user_id == author_id)
+                    .map(|p| MessageAuthor {
+                        id: p.user_id,
+                        username: p.username.clone(),
+                        avatar_url: p.avatar_url.clone(),
+                    })
             })
     }
 
@@ -620,11 +710,95 @@ impl ConcordApp {
         cx.notify();
     }
 
-    /// Open a direct message with `user_id`, clicked from the member panel. The
-    /// DM view itself lands in later work, so for now this only records the
-    /// intent — the affordance is wired so the panel is complete.
+    /// Start a direct message with `user_id`, clicked from the member panel.
+    /// Opening a DM with a specific *user* needs the find-or-create endpoint,
+    /// which lands in later work; existing conversations are reachable today
+    /// from the DM view's list. For now this only records the intent.
     fn open_dm(&mut self, user_id: Uuid, _cx: &mut Context<Self>) {
-        tracing::debug!(%user_id, "open-DM clicked; the DM view lands in later work");
+        tracing::debug!(%user_id, "start-DM clicked; opening a DM with a user lands in later work");
+    }
+
+    /// Fetch the DM conversation list once, the first time the user opens the DM
+    /// view. Already-loaded or in-flight lists are left alone; live
+    /// `NewDirectMessage`s keep the list current afterwards.
+    fn ensure_dms_loaded(&mut self, cx: &mut Context<Self>) {
+        let dms = self.dms.read(cx);
+        if dms.is_loaded() || dms.is_loading() {
+            return;
+        }
+        self.load_dms(cx);
+    }
+
+    /// Load `GET /api/dms` into the DM state. A failure clears the spinner and is
+    /// logged; the next view entry will not retry (the list is marked loaded only
+    /// on success), but a reconnect's live messages still flow in.
+    fn load_dms(&mut self, cx: &mut Context<Self>) {
+        let Some(token) = self.auth_state.read(cx).access_token().map(str::to_owned) else {
+            return;
+        };
+        self.dms.update(cx, |d, cx| {
+            d.set_loading(true);
+            cx.notify();
+        });
+
+        let base = auth::api_base_url();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        api::runtime().spawn(async move {
+            let _ = tx.send(api::list_dms(&base, &token).await);
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = rx.await;
+            let _ = this.update(cx, |this, cx| {
+                this.dms.update(cx, |d, cx| {
+                    match outcome {
+                        Ok(Ok(list)) => d.set_conversations(list),
+                        Ok(Err(err)) => {
+                            tracing::warn!(error = %err, "failed to load DM conversations");
+                            d.set_loading(false);
+                        }
+                        Err(_canceled) => d.set_loading(false),
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Open an existing DM conversation from the list: select it (clearing its
+    /// unread dot), tell the server it has been read, and open its channel in the
+    /// chat pane so its history loads — DM channels share the message endpoint
+    /// and `ChatState` with server channels.
+    fn open_dm_conversation(&mut self, dm_channel_id: Uuid, cx: &mut Context<Self>) {
+        self.dms.update(cx, |d, cx| {
+            d.set_active(dm_channel_id);
+            cx.notify();
+        });
+        self.mark_dm_read_remote(dm_channel_id, cx);
+        self.open_channel(dm_channel_id, cx);
+    }
+
+    /// Tell the server a DM has been read. Fire-and-forget on the shared runtime:
+    /// the local unread dot is already cleared, so a failure only means the flag
+    /// reappears on the next fetch.
+    fn mark_dm_read_remote(&self, dm_channel_id: Uuid, cx: &Context<Self>) {
+        let Some(token) = self.auth_state.read(cx).access_token().map(str::to_owned) else {
+            return;
+        };
+        let base = auth::api_base_url();
+        api::runtime().spawn(async move {
+            if let Err(err) = api::mark_dm_read(&base, &token, dm_channel_id).await {
+                tracing::warn!(error = %err, "failed to mark DM read");
+            }
+        });
+    }
+
+    /// Whether the open chat is a DM (as opposed to a server channel). True when
+    /// a DM conversation is selected and it is the channel `ChatState` holds, so
+    /// it drives send routing, the title, and the suppressed member toggle alike.
+    fn active_is_dm(&self, cx: &Context<Self>) -> bool {
+        let active_dm = self.dms.read(cx).active();
+        active_dm.is_some() && active_dm == self.chat.read(cx).active_channel()
     }
 
     /// Fetch the newest page of history for `channel_id`.
@@ -946,7 +1120,16 @@ impl ConcordApp {
             c.push_optimistic(optimistic);
             cx.notify();
         });
-        self.send_ws(ClientMsg::SendMessage { channel_id, content });
+        // A DM channel rides a different wire message than a server channel,
+        // though `ChatState` keys both by the same channel id.
+        if self.active_is_dm(cx) {
+            self.send_ws(ClientMsg::SendDirectMessage {
+                dm_channel_id: channel_id,
+                content,
+            });
+        } else {
+            self.send_ws(ClientMsg::SendMessage { channel_id, content });
+        }
 
         self.composer.update(cx, |input, cx| input.set_value("", window, cx));
         self.stop_typing();
@@ -959,6 +1142,11 @@ impl ConcordApp {
         let Some(channel_id) = self.chat.read(cx).active_channel() else {
             return;
         };
+        // DMs carry no typing indicators yet — the server's typing fan-out is a
+        // server-channel concern — so don't announce typing on a DM channel.
+        if self.active_is_dm(cx) {
+            return;
+        }
         if self.composer.read(cx).value().trim().is_empty() {
             self.stop_typing();
             return;
@@ -1179,6 +1367,15 @@ impl ConcordApp {
             .into_any_element();
         Self::rail_item(tooltip, active, false, tooltip.into(), content, cx, move |this, _, cx| {
             this.nav.activate(view);
+            if view == View::DirectMessages {
+                // Load the conversation list on first visit, and re-open the
+                // selected DM so the chat pane shows it rather than whatever
+                // server channel was opened while we were away.
+                this.ensure_dms_loaded(cx);
+                if let Some(active) = this.dms.read(cx).active() {
+                    this.open_channel(active, cx);
+                }
+            }
             cx.notify();
         })
     }
@@ -1246,9 +1443,7 @@ impl ConcordApp {
 
         let body: AnyElement = match view {
             View::Servers => self.channel_list(cx).into_any_element(),
-            View::DirectMessages => {
-                Self::placeholder_rows(&["Direct messages land in later work."]).into_any_element()
-            }
+            View::DirectMessages => self.dm_list(cx).into_any_element(),
             View::Settings => {
                 Self::placeholder_rows(&["My Account", "Appearance", "Notifications"])
                     .into_any_element()
@@ -1408,6 +1603,126 @@ impl ConcordApp {
             .on_click(cx.listener(move |this, _, _, cx| this.open_channel(id, cx)))
     }
 
+    /// The DM sidebar: the user's conversations, newest activity first, each a
+    /// clickable row. Loading and empty states replace the whole list.
+    fn dm_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let active = self.dms.read(cx).active();
+        let me = self.auth_state.read(cx).user().map(|u| u.id);
+        let now = Utc::now();
+        // Build owned rows first so the `dms` borrow drops before the per-row
+        // `cx.listener`s reborrow `cx`.
+        let (loading, loaded, rows) = {
+            let dms = self.dms.read(cx);
+            let rows: Vec<DmRow> = dms
+                .conversations()
+                .iter()
+                .map(|c| DmRow::from_conversation(c, me, now))
+                .collect();
+            (dms.is_loading(), dms.is_loaded(), rows)
+        };
+
+        let mut list = v_flex()
+            .id("dm-list")
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .p(px(space::SM))
+            .gap(px(space::XS));
+
+        if rows.is_empty() {
+            let notice = if loading || !loaded {
+                "Loading…"
+            } else {
+                "No conversations yet."
+            };
+            return list.child(Self::muted_row(notice));
+        }
+        for row in rows {
+            let selected = active == Some(row.id);
+            list = list.child(self.dm_row(row, selected, cx));
+        }
+        list
+    }
+
+    /// One DM conversation row: an avatar, the display name with a relative
+    /// timestamp, and a one-line message preview, plus an unread dot. An unread
+    /// row reads brighter and bolder; clicking it opens the conversation.
+    fn dm_row(&self, row: DmRow, selected: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let id = row.id;
+        let name_color = if row.unread || selected {
+            color::text()
+        } else {
+            color::text_muted()
+        };
+        let name_weight = if row.unread {
+            FontWeight::SEMIBOLD
+        } else {
+            FontWeight::MEDIUM
+        };
+
+        let mut container = h_flex()
+            .id(SharedString::from(id.to_string()))
+            .w_full()
+            .px(px(space::SM))
+            .py(px(space::XS))
+            .gap(px(space::SM))
+            .items_center()
+            .rounded(px(space::XS));
+        if selected {
+            container = container.bg(color::active());
+        }
+        container
+            .hover(|s| s.bg(color::hover()))
+            .cursor_pointer()
+            .child(dm_avatar(&row.avatar))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .gap(px(2.0))
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(space::SM))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .text_size(px(font::MD))
+                                    .text_color(name_color)
+                                    .font_weight(name_weight)
+                                    .child(row.name),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(font::SM))
+                                    .text_color(color::text_faint())
+                                    .child(row.timestamp),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .truncate()
+                            .text_size(px(font::SM))
+                            .text_color(color::text_muted())
+                            .child(row.preview),
+                    ),
+            )
+            .children(row.unread.then(|| {
+                div()
+                    .flex_shrink_0()
+                    .size(px(8.0))
+                    .rounded_full()
+                    .bg(color::accent())
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| this.open_dm_conversation(id, cx)))
+    }
+
     /// Non-interactive, muted sidebar rows for placeholder / status text.
     fn placeholder_rows(rows: &[&'static str]) -> impl IntoElement {
         v_flex()
@@ -1433,8 +1748,15 @@ impl ConcordApp {
         match self.nav.active() {
             View::Servers => self.chat_pane(cx).into_any_element(),
             View::DirectMessages => {
-                Self::placeholder_pane("Direct Messages", "Select a conversation to start chatting.")
+                if self.dms.read(cx).active().is_some() {
+                    self.chat_pane(cx).into_any_element()
+                } else {
+                    Self::placeholder_pane(
+                        "Direct Messages",
+                        "Select a conversation to start chatting.",
+                    )
                     .into_any_element()
+                }
             }
             View::Settings => {
                 Self::placeholder_pane("Settings", "Settings live here once the views land.")
@@ -1443,11 +1765,16 @@ impl ConcordApp {
         }
     }
 
-    /// The chat pane: header, the virtualized message list, and the composer
-    /// (with its typing indicator) pinned at the foot.
-    fn chat_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let active_channel = self.chat.read(cx).active_channel();
-        let title: SharedString = active_channel
+    /// The chat header's title for the open conversation: the DM's display name
+    /// when a DM is open, otherwise the active server channel named
+    /// Discord-style ("# general"), or a prompt when nothing is open.
+    fn chat_title(&self, cx: &Context<Self>) -> SharedString {
+        if let Some(name) = self.active_dm_name(cx) {
+            return name;
+        }
+        self.chat
+            .read(cx)
+            .active_channel()
             .and_then(|id| {
                 self.servers
                     .read(cx)
@@ -1456,7 +1783,28 @@ impl ConcordApp {
                     .find(|c| c.id == id)
                     .map(|c| SharedString::from(format!("# {}", c.name)))
             })
-            .unwrap_or_else(|| "Select a channel".into());
+            .unwrap_or_else(|| "Select a channel".into())
+    }
+
+    /// The display name of the open DM conversation — the other person for a
+    /// 1:1, the group name (or participant names) for a group — or `None` when
+    /// no DM is the open chat.
+    fn active_dm_name(&self, cx: &Context<Self>) -> Option<SharedString> {
+        if !self.active_is_dm(cx) {
+            return None;
+        }
+        let dms = self.dms.read(cx);
+        let conv = dms.conversation(dms.active()?)?;
+        let me = self.auth_state.read(cx).user().map(|u| u.id);
+        Some(dm_display_name(conv, me))
+    }
+
+    /// The chat pane: header, the virtualized message list, and the composer
+    /// (with its typing indicator) pinned at the foot.
+    fn chat_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let active_channel = self.chat.read(cx).active_channel();
+        let is_dm = self.active_is_dm(cx);
+        let title = self.chat_title(cx);
 
         let (loading, empty) = {
             let chat = self.chat.read(cx);
@@ -1502,7 +1850,9 @@ impl ConcordApp {
                             .items_center()
                             .gap(px(space::MD))
                             .child(Self::connection_indicator(status))
-                            .child(self.member_toggle(cx)),
+                            // The member toggle is a server-channel concern; a DM
+                            // has no member list to reveal.
+                            .children((!is_dm).then(|| self.member_toggle(cx))),
                     ),
             )
             .child(body)
@@ -1565,18 +1915,25 @@ impl ConcordApp {
             return;
         }
         self.composer_channel = active;
-        let placeholder: SharedString = match active {
-            Some(id) => {
-                let servers = self.servers.read(cx);
-                servers
-                    .active_channels()
-                    .iter()
-                    .find(|c| c.id == id)
-                    .map(|c| format!("Message #{}", c.name))
-                    .unwrap_or_else(|| "Message".to_string())
-                    .into()
+        let placeholder: SharedString = if self.active_is_dm(cx) {
+            self.active_dm_name(cx)
+                .map(|name| format!("Message {name}"))
+                .unwrap_or_else(|| "Message".to_string())
+                .into()
+        } else {
+            match active {
+                Some(id) => {
+                    let servers = self.servers.read(cx);
+                    servers
+                        .active_channels()
+                        .iter()
+                        .find(|c| c.id == id)
+                        .map(|c| format!("Message #{}", c.name))
+                        .unwrap_or_else(|| "Message".to_string())
+                        .into()
+                }
+                None => "Message".into(),
             }
-            None => "Message".into(),
         };
         self.composer
             .update(cx, |input, cx| input.set_placeholder(placeholder, window, cx));
@@ -2236,6 +2593,145 @@ fn member_avatar(initial: SharedString, tint: u8, status: UserStatus) -> impl In
         )
 }
 
+/// A DM conversation as the sidebar list renders it: identity resolved against
+/// the signed-in user (a 1:1 names the *other* person), a one-line preview of
+/// the last message, and a compact relative timestamp.
+struct DmRow {
+    id: Uuid,
+    name: SharedString,
+    avatar: DmAvatar,
+    preview: SharedString,
+    timestamp: SharedString,
+    unread: bool,
+}
+
+/// The avatar a DM row shows: a single participant's initial for a 1:1, or a
+/// generic group glyph for a group DM.
+enum DmAvatar {
+    Person { initial: SharedString, tint: u8 },
+    Group,
+}
+
+impl DmRow {
+    /// Project a conversation into its rendered row, resolving the display name
+    /// and avatar against `me` (the signed-in user) and the last-message age
+    /// against `now`.
+    fn from_conversation(conv: &DmConversation, me: Option<Uuid>, now: DateTime<Utc>) -> Self {
+        let avatar = if conv.is_group {
+            DmAvatar::Group
+        } else {
+            // A 1:1 shows the other person; fall back to any participant if the
+            // list somehow holds only ourselves.
+            let person = conv
+                .participants
+                .iter()
+                .find(|p| Some(p.user_id) != me)
+                .or_else(|| conv.participants.first());
+            match person {
+                Some(p) => DmAvatar::Person {
+                    initial: author_initial(&p.username),
+                    tint: author_tint(Some(p.user_id)),
+                },
+                None => DmAvatar::Person {
+                    initial: "?".into(),
+                    tint: 0,
+                },
+            }
+        };
+
+        DmRow {
+            id: conv.id,
+            name: dm_display_name(conv, me),
+            avatar,
+            preview: dm_preview(conv),
+            timestamp: conv
+                .last_message
+                .as_ref()
+                .map(|m| relative_time(m.created_at, now).into())
+                .unwrap_or_default(),
+            unread: conv.unread,
+        }
+    }
+}
+
+/// The display name of a DM: an explicit name when set, else the other
+/// participants' usernames joined (a group), else the single other person (a
+/// 1:1). Falls back to a neutral label when no other participant is known.
+fn dm_display_name(conv: &DmConversation, me: Option<Uuid>) -> SharedString {
+    if let Some(name) = conv.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        return name.to_string().into();
+    }
+    let others: Vec<&str> = conv
+        .participants
+        .iter()
+        .filter(|p| Some(p.user_id) != me)
+        .map(|p| p.username.as_str())
+        .collect();
+    if others.is_empty() {
+        // Either a self-only record, or a participant list that didn't resolve.
+        return if conv.is_group { "Group DM" } else { "Direct Message" }.into();
+    }
+    if conv.is_group {
+        others.join(", ").into()
+    } else {
+        others[0].to_string().into()
+    }
+}
+
+/// A one-line preview of a conversation's last message: the message text with
+/// newlines flattened, prefixed with the sender for a group DM so it's clear who
+/// spoke. An empty conversation reads as "No messages yet".
+fn dm_preview(conv: &DmConversation) -> SharedString {
+    let Some(last) = conv.last_message.as_ref() else {
+        return "No messages yet".into();
+    };
+    let text = last.content.replace('\n', " ");
+    match (conv.is_group, last.author.as_ref()) {
+        (true, Some(author)) => format!("{}: {}", author.username, text).into(),
+        _ => text.into(),
+    }
+}
+
+/// A compact, relative timestamp for a DM's last activity: "now" under a minute,
+/// then "5m" / "3h" / "2d" up to a week, then an absolute "Mon D" date.
+fn relative_time(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let secs = (now - then).num_seconds().max(0);
+    if secs < 60 {
+        "now".to_string()
+    } else if secs < 3_600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3_600)
+    } else if secs < 7 * 86_400 {
+        format!("{}d", secs / 86_400)
+    } else {
+        then.with_timezone(&Local).format("%b %-d").to_string()
+    }
+}
+
+/// A DM row avatar: a tinted initial circle for a 1:1, or a muted group glyph.
+fn dm_avatar(avatar: &DmAvatar) -> impl IntoElement {
+    let base = div()
+        .size(px(DM_AVATAR_SIZE))
+        .flex_shrink_0()
+        .rounded_full()
+        .flex()
+        .items_center()
+        .justify_center();
+    match avatar {
+        DmAvatar::Person { initial, tint } => base
+            .bg(avatar_color(*tint))
+            .text_color(color::interactive_active())
+            .text_size(px(font::SM))
+            .font_weight(FontWeight::SEMIBOLD)
+            .child(initial.clone()),
+        DmAvatar::Group => base
+            .bg(color::elevated())
+            .text_color(color::text_muted())
+            .child(Icon::empty().path("icons/users.svg").with_size(px(18.0))),
+    }
+}
+
 /// Whether `me` may edit a message authored by `author_id`: only its own author,
 /// and only when both identities are known (no editing a deleted account's
 /// messages, nor while signed out).
@@ -2565,12 +3061,15 @@ mod tests {
     // re-globs `gpui::*` into this module, which blows the recursion limit when
     // the `#[test]` harness expands.
     use super::{
-        build_message_rows, can_delete_message, can_edit_message, diff_splice, group_members,
-        role_rank, MessageRow,
+        build_message_rows, can_delete_message, can_edit_message, diff_splice, dm_display_name,
+        dm_preview, group_members, relative_time, role_rank, MessageRow,
     };
 
     use chrono::{DateTime, Local, TimeZone, Utc};
-    use concord_shared::types::{MemberInfo, MessageAuthor, MessageWithAuthor, UserStatus};
+    use concord_shared::types::{
+        DmConversation, DmLastMessage, DmParticipant, MemberInfo, MessageAuthor, MessageWithAuthor,
+        UserStatus,
+    };
     use uuid::Uuid;
 
     use crate::state::PresenceState;
@@ -2662,6 +3161,117 @@ mod tests {
             None,
         );
         assert!(is_header(&rows[2], true));
+    }
+
+    fn dm_participant(n: u8, username: &str) -> DmParticipant {
+        let mut bytes = [0u8; 16];
+        bytes[15] = n;
+        DmParticipant {
+            user_id: Uuid::from_bytes(bytes),
+            username: username.into(),
+            avatar_url: None,
+        }
+    }
+
+    fn dm_conv(
+        is_group: bool,
+        name: Option<&str>,
+        participants: Vec<DmParticipant>,
+        last: Option<DmLastMessage>,
+    ) -> DmConversation {
+        DmConversation {
+            id: Uuid::nil(),
+            name: name.map(str::to_string),
+            is_group,
+            owner_id: None,
+            created_at: Utc::now(),
+            member_count: participants.len() as i64,
+            participants,
+            last_message: last,
+            unread: false,
+        }
+    }
+
+    fn me_id() -> Uuid {
+        dm_participant(1, "").user_id
+    }
+
+    #[test]
+    fn dm_name_prefers_explicit_group_name() {
+        let conv = dm_conv(
+            true,
+            Some("Lunch Crew"),
+            vec![dm_participant(1, "me"), dm_participant(2, "bob")],
+            None,
+        );
+        assert_eq!(dm_display_name(&conv, Some(me_id())).as_ref(), "Lunch Crew");
+    }
+
+    #[test]
+    fn dm_name_one_on_one_is_the_other_person() {
+        let conv = dm_conv(
+            false,
+            None,
+            vec![dm_participant(1, "me"), dm_participant(2, "bob")],
+            None,
+        );
+        assert_eq!(dm_display_name(&conv, Some(me_id())).as_ref(), "bob");
+    }
+
+    #[test]
+    fn dm_name_group_joins_other_participants() {
+        let conv = dm_conv(
+            true,
+            None,
+            vec![
+                dm_participant(1, "me"),
+                dm_participant(2, "bob"),
+                dm_participant(3, "cara"),
+            ],
+            None,
+        );
+        assert_eq!(dm_display_name(&conv, Some(me_id())).as_ref(), "bob, cara");
+    }
+
+    #[test]
+    fn dm_name_falls_back_when_only_self() {
+        let conv = dm_conv(false, None, vec![dm_participant(1, "me")], None);
+        assert_eq!(
+            dm_display_name(&conv, Some(me_id())).as_ref(),
+            "Direct Message"
+        );
+    }
+
+    #[test]
+    fn dm_preview_empty_and_group_prefix() {
+        let empty = dm_conv(false, None, vec![dm_participant(2, "bob")], None);
+        assert_eq!(dm_preview(&empty).as_ref(), "No messages yet");
+
+        let last = DmLastMessage {
+            id: Uuid::nil(),
+            author: Some(MessageAuthor {
+                id: Uuid::nil(),
+                username: "bob".into(),
+                avatar_url: None,
+            }),
+            content: "hey\nthere".into(),
+            created_at: Utc::now(),
+        };
+        let group = dm_conv(true, Some("Crew"), vec![dm_participant(2, "bob")], Some(last));
+        // Group previews name the speaker; newlines flatten to one line.
+        assert_eq!(dm_preview(&group).as_ref(), "bob: hey there");
+    }
+
+    #[test]
+    fn relative_time_buckets() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 30, 12, 0, 0).unwrap();
+        assert_eq!(relative_time(now, now), "now");
+        assert_eq!(relative_time(now - chrono::Duration::minutes(5), now), "5m");
+        assert_eq!(relative_time(now - chrono::Duration::hours(3), now), "3h");
+        assert_eq!(relative_time(now - chrono::Duration::days(2), now), "2d");
+        // Older than a week falls back to an absolute date.
+        let old = relative_time(now - chrono::Duration::days(10), now);
+        assert!(old.contains("May"), "expected a month label, got {old}");
     }
 
     fn row_msg(id: u8, content: &str) -> MessageRow {

@@ -15,7 +15,9 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use concord_shared::types::{Channel, ChannelCategory, MemberInfo, MessageWithAuthor, Server};
+use concord_shared::types::{
+    Channel, ChannelCategory, DmConversation, MemberInfo, MessageWithAuthor, Server,
+};
 
 use crate::auth::{api_base_url, http_client};
 
@@ -177,6 +179,31 @@ pub async fn list_messages(
     resp.json()
         .await
         .map_err(|e| ApiError::Unexpected(e.to_string()))
+}
+
+/// `GET /api/dms` — the caller's DM conversations, newest activity first. Each
+/// row carries its participants, a last-message preview, and the unread flag.
+pub async fn list_dms(base_url: &str, token: &str) -> Result<Vec<DmConversation>, ApiError> {
+    get_json(base_url, token, "api/dms").await
+}
+
+/// `POST /api/dms/{id}/read` — mark a DM read for the caller as of now, clearing
+/// its unread flag on the server until another member posts again.
+pub async fn mark_dm_read(base_url: &str, token: &str, dm_channel_id: Uuid) -> Result<(), ApiError> {
+    let url = format!(
+        "{}/api/dms/{dm_channel_id}/read",
+        base_url.trim_end_matches('/')
+    );
+    let resp = http_client()
+        .post(url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| ApiError::Network(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(server_error(resp).await);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
