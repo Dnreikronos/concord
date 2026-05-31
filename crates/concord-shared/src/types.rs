@@ -199,6 +199,18 @@ pub struct DmMember {
     pub joined_at: DateTime<Utc>,
 }
 
+/// A public user summary returned by the user-search endpoint
+/// (`GET /api/users/search`): just enough to render a pickable row and open a
+/// DM. Shares its shape with [`DmParticipant`] but is keyed by `id` to match the
+/// other user-facing profiles ([`MessageAuthor`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserSummary {
+    pub id: Uuid,
+    pub username: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
+}
+
 /// Public profile of a DM participant, embedded in a `DmChannelInfo`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DmParticipant {
