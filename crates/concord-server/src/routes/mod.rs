@@ -4,6 +4,7 @@ pub mod channels;
 pub mod dms;
 pub mod oauth;
 pub mod servers;
+pub mod users;
 pub mod ws;
 
 use std::sync::Arc;
@@ -22,6 +23,7 @@ pub fn all_routes() -> Router<Arc<AppState>> {
         .nest("/api/channels", channels::router())
         .nest("/api/categories", categories::router())
         .nest("/api/dms", dms::router())
+        .nest("/api/users", users::router())
         .route("/ws", get(ws::ws_handler))
         .layer(DefaultBodyLimit::max(1024 * 1024))
 }
