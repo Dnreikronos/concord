@@ -63,6 +63,20 @@ impl DmsState {
         self.sort();
     }
 
+    /// Insert a conversation, or replace the existing one with the same id,
+    /// then re-sort. Marks the list loaded. Used when the user creates a group
+    /// DM so it appears at once without a refetch; live `NewDirectMessage`s and
+    /// the next list fetch keep it current afterwards.
+    pub fn upsert_conversation(&mut self, conversation: DmConversation) {
+        if let Some(slot) = self.conversations.iter_mut().find(|c| c.id == conversation.id) {
+            *slot = conversation;
+        } else {
+            self.conversations.push(conversation);
+        }
+        self.loaded = true;
+        self.sort();
+    }
+
     /// The DM channel currently open, if any.
     pub fn active(&self) -> Option<Uuid> {
         self.active
@@ -237,5 +251,22 @@ mod tests {
         // No panic, no change for a channel we don't hold.
         s.apply_new_message(Uuid::new_v4(), Uuid::new_v4(), None, "x".into(), at, false);
         assert_eq!(s.conversations().len(), 1);
+    }
+
+    #[test]
+    fn upsert_conversation_inserts_then_replaces_in_place() {
+        let mut s = DmsState::new();
+        let mut c = conv(Some(10), false);
+        let id = c.id;
+
+        s.upsert_conversation(c.clone());
+        assert!(s.is_loaded());
+        assert_eq!(s.conversations().len(), 1);
+
+        // The same id replaces in place rather than appending a duplicate.
+        c.name = Some("renamed".into());
+        s.upsert_conversation(c);
+        assert_eq!(s.conversations().len(), 1);
+        assert_eq!(s.conversation(id).unwrap().name.as_deref(), Some("renamed"));
     }
 }
