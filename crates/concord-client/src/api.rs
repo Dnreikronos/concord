@@ -16,7 +16,8 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use concord_shared::types::{
-    Channel, ChannelCategory, DmConversation, MemberInfo, MessageWithAuthor, Server,
+    Channel, ChannelCategory, DmChannelInfo, DmConversation, MemberInfo, MessageWithAuthor, Server,
+    UserSummary,
 };
 
 use crate::auth::{api_base_url, http_client};
@@ -204,6 +205,59 @@ pub async fn mark_dm_read(base_url: &str, token: &str, dm_channel_id: Uuid) -> R
         return Err(server_error(resp).await);
     }
     Ok(())
+}
+
+/// `GET /api/users/search?q=&limit=` — find users by username for the group-DM
+/// participant picker. The server matches `query` as a case-insensitive
+/// substring and never returns the caller themselves.
+pub async fn search_users(
+    base_url: &str,
+    token: &str,
+    query: &str,
+    limit: i64,
+) -> Result<Vec<UserSummary>, ApiError> {
+    let url = format!("{}/api/users/search", base_url.trim_end_matches('/'));
+    let limit = limit.to_string();
+    let resp = http_client()
+        .get(url)
+        .query(&[("q", query), ("limit", limit.as_str())])
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| ApiError::Network(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(server_error(resp).await);
+    }
+    resp.json()
+        .await
+        .map_err(|e| ApiError::Unexpected(e.to_string()))
+}
+
+/// `POST /api/dms/group` — create a group DM owned by the caller, with the given
+/// recipients and an optional name. The caller is always a participant, so
+/// `recipient_ids` lists only the others; the server bounds the total at 2–10.
+/// Returns the new channel with its participants resolved.
+pub async fn create_group_dm(
+    base_url: &str,
+    token: &str,
+    recipient_ids: &[Uuid],
+    name: Option<&str>,
+) -> Result<DmChannelInfo, ApiError> {
+    let url = format!("{}/api/dms/group", base_url.trim_end_matches('/'));
+    let body = serde_json::json!({ "recipient_ids": recipient_ids, "name": name });
+    let resp = http_client()
+        .post(url)
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| ApiError::Network(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(server_error(resp).await);
+    }
+    resp.json()
+        .await
+        .map_err(|e| ApiError::Unexpected(e.to_string()))
 }
 
 #[cfg(test)]

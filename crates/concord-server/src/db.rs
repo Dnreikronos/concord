@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use concord_shared::types::{
     Channel, DmChannel, DmParticipant, MemberInfo, MessageAuthor, MessageWithAuthor, Server,
-    ServerInvite, User,
+    ServerInvite, User, UserSummary,
 };
 
 use crate::error::AppError;
@@ -1124,6 +1124,67 @@ pub async fn user_exists(pool: &PgPool, user_id: Uuid) -> Result<bool, AppError>
     .await?;
 
     Ok(result)
+}
+
+#[derive(sqlx::FromRow)]
+struct UserSummaryRow {
+    id: Uuid,
+    username: String,
+    avatar_url: Option<String>,
+}
+
+impl From<UserSummaryRow> for UserSummary {
+    fn from(row: UserSummaryRow) -> Self {
+        UserSummary {
+            id: row.id,
+            username: row.username,
+            avatar_url: row.avatar_url,
+        }
+    }
+}
+
+/// Find users whose username contains `query` (case-insensitive), excluding
+/// `exclude` (the caller, so a search never offers a DM with yourself), capped
+/// at `limit` and ordered username-first for a stable, alphabetical list.
+///
+/// `query` is matched as a substring with its LIKE metacharacters escaped, so a
+/// caller typing `%` or `_` searches for those literal characters rather than
+/// turning the pattern into a wildcard.
+pub async fn search_users_by_username(
+    pool: &PgPool,
+    query: &str,
+    exclude: Uuid,
+    limit: i64,
+) -> Result<Vec<UserSummary>, AppError> {
+    let pattern = format!("%{}%", escape_like(query));
+    let rows = sqlx::query_as::<_, UserSummaryRow>(
+        "SELECT id, username, avatar_url \
+         FROM users \
+         WHERE id <> $1 AND username ILIKE $2 ESCAPE '\\' \
+         ORDER BY username, id \
+         LIMIT $3",
+    )
+    .bind(exclude)
+    .bind(pattern)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(UserSummary::from).collect())
+}
+
+/// Escape the `LIKE`/`ILIKE` metacharacters (`\`, `%`, `_`) in a user-supplied
+/// search term so it is matched literally. The query uses `ESCAPE '\'`, so the
+/// backslash must be escaped first to avoid double-unescaping.
+fn escape_like(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Return the 1:1 DM channel between `user_a` and `user_b`, creating it (with
