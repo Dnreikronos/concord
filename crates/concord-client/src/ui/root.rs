@@ -28,8 +28,8 @@ use uuid::Uuid;
 
 use concord_shared::protocol::{ClientMsg, ServerMsg, Token};
 use concord_shared::types::{
-    Channel, ChannelCategory, ChannelType, DmConversation, MemberInfo, MessageAuthor,
-    MessageWithAuthor, Server, UserStatus,
+    Channel, ChannelCategory, ChannelType, DmChannelInfo, DmConversation, MemberInfo,
+    MessageAuthor, MessageWithAuthor, Server, UserStatus,
 };
 use concord_shared::validation::validate_message_content;
 
@@ -39,6 +39,7 @@ use crate::state::{
     AuthState, ChatState, ConnectionState, ConnectionStatus, DmsState, PresenceState, ServersState,
 };
 use crate::ui::auth_view::{AuthEvent, AuthView};
+use crate::ui::group_dm_dialog::{GroupDmDialog, GroupDmEvent};
 use crate::ui::nav::{NavState, View};
 use crate::ui::theme::{color, font, space};
 use crate::ws::{ConnectionHandle, WsEvent};
@@ -141,6 +142,13 @@ pub struct ConcordApp {
     presence: Entity<PresenceState>,
     dms: Entity<DmsState>,
 
+    /// The open "New Group DM" dialog, overlaid on the main layout, or `None`
+    /// when it is closed.
+    group_dm_dialog: Option<Entity<GroupDmDialog>>,
+    /// Subscription to the open dialog's events; dropped (cancelling it) when
+    /// the dialog closes.
+    _dialog_subscription: Option<Subscription>,
+
     /// The live connection handle: outgoing messages are sent through it, and
     /// holding it keeps the background task's command channel open (the task
     /// exits once every handle drops).
@@ -232,6 +240,8 @@ impl ConcordApp {
             connection,
             presence,
             dms,
+            group_dm_dialog: None,
+            _dialog_subscription: None,
             ws_handle: None,
             _subscriptions: subscriptions,
         }
@@ -776,6 +786,56 @@ impl ConcordApp {
         });
         self.mark_dm_read_remote(dm_channel_id, cx);
         self.open_channel(dm_channel_id, cx);
+    }
+
+    /// Open the "New Group DM" dialog over the main layout, subscribing to its
+    /// events. A dialog already open is left in place. Needs a signed-in session
+    /// (its requests carry the token); without one it is a no-op.
+    fn open_group_dm_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.group_dm_dialog.is_some() {
+            return;
+        }
+        let Some(token) = self.auth_state.read(cx).access_token().map(str::to_owned) else {
+            return;
+        };
+        let dialog = cx.new(|cx| GroupDmDialog::new(token, window, cx));
+        self._dialog_subscription = Some(cx.subscribe(&dialog, Self::on_group_dm_event));
+        self.group_dm_dialog = Some(dialog);
+        cx.notify();
+    }
+
+    /// Tear down the open dialog (and its subscription).
+    fn close_group_dm_dialog(&mut self, cx: &mut Context<Self>) {
+        self.group_dm_dialog = None;
+        self._dialog_subscription = None;
+        cx.notify();
+    }
+
+    /// React to the group-DM dialog: on creation, fold the new channel into the
+    /// DM list, close the dialog, and open the conversation; on dismissal, just
+    /// close it.
+    fn on_group_dm_event(
+        &mut self,
+        _dialog: Entity<GroupDmDialog>,
+        event: &GroupDmEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            GroupDmEvent::Created(info) => {
+                let conversation = conversation_from_info(info.clone());
+                let id = conversation.id;
+                self.dms.update(cx, |d, cx| {
+                    d.upsert_conversation(conversation);
+                    cx.notify();
+                });
+                // The dialog opens from the DM view, but make the switch explicit
+                // so the new conversation lands on screen wherever it fired from.
+                self.nav.activate(View::DirectMessages);
+                self.close_group_dm_dialog(cx);
+                self.open_dm_conversation(id, cx);
+            }
+            GroupDmEvent::Dismissed => self.close_group_dm_dialog(cx),
+        }
     }
 
     /// Tell the server a DM has been read. Fire-and-forget on the shared runtime:
@@ -1461,14 +1521,42 @@ impl ConcordApp {
                     .w_full()
                     .px(px(space::MD))
                     .items_center()
+                    .justify_between()
                     .border_b_1()
                     .border_color(color::border())
-                    .text_color(color::text())
-                    .text_size(px(font::LG))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(header),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_color(color::text())
+                            .text_size(px(font::LG))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(header),
+                    )
+                    // A "new group DM" affordance rides the DM view's header.
+                    .children((view == View::DirectMessages).then(|| self.new_group_dm_button(cx))),
             )
             .child(body)
+    }
+
+    /// The "New Group DM" button in the DM sidebar header: a "+" that opens the
+    /// group-creation dialog.
+    fn new_group_dm_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("new-group-dm")
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(28.0))
+            .flex_shrink_0()
+            .rounded(px(space::XS))
+            .text_color(color::text_muted())
+            .cursor_pointer()
+            .hover(|s| s.bg(color::hover()).text_color(color::text()))
+            .child(Icon::new(IconName::Plus).with_size(px(18.0)))
+            .tooltip(|window, cx| Tooltip::new("New Group DM").build(window, cx))
+            .on_click(cx.listener(|this, _, window, cx| this.open_group_dm_dialog(window, cx)))
     }
 
     /// The active server's channels, grouped under collapsible category headers.
@@ -2270,8 +2358,34 @@ impl Render for ConcordApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         match self.screen {
             Screen::Auth => self.auth.clone().into_any_element(),
-            Screen::Main => self.main_layout(cx).into_any_element(),
+            Screen::Main => {
+                // The group-DM dialog, when open, overlays the layout as an
+                // absolutely-positioned, full-window modal that dims the app.
+                div()
+                    .relative()
+                    .size_full()
+                    .child(self.main_layout(cx))
+                    .children(self.group_dm_dialog.clone())
+                    .into_any_element()
+            }
         }
+    }
+}
+
+/// Project a freshly created DM channel into a conversation-list row: it has no
+/// messages yet and is read by its creator. `member_count` counts every
+/// participant, the caller included, matching the DM-list endpoint's shape.
+fn conversation_from_info(info: DmChannelInfo) -> DmConversation {
+    DmConversation {
+        id: info.id,
+        name: info.name,
+        is_group: info.is_group,
+        owner_id: info.owner_id,
+        created_at: info.created_at,
+        member_count: info.participants.len() as i64,
+        participants: info.participants,
+        last_message: None,
+        unread: false,
     }
 }
 
