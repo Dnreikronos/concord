@@ -102,12 +102,20 @@ async fn send(ws: &mut ClientWs, msg: &ClientMsg) {
 /// because these tests run in parallel against a real DB: cold-start
 /// congestion (opening pools, running migrations, several tests firing at
 /// once) can briefly delay a round-trip past a tighter bound.
+///
+/// Presence frames (the connect-time `PresenceSnapshot` and any
+/// `UserStatusChanged`) are emitted independently of channel traffic, so
+/// they're skipped here — these tests assert on the messages they actually sent.
 async fn recv(ws: &mut ClientWs) -> ServerMsg {
     let fut = async {
         loop {
             match ws.next().await {
                 Some(Ok(Message::Text(t))) => {
-                    return serde_json::from_str::<ServerMsg>(&t).unwrap()
+                    match serde_json::from_str::<ServerMsg>(&t).unwrap() {
+                        ServerMsg::PresenceSnapshot { .. }
+                        | ServerMsg::UserStatusChanged { .. } => continue,
+                        other => return other,
+                    }
                 }
                 Some(Ok(_)) => continue,
                 other => panic!("expected text frame, got {other:?}"),
