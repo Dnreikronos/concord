@@ -112,12 +112,20 @@ async fn send(ws: &mut ClientWs, msg: &ClientMsg) {
 }
 
 /// Read frames until a `ServerMsg` text frame arrives, bounded by a timeout.
+///
+/// Presence frames (the connect-time `PresenceSnapshot` and any
+/// `UserStatusChanged`) are emitted independently of typing traffic, so they're
+/// skipped here — these tests assert on the typing indicators they actually sent.
 async fn recv(ws: &mut ClientWs) -> ServerMsg {
     let fut = async {
         loop {
             match ws.next().await {
                 Some(Ok(Message::Text(t))) => {
-                    return serde_json::from_str::<ServerMsg>(&t).unwrap()
+                    match serde_json::from_str::<ServerMsg>(&t).unwrap() {
+                        ServerMsg::PresenceSnapshot { .. }
+                        | ServerMsg::UserStatusChanged { .. } => continue,
+                        other => return other,
+                    }
                 }
                 Some(Ok(_)) => continue,
                 other => panic!("expected text frame, got {other:?}"),
@@ -130,13 +138,19 @@ async fn recv(ws: &mut ClientWs) -> ServerMsg {
 }
 
 /// Like [`recv`] but returns `None` if no message arrives within `dur` — used
-/// to assert the *absence* of a frame (e.g. the sender's own echo).
+/// to assert the *absence* of a frame (e.g. the sender's own echo). Presence
+/// frames are skipped for the same reason as in [`recv`], so a stray snapshot or
+/// status change can't masquerade as the frame whose absence we're checking.
 async fn recv_within(ws: &mut ClientWs, dur: Duration) -> Option<ServerMsg> {
     let fut = async {
         loop {
             match ws.next().await {
                 Some(Ok(Message::Text(t))) => {
-                    return serde_json::from_str::<ServerMsg>(&t).unwrap()
+                    match serde_json::from_str::<ServerMsg>(&t).unwrap() {
+                        ServerMsg::PresenceSnapshot { .. }
+                        | ServerMsg::UserStatusChanged { .. } => continue,
+                        other => return other,
+                    }
                 }
                 Some(Ok(_)) => continue,
                 other => panic!("expected text frame, got {other:?}"),
