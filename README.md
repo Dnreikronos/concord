@@ -2,7 +2,8 @@
 
 A Discord-like chat application built entirely in Rust. Real-time messaging
 over WebSocket, REST API for resource management, JWT + OAuth authentication,
-backed by Postgres and Redis. Desktop client planned with [GPUI](https://gpui.rs/).
+backed by Postgres and Redis, with a native desktop client built on
+[GPUI](https://gpui.rs/).
 
 ```mermaid
 graph TB
@@ -47,6 +48,9 @@ graph TB
   channel names, message content, icon URLs, and invite codes
 - **Typed protocol** -- `concord-shared` crate defines all wire types so
   client and server stay in sync
+- **Desktop client** -- native GPUI app: password / OAuth login, server and
+  channel navigation, direct and group messages, a live composer with typing
+  indicators, and native desktop notifications for background messages
 
 ## Workspace layout
 
@@ -55,7 +59,7 @@ concord/
 ├── crates/
 │   ├── concord-server   # Axum backend: HTTP routes, WebSocket, DB queries
 │   ├── concord-shared   # Protocol types, domain types, validation
-│   └── concord-client   # GPUI desktop client (planned)
+│   └── concord-client   # GPUI desktop client: login, chat, notifications
 ├── migrations/          # Postgres schema (sqlx-cli)
 ├── docs/                # Architecture docs, ER diagram
 └── docker-compose.yml   # Postgres 16 + Redis 7
@@ -72,6 +76,7 @@ concord/
 | `POST`   | `/api/auth/refresh`                          | Rotate refresh token    |
 | `GET`    | `/api/auth/oauth/github`                     | GitHub OAuth redirect   |
 | `GET`    | `/api/auth/oauth/google`                     | Google OAuth redirect   |
+| `GET`    | `/api/users/search?q=`                       | Search users by name    |
 | `POST`   | `/api/servers`                               | Create server           |
 | `GET`    | `/api/servers`                               | List joined servers     |
 | `GET`    | `/api/servers/:id`                           | Get server details      |
@@ -92,6 +97,7 @@ concord/
 | `POST`   | `/api/dms/group`                             | Create group DM         |
 | `POST`   | `/api/dms/:id/members`                       | Add member to group DM  |
 | `DELETE` | `/api/dms/:id/members/:user_id`              | Remove member / leave   |
+| `GET`    | `/health`                                    | Liveness probe          |
 
 ### WebSocket (`/ws`)
 
@@ -112,6 +118,9 @@ Clients connect, authenticate with a JWT, then exchange JSON-tagged messages:
 - Rust toolchain (stable)
 - Docker & Docker Compose
 - [`sqlx-cli`](https://crates.io/crates/sqlx-cli)
+- For the desktop client: a C/C++ toolchain and, on Linux, X11 + Wayland and
+  font (`fontconfig` / `freetype`) development packages — GPUI compiles its
+  native windowing and text stack from source
 
 ### 1. Clone and configure
 
@@ -171,11 +180,86 @@ cargo run -p concord-server
 
 The server listens on `0.0.0.0:8080` by default -- REST API and WebSocket on the same port.
 
+A multi-stage `Dockerfile` builds the server into a minimal Alpine image as an
+alternative to `cargo run`:
+
+```sh
+docker build -t concord-server .
+```
+
+The image expects the same `DATABASE_URL` and `JWT_SECRET` in its environment,
+exposes port `8080`, and ships a built-in `/health` check.
+
+### 5. Run the desktop client
+
+The GPUI client lives behind the `gui` cargo feature, so the default build (the
+WebSocket library and its tests) stays light. With the server running:
+
+```sh
+cargo run -p concord-client --bin concord-ui --features gui
+```
+
+> The first build clones and compiles the GPUI stack from git and can take
+> several minutes; later builds are incremental.
+
+By default the client talks to `http://127.0.0.1:8080`, matching the server's
+default bind. Point it elsewhere with `CONCORD_API_URL` (and optionally
+`CONCORD_WS_URL`, which is otherwise derived from the API URL):
+
+```sh
+CONCORD_API_URL=https://chat.example.com \
+  cargo run -p concord-client --bin concord-ui --features gui
+```
+
 ### Reset database (development)
 
 ```sh
 sqlx database drop -y && sqlx database create && sqlx migrate run
 ```
+
+## Configuration
+
+All configuration is via environment variables. The server reads them straight
+from its process environment (it does **not** auto-load `.env`), so export them
+-- or use a tool like `direnv` -- before launching.
+
+### Server
+
+| Variable                     | Required | Default   | Description                                                  |
+| ---------------------------- | -------- | --------- | ------------------------------------------------------------ |
+| `DATABASE_URL`               | yes      | --        | Postgres connection string                                   |
+| `JWT_SECRET`                 | yes      | --        | Signs access & refresh tokens; must be at least 32 bytes     |
+| `HOST`                       | no       | `0.0.0.0` | Bind address                                                 |
+| `PORT`                       | no       | `8080`    | Bind port (REST and WebSocket share it)                      |
+| `MAX_CONNECTIONS`            | no       | `10`      | Postgres connection-pool size                                |
+| `REDIS_URL`                  | no       | --        | Presence store + cross-instance typing; unset disables both  |
+| `PRESENCE_TTL_SECONDS`       | no       | `60`      | Presence lifetime without a heartbeat (minimum `2`)          |
+| `GITHUB_OAUTH_CLIENT_ID`     | no       | --        | Enables GitHub login when set (secret + redirect then required) |
+| `GITHUB_OAUTH_CLIENT_SECRET` | no       | --        | GitHub OAuth app secret                                      |
+| `GITHUB_OAUTH_REDIRECT_URL`  | no       | --        | GitHub OAuth callback URL                                    |
+| `GOOGLE_OAUTH_CLIENT_ID`     | no       | --        | Enables Google login when set (secret + redirect then required) |
+| `GOOGLE_OAUTH_CLIENT_SECRET` | no       | --        | Google OAuth client secret                                   |
+| `GOOGLE_OAUTH_REDIRECT_URL`  | no       | --        | Google OAuth callback URL                                    |
+
+### Desktop client
+
+| Variable          | Default                 | Description                                                              |
+| ----------------- | ----------------------- | ----------------------------------------------------------------------- |
+| `CONCORD_API_URL` | `http://127.0.0.1:8080` | Base URL of the REST API                                                |
+| `CONCORD_WS_URL`  | derived from API URL    | WebSocket URL; defaults to the API URL with the scheme swapped to `ws(s)` and `/ws` appended |
+
+### Docker Compose
+
+`docker-compose.yml` reads these (from `.env`) to provision Postgres and Redis:
+
+| Variable            | Default   | Description                   |
+| ------------------- | --------- | ---------------------------- |
+| `POSTGRES_DB`       | `concord` | Database name                |
+| `POSTGRES_USER`     | `concord` | Database user                |
+| `POSTGRES_PASSWORD` | --        | Database password (required) |
+| `POSTGRES_PORT`     | `5432`    | Host port mapped to Postgres |
+| `REDIS_PASSWORD`    | --        | Redis password (required)    |
+| `REDIS_PORT`        | `6379`    | Host port mapped to Redis    |
 
 ## Tech stack
 
@@ -189,12 +273,35 @@ sqlx database drop -y && sqlx database create && sqlx migrate run
 | Auth           | Argon2, JWT (jsonwebtoken), OAuth2      |
 | Serialization  | serde + serde_json                      |
 | Concurrency    | DashMap, tokio::sync                    |
-| Desktop client | GPUI (planned)                          |
+| Desktop client | GPUI                                    |
+| Notifications  | notify-rust · mac-notification-sys · WinRT |
 
 ## Documentation
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full architecture
 description, database schema, ER diagram, and cascade-delete policy.
+
+## Contributing
+
+Contributions are welcome. A few conventions this repo follows:
+
+- **One issue per branch.** Work is split into small feature branches; a PR
+  targets the branch it was based on rather than `main` directly, so related
+  work stays stacked and reviewable.
+- **clippy is the gate, not rustfmt.** Run `cargo clippy --all-targets` and keep
+  it clean. The tree is not `cargo fmt`-formatted -- match the style of the
+  surrounding code by hand rather than reformatting whole files.
+- **Keep the default build fast.** The desktop client's GPUI dependencies are
+  optional and gated behind the `gui` feature, so plain `cargo build` /
+  `cargo test` stay light. Run the GUI checks explicitly with `--features gui`
+  when you touch client UI code.
+- **Run the tests.** `cargo test` covers the libraries and unit tests; the
+  server's integration tests need a Postgres instance (`DATABASE_URL` pointed at
+  a throwaway database -- `docker compose up -d postgres` is enough).
+- **Shared types live in `concord-shared`.** Wire and domain types belong there
+  so the client and server can't drift out of sync.
+- **Commit messages** are short imperative subjects (`Add ...`, `Fix ...`) with
+  no conventional-commit prefixes.
 
 ## License
 
