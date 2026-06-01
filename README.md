@@ -58,7 +58,7 @@ concord/
 │   └── concord-client   # GPUI desktop client (planned)
 ├── migrations/          # Postgres schema (sqlx-cli)
 ├── docs/                # Architecture docs, ER diagram
-└── docker-compose.yml   # Postgres 16 + Redis 7
+└── docker-compose.yml   # Postgres 16 + Redis 7 + the server
 ```
 
 ## API surface
@@ -138,15 +138,26 @@ For OAuth login (optional):
 | `GOOGLE_OAUTH_CLIENT_ID`      | Google OAuth client ID       |
 | `GOOGLE_OAUTH_CLIENT_SECRET`  | Google OAuth client secret   |
 
-### 2. Start infrastructure
+### 2. Start the stack
 
 ```sh
-docker compose up -d
+docker compose up -d --build
 ```
 
-This starts PostgreSQL 16 and Redis 7 on loopback (`127.0.0.1`), ports from `.env`.
+This builds the `concord-server` image and starts PostgreSQL 16, Redis 7, and the
+server on loopback (`127.0.0.1`), ports from `.env`. The server waits for Postgres
+and Redis to report healthy, applies any pending database migrations on startup,
+then serves the REST API and WebSocket on port 8080.
 
-### 3. Set up the database
+Tail the logs with `docker compose logs -f server`; stop everything with
+`docker compose down` (add `-v` to also drop the data volumes).
+
+### Running the server from source (optional)
+
+For server development you can run the binary directly against the compose
+Postgres and Redis instead of rebuilding the image. Migrations still run
+automatically when the server starts; `sqlx-cli` is only needed for managing the
+database by hand (creating or resetting it).
 
 ```sh
 cargo install sqlx-cli --no-default-features --features rustls,postgres
@@ -158,14 +169,10 @@ cargo install sqlx-cli --no-default-features --features rustls,postgres
 
 ```sh
 export DATABASE_URL="postgres://concord:<POSTGRES_PASSWORD>@localhost:5432/concord"
+export JWT_SECRET="<at least 32 bytes>"
 
-sqlx database create        # first time only
-sqlx migrate run            # apply all pending migrations
-```
-
-### 4. Run the server
-
-```sh
+# Start only the dependencies, then run the server from source.
+docker compose up -d postgres redis
 cargo run -p concord-server
 ```
 
