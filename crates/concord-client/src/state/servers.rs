@@ -104,6 +104,17 @@ impl ServersState {
         }
     }
 
+    /// Find a loaded channel by id across every server. Used to resolve a live
+    /// message's channel — and the server it belongs to — when the message is
+    /// for some channel other than the active one. The returned [`Channel`]
+    /// carries its `server_id` and name.
+    pub fn find_channel(&self, channel_id: Uuid) -> Option<&Channel> {
+        self.channels
+            .values()
+            .flatten()
+            .find(|c| c.id == channel_id)
+    }
+
     /// Store the channels for `server_id`, sorted by `(position, name)`.
     pub fn set_channels(&mut self, server_id: Uuid, mut channels: Vec<Channel>) {
         channels.sort_by(|a, b| a.position.cmp(&b.position).then_with(|| a.name.cmp(&b.name)));
@@ -258,6 +269,25 @@ mod tests {
         assert!(s.members_for(Uuid::new_v4()).is_empty());
         assert!(s.active_channels().is_empty());
         assert!(s.active_categories().is_empty());
+    }
+
+    #[test]
+    fn find_channel_searches_every_server() {
+        let mut s = ServersState::new();
+        let (a, b) = (server("alpha"), server("beta"));
+        let (a_id, b_id) = (a.id, b.id);
+        s.set_servers(vec![a, b]);
+        s.set_channels(a_id, vec![channel(a_id, "general", 0)]);
+        let target = channel(b_id, "random", 0);
+        let target_id = target.id;
+        s.set_channels(b_id, vec![target]);
+
+        // A channel in the non-active server still resolves, carrying its
+        // owning server id.
+        let found = s.find_channel(target_id).expect("channel should be found");
+        assert_eq!(found.name, "random");
+        assert_eq!(found.server_id, b_id);
+        assert!(s.find_channel(Uuid::new_v4()).is_none());
     }
 
     #[test]
