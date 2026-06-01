@@ -97,6 +97,8 @@ pub struct ConcordApp {
     /// Whether the right-hand member list panel is shown. Pure view state,
     /// toggled from the chat header; defaults to shown, Discord-style.
     show_members: bool,
+    /// Whether the bottom-left status selector is expanded. Pure view state.
+    status_menu_open: bool,
 
     /// Virtualized list backing the chat pane. Bottom-aligned and tail-following
     /// like a chat log; its item set is kept in lockstep with
@@ -223,6 +225,7 @@ impl ConcordApp {
             nav: NavState::new(),
             collapsed_categories: HashSet::new(),
             show_members: true,
+            status_menu_open: false,
             message_list,
             message_rows: Rc::new(Vec::new()),
             synced_channel: None,
@@ -322,6 +325,13 @@ impl ConcordApp {
                     self.connection.read(cx).status() == ConnectionStatus::Reconnecting;
                 self.connection.update(cx, |c, cx| {
                     c.connected();
+                    cx.notify();
+                });
+                // The server marks us online for the lifetime of the socket
+                // (and again on each reconnect); mirror that locally so the
+                // status selector reflects it without waiting on a round-trip.
+                self.auth_state.update(cx, |auth, cx| {
+                    auth.set_status(UserStatus::Online);
                     cx.notify();
                 });
                 if reconnected {
@@ -1538,6 +1548,177 @@ impl ConcordApp {
                     .children((view == View::DirectMessages).then(|| self.new_group_dm_button(cx))),
             )
             .child(body)
+            .child(self.user_area(cx))
+    }
+
+    // -- User status area -------------------------------------------------
+
+    /// Status options offered by the selector, in display order. `Offline` is
+    /// the wire value behind Discord's "Invisible": the server stores offline,
+    /// so peers see the user as offline.
+    const STATUS_OPTIONS: [UserStatus; 4] = [
+        UserStatus::Online,
+        UserStatus::Idle,
+        UserStatus::Dnd,
+        UserStatus::Offline,
+    ];
+
+    /// Human-readable label for a status. `Offline` reads as "Invisible" since
+    /// that is how the user picks it here.
+    fn status_label(status: UserStatus) -> &'static str {
+        match status {
+            UserStatus::Online => "Online",
+            UserStatus::Idle => "Idle",
+            UserStatus::Dnd => "Do Not Disturb",
+            UserStatus::Offline => "Invisible",
+        }
+    }
+
+    /// Optimistically apply a newly picked own-status and push it to the server,
+    /// then close the selector. The server persists it (Redis) and broadcasts to
+    /// peers; it does not echo back to us, so the local update is what the panel
+    /// reflects.
+    fn set_status(&mut self, status: UserStatus, cx: &mut Context<Self>) {
+        self.status_menu_open = false;
+        self.auth_state.update(cx, |auth, cx| {
+            auth.set_status(status);
+            cx.notify();
+        });
+        if let Some(handle) = self.ws_handle.clone() {
+            api::runtime().spawn(async move {
+                if let Err(err) = handle.send(ClientMsg::UpdateStatus { status }).await {
+                    tracing::warn!(error = %err, "failed to send status update");
+                }
+            });
+        }
+        cx.notify();
+    }
+
+    /// Bottom-left user area: the selector menu (when open) stacked above the
+    /// always-visible user panel. Empty when signed out.
+    fn user_area(&self, cx: &mut Context<Self>) -> AnyElement {
+        // Collect owned data first so the `auth_state` borrow is dropped before
+        // the per-row `cx.listener` calls reborrow `cx`.
+        let Some((user_id, username, status)) = self.auth_state.read(cx).user().map(|u| {
+            (u.id, SharedString::from(u.username.clone()), u.status)
+        }) else {
+            return div().into_any_element(); // signed out — nothing to show
+        };
+
+        let mut area = v_flex().flex_shrink_0();
+        if self.status_menu_open {
+            area = area.child(self.status_menu(status, cx));
+        }
+        area.child(self.user_panel(user_id, username, status, cx))
+            .into_any_element()
+    }
+
+    /// The status selector menu: one row per [`Self::STATUS_OPTIONS`] entry.
+    fn status_menu(&self, current: UserStatus, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut menu = v_flex()
+            .mx(px(space::SM))
+            .mb(px(space::XS))
+            .p(px(space::XS))
+            .gap(px(space::XS))
+            .rounded(px(space::SM))
+            .bg(color::elevated())
+            .border_1()
+            .border_color(color::border())
+            .shadow_lg();
+        for status in Self::STATUS_OPTIONS {
+            menu = menu.child(self.status_option(status, status == current, cx));
+        }
+        menu
+    }
+
+    /// One selectable status row: a presence dot and label; clicking applies it.
+    fn status_option(
+        &self,
+        status: UserStatus,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let mut row = h_flex()
+            .id(SharedString::from(format!("status-{status}")))
+            .w_full()
+            .gap(px(space::SM))
+            .px(px(space::SM))
+            .py(px(space::XS))
+            .rounded(px(space::XS))
+            .text_size(px(font::SM));
+        if selected {
+            row = row.bg(color::active()).text_color(color::text());
+        } else {
+            row = row.text_color(color::text_muted());
+        }
+        row.hover(|s| s.bg(color::hover()).text_color(color::text()))
+            .cursor_pointer()
+            .child(
+                div()
+                    .size(px(MEMBER_STATUS_DOT))
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .bg(status_color(status)),
+            )
+            .child(SharedString::from(Self::status_label(status)))
+            .on_click(cx.listener(move |this, _, _, cx| this.set_status(status, cx)))
+    }
+
+    /// The always-visible user panel: the signed-in user's avatar with a
+    /// presence badge, their name, and current status. Clicking it toggles the
+    /// selector.
+    fn user_panel(
+        &self,
+        user_id: Uuid,
+        username: SharedString,
+        status: UserStatus,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let initial = SharedString::from(
+            username
+                .chars()
+                .next()
+                .map(|c| c.to_uppercase().to_string())
+                .unwrap_or_else(|| "?".to_string()),
+        );
+        let status_label = SharedString::from(Self::status_label(status));
+        h_flex()
+            .id("user-panel")
+            .w_full()
+            .px(px(space::SM))
+            .py(px(space::SM))
+            .gap(px(space::SM))
+            .items_center()
+            .flex_shrink_0()
+            .border_t_1()
+            .border_color(color::border())
+            .hover(|s| s.bg(color::hover()))
+            .cursor_pointer()
+            .child(member_avatar(initial, author_tint(Some(user_id)), status))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_color(color::text())
+                            .text_size(px(font::SM))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(username),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_color(color::text_muted())
+                            .text_size(px(font::SM))
+                            .child(status_label),
+                    ),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.status_menu_open = !this.status_menu_open;
+                cx.notify();
+            }))
     }
 
     /// The "New Group DM" button in the DM sidebar header: a "+" that opens the
