@@ -13,6 +13,8 @@ pub mod group_dm_dialog;
 #[cfg(feature = "gui")]
 pub mod root;
 #[cfg(feature = "gui")]
+pub mod selection;
+#[cfg(feature = "gui")]
 pub mod theme;
 
 #[cfg(feature = "gui")]
