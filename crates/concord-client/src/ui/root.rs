@@ -35,6 +35,7 @@ use concord_shared::validation::validate_message_content;
 
 use crate::api;
 use crate::auth;
+use crate::notifications::{Notifier, NotifyTarget};
 use crate::state::{
     AuthState, ChatState, ConnectionState, ConnectionStatus, DmsState, PresenceState, ServersState,
 };
@@ -76,6 +77,10 @@ const TYPING_REFRESH: Duration = Duration::from_secs(3);
 /// How long the composer must sit idle after the last keystroke before we send
 /// `StopTyping` to clear the indicator for everyone else.
 const TYPING_IDLE: Duration = Duration::from_secs(3);
+/// Longest message preview shown in a desktop notification, in characters.
+/// Anything past this is truncated with an ellipsis so the notification stays a
+/// glanceable one-liner.
+const NOTIFICATION_PREVIEW_CHARS: usize = 140;
 
 /// Which top-level screen the app is showing.
 enum Screen {
@@ -155,6 +160,16 @@ pub struct ConcordApp {
     /// holding it keeps the background task's command channel open (the task
     /// exits once every handle drops).
     ws_handle: Option<ConnectionHandle>,
+
+    /// Shows native desktop notifications for messages that arrive while the
+    /// window is unfocused. Clicks come back through the receiver drained by the
+    /// loop spawned in [`Self::new`].
+    notifier: Notifier,
+    /// Whether the window currently has OS focus, tracked via
+    /// `observe_window_activation` so the WebSocket handler — which has no
+    /// `Window` — can gate notifications without one.
+    window_active: bool,
+
     /// Auth-view and state observers; dropped together with the view.
     _subscriptions: Vec<Subscription>,
 }
@@ -201,6 +216,25 @@ impl ConcordApp {
             let _ = weak.update(cx, |this, cx| this.on_message_scroll(start, end, count, cx));
         });
 
+        // Desktop notifications: clicks on a shown notification arrive on
+        // `notification_clicks`, drained below on the UI executor to focus the
+        // window and navigate to the conversation.
+        let (notifier, mut notification_clicks) = Notifier::spawn();
+        let window_active = window.is_window_active();
+        cx.spawn_in(window, async move |this, cx| {
+            while let Some(target) = notification_clicks.recv().await {
+                if this
+                    .update_in(cx, |this, window, cx| {
+                        this.handle_notification_click(target, window, cx)
+                    })
+                    .is_err()
+                {
+                    break; // root view gone
+                }
+            }
+        })
+        .detach();
+
         // Re-render the layout whenever the auth view fires or any piece of
         // shared state changes; chat changes also reconcile the message list.
         let subscriptions = vec![
@@ -217,6 +251,11 @@ impl ConcordApp {
             cx.observe(&connection, |_, _, cx| cx.notify()),
             cx.observe(&presence, |_, _, cx| cx.notify()),
             cx.observe(&dms, |_, _, cx| cx.notify()),
+            // Track OS focus so notifications only fire while the window is in
+            // the background. Pure internal state — no re-render needed.
+            cx.observe_window_activation(window, |this, window, _cx| {
+                this.window_active = window.is_window_active();
+            }),
         ];
 
         Self {
@@ -246,6 +285,8 @@ impl ConcordApp {
             group_dm_dialog: None,
             _dialog_subscription: None,
             ws_handle: None,
+            notifier,
+            window_active,
             _subscriptions: subscriptions,
         }
     }
@@ -376,6 +417,10 @@ impl ConcordApp {
                 content,
                 created_at,
             } => {
+                // Notify before the active-channel gate below: a message in any
+                // channel should raise a notification when the window is in the
+                // background, not just the one on screen.
+                self.notify_channel_message(*channel_id, *author_id, content, cx);
                 if self.chat.read(cx).active_channel() != Some(*channel_id) {
                     return;
                 }
@@ -464,6 +509,11 @@ impl ConcordApp {
             } => {
                 let me = self.auth_state.read(cx).user().map(|u| u.id);
                 let from_me = matches!((*author_id, me), (Some(a), Some(m)) if a == m);
+                // Raise a background notification for a DM from someone else
+                // before folding it into state, mirroring the channel path.
+                if !from_me {
+                    self.notify_direct_message(*dm_channel_id, *author_id, content, cx);
+                }
                 // The wire message carries no author profile; resolve it against
                 // the conversation's participants (or the signed-in user).
                 let author = (*author_id).and_then(|aid| self.resolve_dm_author(*dm_channel_id, aid, cx));
@@ -566,6 +616,136 @@ impl ConcordApp {
                         avatar_url: p.avatar_url.clone(),
                     })
             })
+    }
+
+    // -- Desktop notifications --------------------------------------------
+
+    /// Whether a desktop notification should be raised right now: the window is
+    /// unfocused and the signed-in user is not in Do-Not-Disturb. Idle and
+    /// invisible still notify — only DND silences, per the issue.
+    fn notifications_enabled(&self, cx: &Context<Self>) -> bool {
+        !self.window_active
+            && self.auth_state.read(cx).user().map(|u| u.status) != Some(UserStatus::Dnd)
+    }
+
+    /// Raise a notification for a channel message from someone else while the
+    /// window is in the background. Resolves the sender and channel name for the
+    /// banner and records the channel as the click target. Dropped if the
+    /// channel isn't loaded (so a click would have nowhere to go) or the message
+    /// is our own echoed back from another session.
+    fn notify_channel_message(
+        &self,
+        channel_id: Uuid,
+        author_id: Option<Uuid>,
+        content: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.notifications_enabled(cx) {
+            return;
+        }
+        if let (Some(author), Some(me)) = (author_id, self.auth_state.read(cx).user_id()) {
+            if author == me {
+                return;
+            }
+        }
+        let Some((server_id, channel_name)) = self
+            .servers
+            .read(cx)
+            .find_channel(channel_id)
+            .map(|c| (c.server_id, c.name.clone()))
+        else {
+            return;
+        };
+        let sender = author_id.and_then(|id| self.resolve_author(id, cx)).map(|a| a.username);
+        let title = match sender {
+            Some(name) => format!("{name} · #{channel_name}"),
+            None => format!("#{channel_name}"),
+        };
+        self.notifier.notify(
+            title,
+            notification_preview(content),
+            NotifyTarget::Channel { server_id, channel_id },
+        );
+    }
+
+    /// Raise a notification for a DM from someone else while the window is in
+    /// the background. The caller has already excluded our own messages. A group
+    /// DM prefixes the group name so it's clear where the message landed.
+    fn notify_direct_message(
+        &self,
+        dm_channel_id: Uuid,
+        author_id: Option<Uuid>,
+        content: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.notifications_enabled(cx) {
+            return;
+        }
+        let me = self.auth_state.read(cx).user_id();
+        let sender = author_id
+            .and_then(|id| self.resolve_dm_author(dm_channel_id, id, cx))
+            .map(|a| a.username);
+        let group = self
+            .dms
+            .read(cx)
+            .conversation(dm_channel_id)
+            .filter(|c| c.is_group)
+            .map(|c| dm_display_name(c, me));
+        let title = match (sender, group) {
+            (Some(name), Some(group)) => format!("{name} · {group}"),
+            (Some(name), None) => name,
+            (None, Some(group)) => group.to_string(),
+            (None, None) => "New message".to_string(),
+        };
+        self.notifier.notify(
+            title,
+            notification_preview(content),
+            NotifyTarget::Dm { dm_channel_id },
+        );
+    }
+
+    /// Handle a click on a shown notification: bring the app to the front, focus
+    /// the window, and navigate to the conversation it was for. A click landing
+    /// before the main app is up just raises the window.
+    fn handle_notification_click(
+        &mut self,
+        target: NotifyTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.activate(true);
+        window.activate_window();
+        if !matches!(self.screen, Screen::Main) {
+            return;
+        }
+        match target {
+            NotifyTarget::Channel { server_id, channel_id } => {
+                self.navigate_to_channel(server_id, channel_id, cx);
+            }
+            NotifyTarget::Dm { dm_channel_id } => {
+                self.nav.activate(View::DirectMessages);
+                self.ensure_dms_loaded(cx);
+                self.open_dm_conversation(dm_channel_id, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Show the servers view, select `server_id` (loading its members the first
+    /// time), and open `channel_id` — the channel-notification counterpart to
+    /// [`Self::open_dm_conversation`]. Unlike [`Self::select_server`] it opens
+    /// the named channel directly rather than the server's first text channel.
+    fn navigate_to_channel(&mut self, server_id: Uuid, channel_id: Uuid, cx: &mut Context<Self>) {
+        self.nav.activate(View::Servers);
+        let switching = self.servers.read(cx).active_server() != Some(server_id);
+        self.servers.update(cx, |s, cx| {
+            s.set_active(server_id);
+            cx.notify();
+        });
+        if switching && self.servers.read(cx).members_for(server_id).is_empty() {
+            self.load_members(server_id, cx);
+        }
+        self.open_channel(channel_id, cx);
     }
 
     // -- Initial data load ------------------------------------------------
@@ -2987,6 +3167,21 @@ fn dm_preview(conv: &DmConversation) -> SharedString {
     }
 }
 
+/// A glanceable one-line preview for a notification body: all whitespace
+/// (including newlines) collapsed to single spaces, then truncated to
+/// [`NOTIFICATION_PREVIEW_CHARS`] with a trailing ellipsis.
+fn notification_preview(content: &str) -> String {
+    let flattened = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flattened.chars().count() > NOTIFICATION_PREVIEW_CHARS {
+        let mut preview: String =
+            flattened.chars().take(NOTIFICATION_PREVIEW_CHARS).collect();
+        preview.push('…');
+        preview
+    } else {
+        flattened
+    }
+}
+
 /// A compact, relative timestamp for a DM's last activity: "now" under a minute,
 /// then "5m" / "3h" / "2d" up to a week, then an absolute "Mon D" date.
 fn relative_time(then: DateTime<Utc>, now: DateTime<Utc>) -> String {
@@ -3357,7 +3552,7 @@ mod tests {
     // the `#[test]` harness expands.
     use super::{
         build_message_rows, can_delete_message, can_edit_message, diff_splice, dm_display_name,
-        dm_preview, group_members, relative_time, role_rank, MessageRow,
+        dm_preview, group_members, notification_preview, relative_time, role_rank, MessageRow,
     };
 
     use chrono::{DateTime, Local, TimeZone, Utc};
@@ -3732,5 +3927,20 @@ mod tests {
         // One MEMBER group: online first (bob, zoe alphabetical), then offline amy.
         let names: Vec<&str> = groups[0].1.iter().map(|m| m.username.as_str()).collect();
         assert_eq!(names, vec!["bob", "zoe", "amy"]);
+    }
+
+    #[test]
+    fn notification_preview_flattens_whitespace() {
+        // Newlines and runs of spaces collapse to single spaces for a one-liner.
+        assert_eq!(notification_preview("hello\n\nthere   world"), "hello there world");
+        assert_eq!(notification_preview("  trim\tme  "), "trim me");
+    }
+
+    #[test]
+    fn notification_preview_truncates_long_messages() {
+        let preview = notification_preview(&"a".repeat(500));
+        // Truncated to the cap plus a single trailing ellipsis character.
+        assert_eq!(preview.chars().count(), super::NOTIFICATION_PREVIEW_CHARS + 1);
+        assert!(preview.ends_with('…'));
     }
 }
