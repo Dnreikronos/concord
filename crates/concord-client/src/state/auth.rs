@@ -6,7 +6,7 @@
 
 use uuid::Uuid;
 
-use concord_shared::types::User;
+use concord_shared::types::{User, UserStatus};
 
 use crate::auth::Session;
 
@@ -70,13 +70,21 @@ impl AuthState {
             session.refresh_token = refresh_token;
         }
     }
+
+    /// Set the signed-in user's presence status. An optimistic local update for
+    /// the status the user just picked; the authoritative copy lives on the
+    /// server (Redis). No-op when signed out.
+    pub fn set_status(&mut self, status: UserStatus) {
+        if let Some(session) = self.session.as_mut() {
+            session.user.status = status;
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Utc;
-    use concord_shared::types::UserStatus;
 
     fn sample_session() -> Session {
         let now = Utc::now();
@@ -141,5 +149,20 @@ mod tests {
         auth.sign_out();
         assert!(!auth.is_authenticated());
         assert!(auth.session().is_none());
+    }
+
+    #[test]
+    fn set_status_updates_user() {
+        let mut auth = AuthState::new();
+        auth.sign_in(sample_session());
+        auth.set_status(UserStatus::Dnd);
+        assert_eq!(auth.user().map(|u| u.status), Some(UserStatus::Dnd));
+    }
+
+    #[test]
+    fn set_status_noop_when_signed_out() {
+        let mut auth = AuthState::new();
+        auth.set_status(UserStatus::Dnd);
+        assert!(!auth.is_authenticated());
     }
 }
