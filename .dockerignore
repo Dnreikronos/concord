@@ -1,0 +1,20 @@
+# Build artifacts — never ship the host's compiled output into the context.
+target/
+**/target/
+
+# VCS and CI metadata.
+.git/
+.gitignore
+.github/
+
+# Docs and editor/local cruft.
+*.md
+.vscode/
+.idea/
+
+# Local secrets / environment — config is injected at runtime, not baked in.
+.env
+.env.*
+
+# Cached sqlx query metadata (unused: the server runs runtime-checked queries).
+.sqlx/
