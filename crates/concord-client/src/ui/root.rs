@@ -42,6 +42,7 @@ use crate::state::{
 use crate::ui::auth_view::{AuthEvent, AuthView};
 use crate::ui::group_dm_dialog::{GroupDmDialog, GroupDmEvent};
 use crate::ui::nav::{NavState, View};
+use crate::ui::selection::{hit_test, OrderedSelection, Registry, SelectableText, SelectionState};
 use crate::ui::theme::{color, font, space};
 use crate::ws::{ConnectionHandle, WsEvent};
 
@@ -119,6 +120,15 @@ pub struct ConcordApp {
     /// Set when messages arrive below the viewport while the user has scrolled
     /// up; surfaces the "new messages" jump button.
     unseen_messages: bool,
+
+    /// Discord-style cross-message text selection over the chat log. Pure view
+    /// state: the drag anchor/head and the per-frame registry of laid-out rows
+    /// it hit-tests against. See [`crate::ui::selection`].
+    selection: SelectionState,
+    /// Focus handle for the message-list area, so it can receive the Cmd/Ctrl-C
+    /// keystroke that copies the active selection. Focused on mouse-down in the
+    /// chat body.
+    selection_focus: FocusHandle,
 
     /// The message composer at the foot of the chat pane.
     composer: Entity<InputState>,
@@ -269,6 +279,8 @@ impl ConcordApp {
             message_rows: Rc::new(Vec::new()),
             synced_channel: None,
             unseen_messages: false,
+            selection: SelectionState::new(),
+            selection_focus: cx.focus_handle(),
             composer,
             composer_channel: None,
             editing: None,
@@ -2436,18 +2448,42 @@ impl ConcordApp {
             .unwrap_or_else(|| "Someone".to_string())
     }
 
+    /// The message ids in render order, used to resolve the selection span. Date
+    /// separators carry no text, so they're skipped.
+    fn message_order(&self) -> Rc<Vec<Uuid>> {
+        Rc::new(
+            self.message_rows
+                .iter()
+                .filter_map(|row| match row {
+                    MessageRow::Message { id, .. } => Some(*id),
+                    MessageRow::DateSeparator { .. } => None,
+                })
+                .collect(),
+        )
+    }
+
     /// The scrollable list of messages, overlaid with the "new messages" jump
     /// button while the user is scrolled up past freshly arrived messages.
     fn message_list_area(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let rows = self.message_rows.clone();
-        // Everything a row needs to render its hover actions and inline editor.
-        // Permissions are resolved here, per render, rather than baked into the
-        // rows, so they track membership/auth loading without rebuilding rows.
+        let order = self.message_order();
+        // Rows that scrolled off last frame should stop being hit-tested; only
+        // the rows mounted this frame re-register themselves below.
+        self.selection.clear_registry();
+        // Everything a row needs to render its hover actions, inline editor, and
+        // its slice of the selection. Permissions and the selection snapshot are
+        // resolved here, per render, rather than baked into the rows, so they
+        // track membership/auth loading and the live drag without rebuilding
+        // rows.
         let ctx = RowRender {
             view: cx.weak_entity(),
             me: self.auth_state.read(cx).user().map(|u| u.id),
             is_admin: self.is_active_server_admin(cx),
             editor: self.editor.clone(),
+            selection_registry: self.selection.registry(),
+            selection: self.selection.ordered(&order),
+            order: order.clone(),
+            selection_color: color::selection(),
         };
         let list = list(self.message_list.clone(), move |ix, _window, _cx| {
             rows.get(ix)
@@ -2457,7 +2493,52 @@ impl ConcordApp {
         .flex_1()
         .py(px(space::SM));
 
-        let mut area = v_flex().relative().flex_1().min_h(px(0.0)).child(list);
+        let registry = self.selection.registry();
+        let mut area = v_flex()
+            .track_focus(&self.selection_focus)
+            .relative()
+            .flex_1()
+            .min_h(px(0.0))
+            // Mouse-down anchors a fresh selection (or clears, off any text).
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener({
+                    let order = order.clone();
+                    let registry = registry.clone();
+                    move |this, event: &MouseDownEvent, window, cx| {
+                        this.selection_focus.focus(window, cx);
+                        let caret = hit_test(event.position, &order, &registry);
+                        this.selection.begin(caret);
+                        cx.notify();
+                    }
+                }),
+            )
+            // Dragging with the left button held extends the head.
+            .on_mouse_move(cx.listener({
+                let order = order.clone();
+                let registry = registry.clone();
+                move |this, event: &MouseMoveEvent, _window, cx| {
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        let caret = hit_test(event.position, &order, &registry);
+                        this.selection.extend(caret);
+                        cx.notify();
+                    }
+                }
+            }))
+            // Cmd/Ctrl-C copies the selection in reading order.
+            .on_key_down(cx.listener({
+                let order = order.clone();
+                move |this, event: &KeyDownEvent, _window, cx| {
+                    let ks = &event.keystroke;
+                    if ks.key == "c" && (ks.modifiers.platform || ks.modifiers.control) {
+                        let text = this.selection.selected_text(&order);
+                        if !text.is_empty() {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        }
+                    }
+                }
+            }))
+            .child(list);
         if self.unseen_messages {
             area = area.child(self.jump_to_latest_button(cx));
         }
@@ -2839,6 +2920,17 @@ struct RowRender {
     is_admin: bool,
     /// The shared inline editor, rendered only by the row being edited.
     editor: Entity<InputState>,
+    /// Shared map each [`SelectableText`] publishes its laid-out text into, so
+    /// the view can hit-test pointers against the mounted rows.
+    selection_registry: Registry,
+    /// The active selection's endpoints ordered by render position, or `None`
+    /// when nothing is selected. Each row slices its own highlight from this.
+    selection: Option<OrderedSelection>,
+    /// Message ids in render order, for resolving a row's place in the
+    /// selection span.
+    order: Rc<Vec<Uuid>>,
+    /// The text-background color a selected sub-range is painted with.
+    selection_color: Hsla,
 }
 
 /// Flatten loaded messages (oldest first) into renderable rows: a date
@@ -3408,13 +3500,29 @@ fn render_message(props: MessageProps, ctx: &RowRender) -> AnyElement {
                 ),
         );
     } else {
+        // The body renders through SelectableText so a drag can highlight and
+        // copy across rows. The selected sub-range, if any, is sliced from the
+        // active selection; the wrapping div still supplies the text color/size
+        // that the StyledText inside inherits.
+        let highlight = ctx
+            .selection
+            .and_then(|sel| sel.range_in_row(id, content.len(), &ctx.order));
+        let body = SelectableText::new(
+            id,
+            content,
+            highlight,
+            ctx.selection_color,
+            ctx.selection_registry.clone(),
+        );
         let mut content_line = h_flex().w_full().items_baseline().gap(px(space::SM)).child(
             div()
                 .flex_1()
                 .min_w(px(0.0))
                 .text_color(color::text())
                 .text_size(px(font::MD))
-                .child(content),
+                // An I-beam over the body signals the text is selectable.
+                .cursor_text()
+                .child(body),
         );
         if let Some(tip) = edited {
             // The "(edited)" marker carries the exact edit time in its tooltip.

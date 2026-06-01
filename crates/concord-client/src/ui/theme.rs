@@ -5,7 +5,7 @@
 //! at startup and otherwise style our own surfaces directly from the palette
 //! below so the result stays consistent regardless of the component defaults.
 
-use gpui::{Hsla, rgb};
+use gpui::{rgb, rgba, Hsla};
 
 /// Color palette. Functions rather than constants because building an [`Hsla`]
 /// from a hex literal is not a `const` operation.
@@ -90,6 +90,12 @@ pub mod color {
     /// Danger / destructive — also the "do not disturb" presence dot.
     pub fn danger() -> Hsla {
         rgb(0xf23f43).into()
+    }
+
+    /// Text-selection highlight: a translucent blurple drawn behind selected
+    /// glyphs, Discord-style. The alpha lets the message text show through.
+    pub fn selection() -> Hsla {
+        rgba(0x5865f266).into()
     }
 }
 
