@@ -20,3 +20,8 @@ pub mod state;
 /// members, message history). `gui`-only — like [`auth`], a user of `reqwest`.
 #[cfg(feature = "gui")]
 pub mod api;
+
+/// Native desktop notifications for incoming messages. `gui`-only — it pulls in
+/// the platform notification backends and is only driven by the desktop client.
+#[cfg(feature = "gui")]
+pub mod notifications;
