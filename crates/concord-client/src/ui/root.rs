@@ -48,6 +48,11 @@ pub struct ConcordApp {
     channels: LoadState<Vec<Channel>>,
     /// History of the open channel or DM, oldest-first for rendering.
     messages: LoadState<Vec<MessageWithAuthor>>,
+    /// The thread [`messages`] was last loaded for (`nav.active_thread()` at
+    /// load time). A view switch can change the active thread without touching
+    /// `messages`, so the pane is keyed on this to tell when its history has
+    /// gone stale and must be reloaded.
+    messages_thread: Option<Uuid>,
     /// The user's DM conversations (`GET /api/dms`).
     dms: LoadState<Vec<DmChannelInfo>>,
     _auth_subscription: Subscription,
@@ -66,6 +71,7 @@ impl ConcordApp {
             servers: LoadState::Idle,
             channels: LoadState::Idle,
             messages: LoadState::Idle,
+            messages_thread: None,
             dms: LoadState::Idle,
             _auth_subscription: auth_subscription,
         }
@@ -94,15 +100,6 @@ impl ConcordApp {
     /// The current access token, if signed in.
     fn current_token(&self) -> Option<String> {
         self.session.as_ref().map(|s| s.access_token.clone())
-    }
-
-    /// The channel id whose history the content pane is currently showing: the
-    /// open DM in the DM view, otherwise the selected channel.
-    fn active_thread_id(&self) -> Option<Uuid> {
-        match self.nav.active() {
-            View::DirectMessages => self.nav.selected_dm(),
-            _ => self.nav.selected_channel(),
-        }
     }
 
     /// Drive an API future on the tokio runtime and apply its result back on
@@ -167,6 +164,10 @@ impl ConcordApp {
         self.nav.activate(View::Servers);
         self.nav.select_server(server_id);
         self.load_channels(cx);
+        // Returning to a server keeps its previously open channel selected, so
+        // the pane may still hold the thread we navigated away from; reconcile
+        // it. (When the channel was cleared, the channel fetch reloads it.)
+        self.sync_messages(cx);
     }
 
     /// Fetch the selected server's channels, auto-opening the first text one.
@@ -234,7 +235,27 @@ impl ConcordApp {
                 return;
             }
         }
-        cx.notify();
+        // An already-open conversation isn't re-fetched by the arm above, so
+        // the pane may still hold the thread we came from; reconcile it.
+        self.sync_messages(cx);
+    }
+
+    /// Reconcile the message pane with the active thread after a view switch.
+    /// A click on a channel or DM row loads its history directly, but switching
+    /// views via the rail can change which thread is active without touching
+    /// [`Self::messages`] — leaving the pane showing the thread we left. Reload
+    /// the active thread's history when the pane has gone stale, clear it when
+    /// no thread is active, and otherwise just redraw the freshly-shown view.
+    fn sync_messages(&mut self, cx: &mut Context<Self>) {
+        match message_sync(self.nav.active_thread(), self.messages_thread) {
+            MessageSync::Keep => cx.notify(),
+            MessageSync::Clear => {
+                self.messages = LoadState::Idle;
+                self.messages_thread = None;
+                cx.notify();
+            }
+            MessageSync::Reload(thread) => self.load_messages(thread, cx),
+        }
     }
 
     /// Fetch a channel's (or DM's) message history.
@@ -244,13 +265,14 @@ impl ConcordApp {
         };
         let base = auth::api_base_url();
         self.messages = LoadState::Loading;
+        self.messages_thread = Some(channel_id);
         cx.notify();
         Self::drive(
             cx,
             async move { api::list_messages(&base, &token, channel_id).await },
             move |this, result, cx| {
                 // Drop a stale response if the user has since switched threads.
-                if this.active_thread_id() != Some(channel_id) {
+                if this.nav.active_thread() != Some(channel_id) {
                     return;
                 }
                 match result {
@@ -843,6 +865,30 @@ fn channel_label(channel: &Channel) -> SharedString {
     SharedString::from(format!("{prefix}{}", channel.name))
 }
 
+/// What the message pane should do when the active thread (`active`) and the
+/// thread its contents were loaded for (`loaded`) may have diverged after a
+/// view switch. See [`ConcordApp::sync_messages`].
+#[derive(Debug, PartialEq, Eq)]
+enum MessageSync {
+    /// The pane already shows the active thread; leave its contents untouched.
+    Keep,
+    /// No thread is active (an empty view); clear the pane.
+    Clear,
+    /// The pane belongs to another thread; (re)load this one's history.
+    Reload(Uuid),
+}
+
+/// Decide how the message pane should react to the active thread, given the
+/// thread its current contents were loaded for. Kept pure (no view, no window)
+/// so the view-switch reload logic is unit-testable.
+fn message_sync(active: Option<Uuid>, loaded: Option<Uuid>) -> MessageSync {
+    match active {
+        _ if active == loaded => MessageSync::Keep,
+        Some(thread) => MessageSync::Reload(thread),
+        None => MessageSync::Clear,
+    }
+}
+
 /// First letter of a server name, used as its rail glyph.
 fn server_initial(name: &str) -> SharedString {
     name.chars()
@@ -858,5 +904,40 @@ impl Render for ConcordApp {
             Screen::Auth => self.auth.clone().into_any_element(),
             Screen::Main => self.main_layout(cx).into_any_element(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Import specifics, not `use super::*`: this module pulls in `gpui::*`, and
+    // re-globbing it into a test mod blows the type-resolution recursion limit.
+    use super::{message_sync, MessageSync};
+    use uuid::Uuid;
+
+    #[test]
+    fn keeps_the_pane_when_the_thread_is_unchanged() {
+        let thread = Uuid::new_v4();
+        // Same thread loaded and active — switching views must not refetch.
+        assert_eq!(message_sync(Some(thread), Some(thread)), MessageSync::Keep);
+        // Both empty (e.g. an empty Servers view) is also a no-op.
+        assert_eq!(message_sync(None, None), MessageSync::Keep);
+    }
+
+    #[test]
+    fn reloads_when_the_active_thread_differs() {
+        let loaded = Uuid::new_v4();
+        let active = Uuid::new_v4();
+        // The bug this guards: the pane holds another thread's history after a
+        // rail switch, so the active thread must be (re)loaded.
+        assert_eq!(message_sync(Some(active), Some(loaded)), MessageSync::Reload(active));
+        // First load into an idle pane reloads too.
+        assert_eq!(message_sync(Some(active), None), MessageSync::Reload(active));
+    }
+
+    #[test]
+    fn clears_when_no_thread_is_active() {
+        let loaded = Uuid::new_v4();
+        // Switched to a view with nothing selected: drop the stale history.
+        assert_eq!(message_sync(None, Some(loaded)), MessageSync::Clear);
     }
 }
