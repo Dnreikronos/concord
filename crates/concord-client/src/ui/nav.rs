@@ -104,6 +104,16 @@ impl NavState {
     pub fn select_dm(&mut self, dm: Uuid) {
         self.selected_dm = Some(dm);
     }
+
+    /// The thread whose history the content pane shows: the open DM in the DM
+    /// view, otherwise the selected channel. This is the single key the message
+    /// pane is keyed on, so a view switch knows which history it should reflect.
+    pub fn active_thread(&self) -> Option<Uuid> {
+        match self.active {
+            View::DirectMessages => self.selected_dm,
+            _ => self.selected_channel,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -157,6 +167,27 @@ mod tests {
         nav.select_server(other);
         assert_eq!(nav.selected_server(), Some(other));
         assert_eq!(nav.selected_channel(), None);
+    }
+
+    #[test]
+    fn active_thread_follows_the_active_view() {
+        let mut nav = NavState::new();
+        let channel = Uuid::new_v4();
+        let dm = Uuid::new_v4();
+        nav.select_server(Uuid::new_v4());
+        nav.select_channel(channel);
+        nav.select_dm(dm);
+
+        // Servers view keys on the selected channel...
+        nav.activate(View::Servers);
+        assert_eq!(nav.active_thread(), Some(channel));
+        // ...the DM view on the open conversation...
+        nav.activate(View::DirectMessages);
+        assert_eq!(nav.active_thread(), Some(dm));
+        // ...and Settings has no thread of its own, so it falls back to the
+        // selected channel (the pane there never renders a history anyway).
+        nav.activate(View::Settings);
+        assert_eq!(nav.active_thread(), Some(channel));
     }
 
     #[test]
