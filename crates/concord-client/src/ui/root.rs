@@ -161,6 +161,15 @@ impl ConcordApp {
 
     /// Activate the Servers view on `server_id` and load its channels.
     fn select_server(&mut self, server_id: Uuid, cx: &mut Context<Self>) {
+        // Re-clicking the server already on screen is a no-op: re-running the
+        // channel fetch would flip the sidebar back to "Loading…" and flicker
+        // it while the content pane keeps the open channel's history. A failed
+        // load still re-runs, so the click doubles as a retry.
+        let already_here =
+            self.nav.is_active(View::Servers) && self.nav.selected_server() == Some(server_id);
+        if already_here && !matches!(self.channels, LoadState::Failed(_)) {
+            return;
+        }
         self.nav.activate(View::Servers);
         self.nav.select_server(server_id);
         self.load_channels(cx);
