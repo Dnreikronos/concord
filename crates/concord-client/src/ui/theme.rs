@@ -109,6 +109,11 @@ pub mod space {
     pub const HEADER: f32 = 48.0;
     /// Side length of a circular rail button.
     pub const RAIL_BUTTON: f32 = 48.0;
+    /// Hairline divider between the server icons and the fixed rail buttons:
+    /// its width, thickness, and corner radius.
+    pub const RAIL_DIVIDER_W: f32 = 32.0;
+    pub const RAIL_DIVIDER_H: f32 = 2.0;
+    pub const RAIL_DIVIDER_RADIUS: f32 = 1.0;
 }
 
 /// Font settings in logical pixels.

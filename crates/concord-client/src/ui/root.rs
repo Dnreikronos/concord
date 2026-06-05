@@ -336,7 +336,13 @@ impl ConcordApp {
             .gap(px(space::SM))
             .items_center()
             .children(servers)
-            .child(div().w(px(32.0)).h(px(2.0)).rounded(px(1.0)).bg(color::border()))
+            .child(
+                div()
+                    .w(px(space::RAIL_DIVIDER_W))
+                    .h(px(space::RAIL_DIVIDER_H))
+                    .rounded(px(space::RAIL_DIVIDER_RADIUS))
+                    .bg(color::border()),
+            )
             .child(self.rail_button(View::DirectMessages, cx))
             .child(div().flex_1())
             .child(self.rail_button(View::Settings, cx))
