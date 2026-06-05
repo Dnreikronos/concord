@@ -3,8 +3,8 @@ use sqlx::{Executor, PgPool, Postgres};
 use uuid::Uuid;
 
 use concord_shared::types::{
-    Channel, DmChannel, DmParticipant, MemberInfo, MessageAuthor, MessageWithAuthor, Server,
-    ServerInvite, User,
+    Channel, DmChannel, DmChannelInfo, DmParticipant, MemberInfo, MessageAuthor, MessageWithAuthor,
+    Server, ServerInvite, User,
 };
 
 use crate::error::AppError;
@@ -1195,6 +1195,81 @@ pub async fn list_dm_participants(
     .await?;
 
     Ok(rows.into_iter().map(DmParticipantRow::into_participant).collect())
+}
+
+/// Participant row tagged with its DM channel, used to resolve every
+/// participant for a *set* of channels in one query (see
+/// [`list_dm_channels_for_user`]).
+#[derive(sqlx::FromRow)]
+struct DmParticipantWithChannelRow {
+    dm_channel_id: Uuid,
+    user_id: Uuid,
+    username: String,
+    avatar_url: Option<String>,
+}
+
+/// Every DM channel `user_id` belongs to, newest first, each with its
+/// participants resolved — the list counterpart of the `DmChannelInfo` returned
+/// by the create endpoints.
+///
+/// Participants for all channels are fetched in a single query and grouped in
+/// memory, so the cost is two round-trips regardless of how many DMs the user
+/// has rather than one per channel.
+pub async fn list_dm_channels_for_user(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Vec<DmChannelInfo>, AppError> {
+    let channels = sqlx::query_as::<_, DmChannelRow>(
+        "SELECT dc.id, dc.name, dc.is_group, dc.owner_id, dc.created_at \
+         FROM dm_channels dc \
+         JOIN dm_members dm ON dm.dm_channel_id = dc.id \
+         WHERE dm.user_id = $1 \
+         ORDER BY dc.created_at DESC, dc.id",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+
+    if channels.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let channel_ids: Vec<Uuid> = channels.iter().map(|c| c.id).collect();
+    let participant_rows = sqlx::query_as::<_, DmParticipantWithChannelRow>(
+        "SELECT dm.dm_channel_id, u.id AS user_id, u.username, u.avatar_url \
+         FROM dm_members dm \
+         JOIN users u ON u.id = dm.user_id \
+         WHERE dm.dm_channel_id = ANY($1) \
+         ORDER BY dm.joined_at, u.id",
+    )
+    .bind(&channel_ids)
+    .fetch_all(pool)
+    .await?;
+
+    // Group participants by channel. The query's ORDER BY is global, but the
+    // relative order within each channel is preserved as we append, so each
+    // channel's participants stay ordered by (joined_at, id).
+    let mut by_channel: std::collections::HashMap<Uuid, Vec<DmParticipant>> =
+        std::collections::HashMap::with_capacity(channels.len());
+    for row in participant_rows {
+        by_channel.entry(row.dm_channel_id).or_default().push(DmParticipant {
+            user_id: row.user_id,
+            username: row.username,
+            avatar_url: row.avatar_url,
+        });
+    }
+
+    Ok(channels
+        .into_iter()
+        .map(|ch| DmChannelInfo {
+            participants: by_channel.remove(&ch.id).unwrap_or_default(),
+            id: ch.id,
+            name: ch.name,
+            is_group: ch.is_group,
+            owner_id: ch.owner_id,
+            created_at: ch.created_at,
+        })
+        .collect())
 }
 
 impl UserRow {

@@ -103,20 +103,24 @@ struct ErrorBody {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP round-trips. `gui`-only — these are the sole users of `reqwest`.
+// HTTP round-trips. `gui`-only, over the shared [`http_client`].
 // ---------------------------------------------------------------------------
 
-/// Shared HTTP client with a request timeout, so a stalled server can't leave
-/// the submit flow waiting forever. Built once and reused to keep the
-/// connection pool and TLS state warm across calls.
+/// The client crate's shared HTTP client, with a request timeout so a stalled
+/// server can't leave a call waiting forever. Built once and reused to keep the
+/// connection pool and TLS state warm across calls — both the auth flow here
+/// and the REST reads in [`crate::api`] go through it, so they share one pool.
 #[cfg(feature = "gui")]
-fn http_client() -> &'static reqwest::Client {
+pub(crate) fn http_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+            // A build failure is a TLS/resolver init problem, not a bad timeout;
+            // `Client::new()` would panic on the same fault, so fail fast rather
+            // than fall back to a client that silently drops the timeout guard.
+            .expect("failed to build the HTTP client")
     })
 }
 

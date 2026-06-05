@@ -9,6 +9,8 @@ pub mod assets;
 #[cfg(feature = "gui")]
 pub mod auth_view;
 #[cfg(feature = "gui")]
+pub mod data;
+#[cfg(feature = "gui")]
 pub mod root;
 #[cfg(feature = "gui")]
 pub mod theme;

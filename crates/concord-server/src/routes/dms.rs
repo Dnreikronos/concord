@@ -34,10 +34,23 @@ struct AddMemberRequest {
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/", post(create_dm))
+        .route("/", post(create_dm).get(list_dms))
         .route("/group", post(create_group_dm))
         .route("/{id}/members", post(add_member))
         .route("/{id}/members/{user_id}", delete(remove_member))
+}
+
+/// `GET /api/dms` — the caller's DM conversations, newest first.
+///
+/// Each entry carries its participants (the same `DmChannelInfo` shape the
+/// create endpoints return), so the client can label a 1:1 by the other person
+/// and a group by its members without a follow-up request.
+async fn list_dms(
+    State(state): State<Arc<AppState>>,
+    auth: AuthUser,
+) -> Result<Json<Vec<DmChannelInfo>>, AppError> {
+    let dms = db::list_dm_channels_for_user(&state.pool, auth.user_id).await?;
+    Ok(Json(dms))
 }
 
 /// `POST /api/dms` — open (or reuse) a 1:1 DM with `recipient_id`.

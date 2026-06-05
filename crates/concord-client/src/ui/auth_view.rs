@@ -10,8 +10,6 @@
 //! are driven on a dedicated tokio runtime and their results handed back over a
 //! oneshot channel that the GPUI task awaits.
 
-use std::sync::OnceLock;
-
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -21,15 +19,8 @@ use concord_shared::types::OAuthProvider;
 use concord_shared::validation::{validate_email, validate_password, validate_username};
 
 use crate::auth::{self, Session};
+use crate::ui::data;
 use crate::ui::theme::{color, font, space};
-
-/// Shared tokio runtime used to drive the auth HTTP calls off GPUI's executor.
-fn runtime() -> &'static tokio::runtime::Runtime {
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Runtime::new().expect("failed to start tokio runtime for auth requests")
-    })
-}
 
 /// Open `url` in the user's default browser, best effort.
 fn open_in_browser(url: &str) {
@@ -167,7 +158,7 @@ impl AuthView {
 
         let base = auth::api_base_url();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        runtime().spawn(async move {
+        data::runtime().spawn(async move {
             let result = match mode {
                 Mode::Login => auth::login(&base, &email, &password).await,
                 Mode::Register => auth::register(&base, &username, &email, &password).await,

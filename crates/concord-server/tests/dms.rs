@@ -18,10 +18,12 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+use sqlx::PgPool;
+
 use concord_server::db;
 use helpers::{
-    app_with_pool, auth_header, auth_json_request, auth_request, authed_post, create_user,
-    seed_dm_channel, seed_user, send_json, setup_pool, test_app,
+    app_with_pool, auth_header, auth_json_request, auth_request, authed_get, authed_post,
+    create_user, seed_dm_channel, seed_user, send_json, setup_pool, test_app,
 };
 
 const DMS: &str = "/api/dms";
@@ -728,4 +730,131 @@ async fn remove_requires_auth() {
         .unwrap();
     let (status, _) = send_json(&app, req).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/dms — list the caller's conversations
+// ---------------------------------------------------------------------------
+
+/// Seed a DM channel with an explicit `created_at` (RFC 3339) so list ordering
+/// is deterministic, then attach `members`. Returns the channel id.
+async fn seed_dm_at(
+    pool: &PgPool,
+    is_group: bool,
+    name: Option<&str>,
+    owner: Option<Uuid>,
+    members: &[Uuid],
+    created_at: &str,
+) -> Uuid {
+    let dm_id = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO dm_channels (is_group, name, owner_id, created_at) \
+         VALUES ($1, $2, $3, $4::timestamptz) RETURNING id",
+    )
+    .bind(is_group)
+    .bind(name)
+    .bind(owner)
+    .bind(created_at)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+
+    for &user_id in members {
+        sqlx::query("INSERT INTO dm_members (dm_channel_id, user_id) VALUES ($1, $2)")
+            .bind(dm_id)
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    dm_id
+}
+
+#[tokio::test]
+async fn list_dms_requires_auth() {
+    let app = app_with_pool(setup_pool().await);
+    let req = Request::builder()
+        .method("GET")
+        .uri(DMS)
+        .body(Body::empty())
+        .unwrap();
+
+    let (status, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn list_dms_is_empty_without_conversations() {
+    let pool = setup_pool().await;
+    let (alice, _) = seed_user(&pool, None).await;
+
+    let (status, body) = send(app_with_pool(pool.clone()), authed_get(DMS, alice)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!([]));
+}
+
+#[tokio::test]
+async fn list_dms_returns_conversations_newest_first() {
+    let pool = setup_pool().await;
+    let (alice, _) = seed_user(&pool, None).await;
+    let (bob, bob_name) = seed_user(&pool, None).await;
+    let (carol, _) = seed_user(&pool, None).await;
+
+    // An older 1:1 with bob and a newer group; the group must list first.
+    let one_to_one = seed_dm_at(&pool, false, None, None, &[alice, bob], "2026-01-01T00:00:00Z").await;
+    let group = seed_dm_at(
+        &pool,
+        true,
+        Some("squad"),
+        Some(alice),
+        &[alice, bob, carol],
+        "2026-02-01T00:00:00Z",
+    )
+    .await;
+
+    let (status, body) = send(app_with_pool(pool.clone()), authed_get(DMS, alice)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let entries = body.as_array().unwrap();
+    assert_eq!(entries.len(), 2, "got: {body}");
+
+    // Newest first: the group, then the 1:1.
+    assert_eq!(entries[0]["id"].as_str().unwrap().parse::<Uuid>().unwrap(), group);
+    assert_eq!(entries[0]["is_group"], json!(true));
+    assert_eq!(entries[0]["name"], json!("squad"));
+    assert_eq!(
+        participant_ids(&entries[0]),
+        HashSet::from([alice, bob, carol])
+    );
+
+    assert_eq!(entries[1]["id"].as_str().unwrap().parse::<Uuid>().unwrap(), one_to_one);
+    assert_eq!(entries[1]["is_group"], json!(false));
+    assert!(entries[1].get("name").is_none(), "got: {body}");
+    assert_eq!(participant_ids(&entries[1]), HashSet::from([alice, bob]));
+
+    // Participant profiles are resolved (usernames present).
+    let names: HashSet<String> = entries[1]["participants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["username"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(names.contains(&bob_name), "got: {body}");
+}
+
+#[tokio::test]
+async fn list_dms_excludes_other_users_conversations() {
+    let pool = setup_pool().await;
+    let (alice, _) = seed_user(&pool, None).await;
+    let (bob, _) = seed_user(&pool, None).await;
+    let (carol, _) = seed_user(&pool, None).await;
+
+    // A DM between bob and carol that alice has no part in.
+    seed_dm_channel(&pool, &[bob, carol]).await;
+
+    let (status, body) = send(app_with_pool(pool.clone()), authed_get(DMS, alice)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!([]));
 }

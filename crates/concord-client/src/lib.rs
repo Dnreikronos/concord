@@ -6,6 +6,11 @@ pub mod ws;
 #[cfg(any(feature = "gui", test))]
 pub mod auth;
 
+/// Authenticated reads against the REST API (servers, channels, messages, DMs).
+/// `gui`-only — these are `reqwest` callers like the auth HTTP round-trips.
+#[cfg(feature = "gui")]
+pub mod api;
+
 /// Desktop client UI. Navigation state is always available; the GPUI-backed
 /// views (theme, root layout) compile only with the `gui` feature.
 pub mod ui;
