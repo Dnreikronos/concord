@@ -117,7 +117,10 @@ pub(crate) fn http_client() -> &'static reqwest::Client {
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+            // A build failure is a TLS/resolver init problem, not a bad timeout;
+            // `Client::new()` would panic on the same fault, so fail fast rather
+            // than fall back to a client that silently drops the timeout guard.
+            .expect("failed to build the HTTP client")
     })
 }
 
