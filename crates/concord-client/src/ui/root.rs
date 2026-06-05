@@ -640,14 +640,15 @@ impl ConcordApp {
 
     // -- content pane -------------------------------------------------------
 
-    /// Main content pane: header plus message history for the active view.
-    fn content(&self) -> impl IntoElement {
-        let body = match self.nav.active() {
+    /// Main content pane for the active view. Each `*_content` already fills the
+    /// column (`flex_1().h_full()`) and renders on the chat surface painted by
+    /// [`Self::main_layout`], so this only routes to the right one.
+    fn content(&self) -> AnyElement {
+        match self.nav.active() {
             View::Servers => self.channel_content(),
             View::DirectMessages => self.dm_content(),
             View::Settings => self.settings_content(),
-        };
-        v_flex().flex_1().h_full().bg(color::chat()).child(body)
+        }
     }
 
     /// The Servers view content: channel header and message history.
