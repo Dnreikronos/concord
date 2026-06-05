@@ -442,8 +442,11 @@ impl ConcordApp {
             .on_click(cx.listener(move |this, _, _, cx| match view {
                 View::DirectMessages => this.show_dms(cx),
                 _ => {
+                    // Switching to Servers can change the active thread (the rail
+                    // keeps a channel selected), so reconcile the pane instead of
+                    // just redrawing — otherwise it keeps the thread we left.
                     this.nav.activate(view);
-                    cx.notify();
+                    this.sync_messages(cx);
                 }
             }))
     }
