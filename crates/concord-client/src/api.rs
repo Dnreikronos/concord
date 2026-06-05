@@ -42,19 +42,6 @@ struct ErrorBody {
     error: String,
 }
 
-/// Shared HTTP client with a request timeout, so a stalled server can't leave a
-/// fetch hanging forever. Built once and reused to keep the connection pool and
-/// TLS state warm across calls.
-fn http_client() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
-    })
-}
-
 /// `GET base_url + path` with the bearer `token`, decoding the JSON body as `T`.
 async fn get_json<T: serde::de::DeserializeOwned>(
     base_url: &str,
@@ -62,7 +49,7 @@ async fn get_json<T: serde::de::DeserializeOwned>(
     path: &str,
 ) -> Result<T, ApiError> {
     let base = base_url.trim_end_matches('/');
-    let resp = http_client()
+    let resp = crate::auth::http_client()
         .get(format!("{base}{path}"))
         .bearer_auth(token)
         .send()
