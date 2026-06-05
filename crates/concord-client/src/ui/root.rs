@@ -207,7 +207,14 @@ impl ConcordApp {
             .map(|c| c.id);
         self.channels = LoadState::Loaded(channels);
         match first_text {
-            Some(id) if self.nav.selected_channel().is_none() => self.select_channel(id, cx),
+            Some(id)
+                if should_open_first_channel(
+                    self.nav.selected_channel().is_some(),
+                    self.nav.active(),
+                ) =>
+            {
+                self.select_channel(id, cx)
+            }
             _ => cx.notify(),
         }
     }
@@ -895,6 +902,15 @@ fn message_sync(active: Option<Uuid>, loaded: Option<Uuid>) -> MessageSync {
     }
 }
 
+/// Whether a freshly-loaded channel list should auto-open its first text
+/// channel. Only when nothing is selected yet *and* the Servers view is the one
+/// on screen: a list that lands while the user has switched to DMs must not
+/// fire a message load, or it would load a channel the user never opened and
+/// surface its history under the wrong header. See [`ConcordApp::channels_loaded`].
+fn should_open_first_channel(has_channel_selected: bool, active: View) -> bool {
+    !has_channel_selected && active == View::Servers
+}
+
 /// First letter of a server name, used as its rail glyph.
 fn server_initial(name: &str) -> SharedString {
     name.chars()
@@ -917,7 +933,8 @@ impl Render for ConcordApp {
 mod tests {
     // Import specifics, not `use super::*`: this module pulls in `gpui::*`, and
     // re-globbing it into a test mod blows the type-resolution recursion limit.
-    use super::{message_sync, MessageSync};
+    use super::{message_sync, should_open_first_channel, MessageSync};
+    use crate::ui::nav::View;
     use uuid::Uuid;
 
     #[test]
@@ -945,5 +962,18 @@ mod tests {
         let loaded = Uuid::new_v4();
         // Switched to a view with nothing selected: drop the stale history.
         assert_eq!(message_sync(None, Some(loaded)), MessageSync::Clear);
+    }
+
+    #[test]
+    fn auto_opens_first_channel_only_in_the_servers_view() {
+        // Fresh list, Servers on screen, nothing open yet: open the first one.
+        assert!(should_open_first_channel(false, View::Servers));
+        // A channel is already open: don't yank it out from under the user.
+        assert!(!should_open_first_channel(true, View::Servers));
+        // The login race: the list lands while the user is reading DMs (or sat
+        // in Settings). Auto-opening here would load a channel into a pane the
+        // user never opened, so it must not fire.
+        assert!(!should_open_first_channel(false, View::DirectMessages));
+        assert!(!should_open_first_channel(false, View::Settings));
     }
 }
