@@ -566,19 +566,25 @@ pub async fn list_channel_ids_for_user(
     Ok(ids)
 }
 
-/// Distinct other users who share at least one server with `user_id`. These
-/// are the "relevant users" for presence: the people who should learn when
-/// `user_id` comes online, changes status, or goes offline. `user_id` itself
-/// is excluded.
-pub async fn list_shared_server_user_ids(
+/// Distinct other users relevant to `user_id`'s presence: the people who should
+/// learn when `user_id` comes online, changes status, or goes offline (and whose
+/// own status `user_id` should receive). That is everyone who shares at least one
+/// server, plus every accepted friend — friends matter even when they share no
+/// server. The two sets are `UNION`ed, so a user in both appears once; `user_id`
+/// itself is excluded.
+pub async fn list_presence_peer_ids(
     pool: &PgPool,
     user_id: Uuid,
 ) -> Result<Vec<Uuid>, AppError> {
     let ids = sqlx::query_scalar::<_, Uuid>(
-        "SELECT DISTINCT peer.user_id \
+        "SELECT peer.user_id \
          FROM server_members me \
          JOIN server_members peer ON peer.server_id = me.server_id \
-         WHERE me.user_id = $1 AND peer.user_id <> $1",
+         WHERE me.user_id = $1 AND peer.user_id <> $1 \
+         UNION \
+         SELECT CASE WHEN requester_id = $1 THEN addressee_id ELSE requester_id END \
+         FROM friendships \
+         WHERE status = 'accepted' AND (requester_id = $1 OR addressee_id = $1)",
     )
     .bind(user_id)
     .fetch_all(pool)

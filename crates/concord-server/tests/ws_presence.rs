@@ -137,6 +137,26 @@ async fn seed_shared_server(pool: &PgPool) -> (Uuid, Uuid) {
     (a, b)
 }
 
+async fn add_friendship(pool: &PgPool, a: Uuid, b: Uuid) {
+    sqlx::query(
+        "INSERT INTO friendships (requester_id, addressee_id, status) VALUES ($1, $2, 'accepted')",
+    )
+    .bind(a)
+    .bind(b)
+    .execute(pool)
+    .await
+    .expect("add friendship");
+}
+
+/// Two users who are accepted friends but share no server — presence must still
+/// flow between them.
+async fn seed_friends(pool: &PgPool) -> (Uuid, Uuid) {
+    let a = insert_user(pool).await;
+    let b = insert_user(pool).await;
+    add_friendship(pool, a, b).await;
+    (a, b)
+}
+
 async fn connect(url: &str) -> ClientWs {
     let (ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     ws
@@ -216,6 +236,31 @@ async fn peer_is_notified_when_user_comes_online() {
     authenticate(&mut ws_a, a).await;
 
     // B comes online — A should be told.
+    let mut ws_b = connect(&url).await;
+    authenticate(&mut ws_b, b).await;
+
+    match recv(&mut ws_a).await {
+        ServerMsg::UserStatusChanged { user_id, status } => {
+            assert_eq!(user_id, b);
+            assert_eq!(status, UserStatus::Online);
+        }
+        other => panic!("expected UserStatusChanged online, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn friend_is_notified_when_user_comes_online() {
+    let pool = test_pool().await;
+    // A and B are friends but share no server, so the only thing that links them
+    // for presence is the friendship.
+    let (a, b) = seed_friends(&pool).await;
+    let url = spawn_server(pool, Presence::disabled()).await;
+
+    let mut ws_a = connect(&url).await;
+    let snapshot = authenticate(&mut ws_a, a).await;
+    assert!(snapshot.is_empty(), "B is still offline; A's snapshot should be empty");
+
+    // B comes online — A should be told even with no shared server.
     let mut ws_b = connect(&url).await;
     authenticate(&mut ws_b, b).await;
 
