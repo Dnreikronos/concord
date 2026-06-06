@@ -28,25 +28,32 @@ struct SearchQuery {
     limit: Option<i64>,
 }
 
+#[derive(Deserialize)]
+struct LookupQuery {
+    /// The exact username to resolve, matched case-insensitively.
+    #[serde(default)]
+    username: String,
+}
+
 pub fn router() -> Router<Arc<AppState>> {
-    Router::new().route("/search", get(search_users))
+    Router::new()
+        .route("/search", get(search_users))
+        .route("/by-username", get(lookup_user))
 }
 
 /// `GET /api/users/search?q=&limit=` — find users by username, for the DM and
 /// group-DM participant pickers.
 ///
 /// Matches `q` as a case-insensitive substring of the username and never
-/// returns the caller themselves. A blank `q` yields an empty list rather than
-/// the whole user table, so an empty search box stays empty.
+/// returns the caller themselves. A blank `q` lists users (still
+/// caller-excluded and `limit`-capped) so the picker can offer candidates
+/// before anything is typed — the empty string is a substring of every name.
 async fn search_users(
     State(state): State<Arc<AppState>>,
     auth: AuthUser,
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<Vec<UserSummary>>, AppError> {
     let term = query.q.trim();
-    if term.is_empty() {
-        return Ok(Json(Vec::new()));
-    }
 
     let limit = query
         .limit
@@ -55,4 +62,24 @@ async fn search_users(
 
     let users = db::search_users_by_username(&state.pool, term, auth.user_id, limit).await?;
     Ok(Json(users))
+}
+
+/// `GET /api/users/by-username?username=` — exact (case-insensitive) lookup of a
+/// single user, for "add friend" where the ranked, capped substring search could
+/// bury or miss the intended user. `404` when there's no such user, or it's the
+/// caller themselves.
+async fn lookup_user(
+    State(state): State<Arc<AppState>>,
+    auth: AuthUser,
+    Query(query): Query<LookupQuery>,
+) -> Result<Json<UserSummary>, AppError> {
+    let username = query.username.trim();
+    if username.is_empty() {
+        return Err(AppError::NotFound);
+    }
+
+    db::get_user_summary_by_username(&state.pool, username, auth.user_id)
+        .await?
+        .map(Json)
+        .ok_or(AppError::NotFound)
 }

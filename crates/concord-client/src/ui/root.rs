@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, NaiveDate, Utc};
 use gpui::*;
+use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{h_flex, v_flex, Icon, IconName, Sizable};
@@ -28,8 +29,8 @@ use uuid::Uuid;
 
 use concord_shared::protocol::{ClientMsg, ServerMsg, Token};
 use concord_shared::types::{
-    Channel, ChannelCategory, ChannelType, DmChannelInfo, DmConversation, MemberInfo,
-    MessageAuthor, MessageWithAuthor, Server, UserStatus,
+    Channel, ChannelCategory, ChannelType, DmChannelInfo, DmConversation, Friend, FriendRequest,
+    MemberInfo, MessageAuthor, MessageWithAuthor, Server, UserStatus,
 };
 use concord_shared::validation::validate_message_content;
 
@@ -37,7 +38,8 @@ use crate::api;
 use crate::auth;
 use crate::notifications::{Notifier, NotifyTarget};
 use crate::state::{
-    AuthState, ChatState, ConnectionState, ConnectionStatus, DmsState, PresenceState, ServersState,
+    AuthState, ChatState, ConnectionState, ConnectionStatus, DmsState, FriendsState, PresenceState,
+    ServersState,
 };
 use crate::ui::auth_view::{AuthEvent, AuthView};
 use crate::ui::group_dm_dialog::{GroupDmDialog, GroupDmEvent};
@@ -158,6 +160,17 @@ pub struct ConcordApp {
     connection: Entity<ConnectionState>,
     presence: Entity<PresenceState>,
     dms: Entity<DmsState>,
+    friends: Entity<FriendsState>,
+
+    /// Whether the DM view's main pane shows the Friends panel (the pinned
+    /// "Friends" sidebar entry) rather than an open conversation. Discord-style:
+    /// opening a conversation drops it; the entry brings it back.
+    friends_panel_open: bool,
+    /// The "Add Friend by username" box in the Friends panel.
+    add_friend_input: Entity<InputState>,
+    /// Inline result of the last add-friend attempt (sent / not found / error),
+    /// shown beneath the box. Cleared as the box is edited.
+    add_friend_feedback: Option<SharedString>,
 
     /// The open "New Group DM" dialog, overlaid on the main layout, or `None`
     /// when it is closed.
@@ -195,6 +208,11 @@ impl ConcordApp {
         let connection = cx.new(|_| ConnectionState::new());
         let presence = cx.new(|_| PresenceState::new());
         let dms = cx.new(|_| DmsState::new());
+        let friends = cx.new(|_| FriendsState::new());
+
+        // The Friends panel's "Add Friend by username" box.
+        let add_friend_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Add a friend by username"));
 
         // The composer: an auto-growing textarea where a plain Enter submits and
         // Shift+Enter inserts a newline (`submit_on_enter` flips that default).
@@ -251,6 +269,7 @@ impl ConcordApp {
             cx.subscribe(&auth, Self::on_auth_event),
             cx.subscribe_in(&composer, window, Self::on_composer_event),
             cx.subscribe_in(&editor, window, Self::on_editor_event),
+            cx.subscribe_in(&add_friend_input, window, Self::on_add_friend_event),
             cx.observe(&auth_state, |_, _, cx| cx.notify()),
             cx.observe(&servers, |_, _, cx| cx.notify()),
             cx.observe_in(&chat, window, |this, _, window, cx| {
@@ -261,6 +280,7 @@ impl ConcordApp {
             cx.observe(&connection, |_, _, cx| cx.notify()),
             cx.observe(&presence, |_, _, cx| cx.notify()),
             cx.observe(&dms, |_, _, cx| cx.notify()),
+            cx.observe(&friends, |_, _, cx| cx.notify()),
             // Track OS focus so notifications only fire while the window is in
             // the background. Pure internal state — no re-render needed.
             cx.observe_window_activation(window, |this, window, _cx| {
@@ -294,6 +314,10 @@ impl ConcordApp {
             connection,
             presence,
             dms,
+            friends,
+            friends_panel_open: true,
+            add_friend_input,
+            add_friend_feedback: None,
             group_dm_dialog: None,
             _dialog_subscription: None,
             ws_handle: None,
@@ -316,6 +340,7 @@ impl ConcordApp {
                 self.screen = Screen::Main;
                 self.connect(cx);
                 self.load_initial_data(cx);
+                self.load_friends(cx);
                 cx.notify();
             }
         }
@@ -511,6 +536,12 @@ impl ConcordApp {
                     p.set_status(user_id, status);
                     cx.notify();
                 });
+                // Mirror onto the friends list, whose rows show presence even for
+                // friends sharing no server with us (so not in PresenceState).
+                self.friends.update(cx, |f, cx| {
+                    f.set_friend_status(user_id, status);
+                    cx.notify();
+                });
             }
             ServerMsg::NewDirectMessage {
                 id,
@@ -567,6 +598,25 @@ impl ConcordApp {
                         cx.notify();
                     });
                 }
+            }
+            // Friend events update the friends/request lists live. For the two
+            // that add data (a new request, an accept) we refetch the affected
+            // list so its contents are exact; removals we apply locally by id.
+            ServerMsg::FriendRequestReceived { .. } => self.load_friend_requests(cx),
+            ServerMsg::FriendRequestAccepted { .. } => self.load_friends(cx),
+            ServerMsg::FriendRequestCanceled { request_id } => {
+                let request_id = *request_id;
+                self.friends.update(cx, |f, cx| {
+                    f.remove_request(request_id);
+                    cx.notify();
+                });
+            }
+            ServerMsg::FriendRemoved { user_id } => {
+                let user_id = *user_id;
+                self.friends.update(cx, |f, cx| {
+                    f.remove_friend(user_id);
+                    cx.notify();
+                });
             }
             _ => {}
         }
@@ -922,12 +972,38 @@ impl ConcordApp {
         cx.notify();
     }
 
-    /// Start a direct message with `user_id`, clicked from the member panel.
-    /// Opening a DM with a specific *user* needs the find-or-create endpoint,
-    /// which lands in later work; existing conversations are reachable today
-    /// from the DM view's list. For now this only records the intent.
-    fn open_dm(&mut self, user_id: Uuid, _cx: &mut Context<Self>) {
-        tracing::debug!(%user_id, "start-DM clicked; opening a DM with a user lands in later work");
+    /// Start (or reuse) a 1:1 DM with `user_id` and open it — the "Message"
+    /// action from the member panel and the friends list. Find-or-create on the
+    /// server returns the conversation; fold it into the DM list, switch to the
+    /// DM view, and open it. A failure is logged and leaves the UI as-is.
+    fn open_dm(&mut self, user_id: Uuid, cx: &mut Context<Self>) {
+        let Some(token) = self.auth_state.read(cx).access_token().map(str::to_owned) else {
+            return;
+        };
+        let base = auth::api_base_url();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        api::runtime().spawn(async move {
+            let _ = tx.send(api::create_dm(&base, &token, user_id).await);
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = rx.await;
+            let _ = this.update(cx, |this, cx| match outcome {
+                Ok(Ok(info)) => {
+                    let conversation = conversation_from_info(info);
+                    let id = conversation.id;
+                    this.dms.update(cx, |d, cx| {
+                        d.upsert_conversation(conversation);
+                        cx.notify();
+                    });
+                    this.nav.activate(View::DirectMessages);
+                    this.open_dm_conversation(id, cx);
+                    cx.notify();
+                }
+                Ok(Err(err)) => tracing::warn!(error = %err, "failed to open DM"),
+                Err(_canceled) => {}
+            });
+        })
+        .detach();
     }
 
     /// Fetch the DM conversation list once, the first time the user opens the DM
@@ -977,11 +1053,252 @@ impl ConcordApp {
         .detach();
     }
 
+    /// Load the friends list and pending requests over REST on login. Failures
+    /// clear the spinner and are logged; live friend events keep the lists
+    /// current afterwards.
+    fn load_friends(&mut self, cx: &mut Context<Self>) {
+        let Some(token) = self.auth_state.read(cx).access_token().map(str::to_owned) else {
+            return;
+        };
+        self.friends.update(cx, |f, cx| {
+            f.set_loading(true);
+            cx.notify();
+        });
+
+        let base = auth::api_base_url();
+        let (base2, token2) = (base.clone(), token.clone());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        api::runtime().spawn(async move {
+            let friends = api::list_friends(&base, &token).await;
+            let requests = api::list_friend_requests(&base2, &token2).await;
+            let _ = tx.send((friends, requests));
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = rx.await;
+            let _ = this.update(cx, |this, cx| {
+                this.friends.update(cx, |f, cx| {
+                    match outcome {
+                        Ok((Ok(list), Ok(reqs))) => {
+                            f.set_friends(list);
+                            f.set_requests(reqs);
+                        }
+                        Ok((Ok(list), Err(err))) => {
+                            tracing::warn!(error = %err, "failed to load friend requests");
+                            f.set_friends(list);
+                        }
+                        Ok((Err(err), _)) => {
+                            tracing::warn!(error = %err, "failed to load friends");
+                            f.set_loading(false);
+                        }
+                        Err(_canceled) => f.set_loading(false),
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Refetch only the pending-request lists, after a live request event whose
+    /// exact contents we'd rather read from the server than reconstruct.
+    fn load_friend_requests(&mut self, cx: &mut Context<Self>) {
+        let Some(token) = self.auth_state.read(cx).access_token().map(str::to_owned) else {
+            return;
+        };
+        let base = auth::api_base_url();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        api::runtime().spawn(async move {
+            let _ = tx.send(api::list_friend_requests(&base, &token).await);
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(reqs)) = rx.await {
+                let _ = this.update(cx, |this, cx| {
+                    this.friends.update(cx, |f, cx| {
+                        f.set_requests(reqs);
+                        cx.notify();
+                    });
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Show the Friends panel in the DM main pane (the pinned sidebar entry).
+    fn open_friends_panel(&mut self, cx: &mut Context<Self>) {
+        self.friends_panel_open = true;
+        cx.notify();
+    }
+
+    /// React to the add-friend box: Enter submits, edits clear stale feedback.
+    fn on_add_friend_event(
+        &mut self,
+        _state: &Entity<InputState>,
+        event: &InputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            InputEvent::PressEnter { .. } => self.add_friend(window, cx),
+            // Editing the box clears any stale feedback from a prior attempt.
+            InputEvent::Change if self.add_friend_feedback.is_some() => {
+                self.add_friend_feedback = None;
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    /// Resolve the typed username to a user and send them a friend request. The
+    /// lookup is an exact (case-insensitive) match, so a typo or unknown name
+    /// resolves to nothing rather than the wrong person; the result lands beneath
+    /// the box.
+    fn add_friend(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.add_friend_input.read(cx).value().trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+        let Some(token) = self.auth_state.read(cx).access_token().map(str::to_owned) else {
+            return;
+        };
+        self.add_friend_input.update(cx, |i, cx| i.set_value("", window, cx));
+        self.add_friend_feedback = Some("Sending…".into());
+        cx.notify();
+
+        let base = auth::api_base_url();
+        let q = query.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        api::runtime().spawn(async move {
+            let result = async {
+                let Some(user) = api::get_user_by_username(&base, &token, &q).await? else {
+                    return Ok::<Option<api::FriendRequestOutcome>, api::ApiError>(None);
+                };
+                let outcome = api::send_friend_request(&base, &token, user.id).await?;
+                Ok(Some(outcome))
+            }
+            .await;
+            let _ = tx.send(result);
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = rx.await;
+            let _ = this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Ok(Some(sent))) => {
+                        // A send can resolve to an immediate accept when the
+                        // target had already requested us, so message and refresh
+                        // for the actual outcome. `load_friends` refetches both
+                        // friends and requests, covering either case.
+                        this.add_friend_feedback = Some(SharedString::from(match sent {
+                            api::FriendRequestOutcome::Requested => {
+                                format!("Friend request sent to {query}.")
+                            }
+                            api::FriendRequestOutcome::Accepted => {
+                                format!("You and {query} are now friends.")
+                            }
+                        }));
+                        this.load_friends(cx);
+                    }
+                    Ok(Ok(None)) => {
+                        this.add_friend_feedback = Some(SharedString::from(format!(
+                            "No user named \u{201c}{query}\u{201d}."
+                        )));
+                    }
+                    Ok(Err(err)) => {
+                        this.add_friend_feedback = Some(SharedString::from(err.to_string()));
+                    }
+                    Err(_canceled) => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Accept an incoming friend request. Optimistically drops it from the
+    /// pending list, then reloads the friends list to bring in the new friend.
+    fn accept_friend(&mut self, request_id: Uuid, cx: &mut Context<Self>) {
+        let Some(token) = self.auth_state.read(cx).access_token().map(str::to_owned) else {
+            return;
+        };
+        self.friends.update(cx, |f, cx| {
+            f.remove_request(request_id);
+            cx.notify();
+        });
+        let base = auth::api_base_url();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        api::runtime().spawn(async move {
+            let _ = tx.send(api::accept_friend_request(&base, &token, request_id).await);
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = rx.await;
+            // Reload either way: on success to add the new friend, on failure to
+            // restore the request the optimistic update removed.
+            let _ = this.update(cx, |this, cx| match outcome {
+                Ok(Ok(())) => this.load_friends(cx),
+                Ok(Err(err)) => {
+                    tracing::warn!(error = %err, "failed to accept friend request");
+                    this.load_friends(cx);
+                }
+                Err(_canceled) => {}
+            });
+        })
+        .detach();
+    }
+
+    /// Reject an incoming request or cancel an outgoing one. Optimistically
+    /// removes it; a failure refetches the request lists to restore the truth.
+    fn reject_or_cancel_request(&mut self, request_id: Uuid, cx: &mut Context<Self>) {
+        let Some(token) = self.auth_state.read(cx).access_token().map(str::to_owned) else {
+            return;
+        };
+        self.friends.update(cx, |f, cx| {
+            f.remove_request(request_id);
+            cx.notify();
+        });
+        let base = auth::api_base_url();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        api::runtime().spawn(async move {
+            let _ = tx.send(api::delete_friend_request(&base, &token, request_id).await);
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Err(err)) = rx.await {
+                tracing::warn!(error = %err, "failed to remove friend request");
+                let _ = this.update(cx, |this, cx| this.load_friend_requests(cx));
+            }
+        })
+        .detach();
+    }
+
+    /// Unfriend a user. Optimistically removes them; a failure refetches the
+    /// friends list to restore the truth.
+    fn unfriend(&mut self, user_id: Uuid, cx: &mut Context<Self>) {
+        let Some(token) = self.auth_state.read(cx).access_token().map(str::to_owned) else {
+            return;
+        };
+        self.friends.update(cx, |f, cx| {
+            f.remove_friend(user_id);
+            cx.notify();
+        });
+        let base = auth::api_base_url();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        api::runtime().spawn(async move {
+            let _ = tx.send(api::remove_friend(&base, &token, user_id).await);
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Err(err)) = rx.await {
+                tracing::warn!(error = %err, "failed to remove friend");
+                let _ = this.update(cx, |this, cx| this.load_friends(cx));
+            }
+        })
+        .detach();
+    }
+
     /// Open an existing DM conversation from the list: select it (clearing its
     /// unread dot), tell the server it has been read, and open its channel in the
     /// chat pane so its history loads — DM channels share the message endpoint
     /// and `ChatState` with server channels.
     fn open_dm_conversation(&mut self, dm_channel_id: Uuid, cx: &mut Context<Self>) {
+        // Opening a conversation leaves the Friends panel for the chat.
+        self.friends_panel_open = false;
         self.dms.update(cx, |d, cx| {
             d.set_active(dm_channel_id);
             cx.notify();
@@ -2070,6 +2387,7 @@ impl ConcordApp {
         let active = self.dms.read(cx).active();
         let me = self.auth_state.read(cx).user().map(|u| u.id);
         let now = Utc::now();
+        let friends_selected = self.friends_panel_open;
         // Build owned rows first so the `dms` borrow drops before the per-row
         // `cx.listener`s reborrow `cx`.
         let (loading, loaded, rows) = {
@@ -2081,28 +2399,335 @@ impl ConcordApp {
                 .collect();
             (dms.is_loading(), dms.is_loaded(), rows)
         };
+        let pending = self.friends.read(cx).incoming_count();
 
-        let mut list = v_flex()
+        let mut convos = v_flex()
             .id("dm-list")
             .flex_1()
             .min_h(px(0.0))
             .overflow_y_scroll()
-            .p(px(space::SM))
+            .px(px(space::SM))
+            .pb(px(space::SM))
             .gap(px(space::XS));
-
         if rows.is_empty() {
             let notice = if loading || !loaded {
                 "Loading…"
             } else {
                 "No conversations yet."
             };
-            return list.child(Self::muted_row(notice));
+            convos = convos.child(Self::muted_row(notice));
+        } else {
+            for row in rows {
+                // No conversation reads as selected while the Friends panel is up.
+                let selected = !friends_selected && active == Some(row.id);
+                convos = convos.child(self.dm_row(row, selected, cx));
+            }
         }
-        for row in rows {
-            let selected = active == Some(row.id);
-            list = list.child(self.dm_row(row, selected, cx));
+
+        v_flex()
+            .flex_1()
+            .min_h(px(0.0))
+            .child(
+                div()
+                    .px(px(space::SM))
+                    .pt(px(space::SM))
+                    .child(self.friends_nav_row(friends_selected, pending, cx)),
+            )
+            .child(convos)
+    }
+
+    /// The pinned "Friends" entry atop the DM sidebar: opens the Friends panel
+    /// and badges the count of incoming requests awaiting a response.
+    fn friends_nav_row(
+        &self,
+        selected: bool,
+        pending: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let mut row = h_flex()
+            .id("friends-nav")
+            .w_full()
+            .px(px(space::SM))
+            .py(px(space::XS))
+            .gap(px(space::SM))
+            .items_center()
+            .rounded(px(space::XS))
+            .text_color(if selected { color::text() } else { color::text_muted() });
+        if selected {
+            row = row.bg(color::active());
         }
-        list
+        row.hover(|s| s.bg(color::hover()))
+            .cursor_pointer()
+            .child(Icon::empty().path("icons/users.svg").with_size(px(20.0)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .text_size(px(font::MD))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Friends"),
+            )
+            .children((pending > 0).then(|| {
+                div()
+                    .flex_shrink_0()
+                    .min_w(px(18.0))
+                    .h(px(18.0))
+                    .px(px(5.0))
+                    .rounded_full()
+                    .bg(color::accent())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(font::SM))
+                    .text_color(color::interactive_active())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(SharedString::from(pending.to_string()))
+            }))
+            .on_click(cx.listener(|this, _, _, cx| this.open_friends_panel(cx)))
+    }
+
+    /// The Friends main panel: an "add friend" box over the incoming/outgoing
+    /// requests and the friends list, each friend with presence and actions.
+    fn friends_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (loading, loaded, friends, incoming, outgoing) = {
+            let f = self.friends.read(cx);
+            (
+                f.is_loading(),
+                f.is_loaded(),
+                f.friends().to_vec(),
+                f.incoming().to_vec(),
+                f.outgoing().to_vec(),
+            )
+        };
+        let feedback = self.add_friend_feedback.clone();
+
+        let mut body = v_flex()
+            .id("friends-body")
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .px(px(space::LG))
+            .pb(px(space::LG))
+            .gap(px(space::XS));
+
+        if !loaded && loading {
+            body = body.child(Self::muted_row("Loading…"));
+        } else {
+            if !incoming.is_empty() {
+                body = body.child(Self::friends_section_header("Incoming Requests", incoming.len()));
+                for req in incoming {
+                    body = body.child(self.friend_request_row(req, true, cx));
+                }
+            }
+            if !outgoing.is_empty() {
+                body = body.child(Self::friends_section_header("Outgoing Requests", outgoing.len()));
+                for req in outgoing {
+                    body = body.child(self.friend_request_row(req, false, cx));
+                }
+            }
+            body = body.child(Self::friends_section_header("All Friends", friends.len()));
+            if friends.is_empty() {
+                body = body.child(Self::muted_row("No friends yet — add someone by username above."));
+            } else {
+                for friend in friends {
+                    body = body.child(self.friend_row(friend, cx));
+                }
+            }
+        }
+
+        v_flex()
+            .flex_1()
+            .h_full()
+            .bg(color::chat())
+            .child(
+                h_flex()
+                    .h(px(space::HEADER))
+                    .w_full()
+                    .px(px(space::LG))
+                    .items_center()
+                    .border_b_1()
+                    .border_color(color::border())
+                    .text_color(color::text())
+                    .text_size(px(font::LG))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Friends"),
+            )
+            .child(
+                v_flex()
+                    .w_full()
+                    .px(px(space::LG))
+                    .py(px(space::MD))
+                    .gap(px(space::SM))
+                    .border_b_1()
+                    .border_color(color::border())
+                    .child(
+                        div()
+                            .text_size(px(font::SM))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(color::text_muted())
+                            .child("ADD FRIEND"),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap(px(space::SM))
+                            .items_center()
+                            .child(div().flex_1().child(Input::new(&self.add_friend_input).w_full()))
+                            .child(
+                                Button::new("add-friend-send")
+                                    .label("Send Request")
+                                    .primary()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.add_friend(window, cx)
+                                    })),
+                            ),
+                    )
+                    .children(feedback.map(|msg| {
+                        div()
+                            .text_size(px(font::SM))
+                            .text_color(color::text_muted())
+                            .child(msg)
+                    })),
+            )
+            .child(body)
+    }
+
+    /// A muted, uppercase section header inside the Friends panel.
+    fn friends_section_header(label: &str, count: usize) -> impl IntoElement {
+        div()
+            .pt(px(space::MD))
+            .pb(px(space::XS))
+            .text_size(px(font::SM))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(color::text_muted())
+            .child(SharedString::from(format!("{} — {count}", label.to_uppercase())))
+    }
+
+    /// One pending-request row: avatar, name, a sub-line, and its actions —
+    /// Accept / Ignore for an incoming request, Cancel for an outgoing one.
+    fn friend_request_row(
+        &self,
+        req: FriendRequest,
+        incoming: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let request_id = req.id;
+        let initial = author_initial(&req.user.username);
+        let tint = author_tint(Some(req.user.id));
+        let username = SharedString::from(req.user.username);
+        let sub: SharedString =
+            if incoming { "Incoming friend request" } else { "Outgoing friend request" }.into();
+
+        let actions = if incoming {
+            h_flex()
+                .gap(px(space::SM))
+                .child(
+                    Button::new(SharedString::from(format!("accept-{request_id}")))
+                        .label("Accept")
+                        .primary()
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.accept_friend(request_id, cx)),
+                        ),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("ignore-{request_id}")))
+                        .label("Ignore")
+                        .ghost()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.reject_or_cancel_request(request_id, cx)
+                        })),
+                )
+        } else {
+            h_flex().gap(px(space::SM)).child(
+                Button::new(SharedString::from(format!("cancel-{request_id}")))
+                    .label("Cancel")
+                    .ghost()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.reject_or_cancel_request(request_id, cx)
+                    })),
+            )
+        };
+
+        h_flex()
+            .w_full()
+            .px(px(space::SM))
+            .py(px(space::XS))
+            .gap(px(space::SM))
+            .items_center()
+            .rounded(px(space::XS))
+            .text_color(color::text())
+            .child(member_avatar(initial, tint, UserStatus::Offline))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .child(div().text_size(px(font::MD)).child(username))
+                    .child(
+                        div()
+                            .text_size(px(font::SM))
+                            .text_color(color::text_muted())
+                            .child(sub),
+                    ),
+            )
+            .child(actions)
+    }
+
+    /// One friend row: an avatar with a presence dot, the name and status text,
+    /// and the Message / Remove actions.
+    fn friend_row(&self, friend: Friend, cx: &mut Context<Self>) -> impl IntoElement {
+        let user_id = friend.user.id;
+        let status = friend.status;
+        let initial = author_initial(&friend.user.username);
+        let tint = author_tint(Some(user_id));
+        let username = SharedString::from(friend.user.username);
+        let status_text: SharedString = match status {
+            UserStatus::Online => "Online",
+            UserStatus::Idle => "Idle",
+            UserStatus::Dnd => "Do Not Disturb",
+            UserStatus::Offline => "Offline",
+        }
+        .into();
+
+        h_flex()
+            .w_full()
+            .px(px(space::SM))
+            .py(px(space::XS))
+            .gap(px(space::SM))
+            .items_center()
+            .rounded(px(space::XS))
+            .text_color(color::text())
+            .hover(|s| s.bg(color::hover()))
+            .child(member_avatar(initial, tint, status))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .child(div().text_size(px(font::MD)).child(username))
+                    .child(
+                        div()
+                            .text_size(px(font::SM))
+                            .text_color(color::text_muted())
+                            .child(status_text),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap(px(space::SM))
+                    .child(
+                        Button::new(SharedString::from(format!("msg-{user_id}")))
+                            .label("Message")
+                            .primary()
+                            .on_click(cx.listener(move |this, _, _, cx| this.open_dm(user_id, cx))),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("unfriend-{user_id}")))
+                            .label("Remove")
+                            .ghost()
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.unfriend(user_id, cx)),
+                            ),
+                    ),
+            )
     }
 
     /// One DM conversation row: an avatar, the display name with a relative
@@ -2209,7 +2834,9 @@ impl ConcordApp {
         match self.nav.active() {
             View::Servers => self.chat_pane(cx).into_any_element(),
             View::DirectMessages => {
-                if self.dms.read(cx).active().is_some() {
+                if self.friends_panel_open {
+                    self.friends_pane(cx).into_any_element()
+                } else if self.dms.read(cx).active().is_some() {
                     self.chat_pane(cx).into_any_element()
                 } else {
                     Self::placeholder_pane(

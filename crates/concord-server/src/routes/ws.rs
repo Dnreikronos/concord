@@ -540,15 +540,15 @@ async fn try_delete_message(
 }
 
 /// On-connect presence setup. On the user's first connection it marks them
-/// online (persisting to Redis and notifying shared-server peers); on every
-/// connection it sends back a snapshot of those peers' current presence so the
-/// client starts with an accurate roster.
+/// online (persisting to Redis and notifying their presence peers — shared-server
+/// members and friends); on every connection it sends back a snapshot of those
+/// peers' current presence so the client starts with an accurate roster.
 ///
 /// Best-effort throughout: if the peer lookup fails the whole step is skipped
 /// rather than failing the connection, which also keeps the auth handshake
 /// testable against a pool that never connects.
 async fn init_presence(state: &Arc<AppState>, sender: &Sink, uid: Uuid, is_first: bool) {
-    let peers = match db::list_shared_server_user_ids(&state.pool, uid).await {
+    let peers = match db::list_presence_peer_ids(&state.pool, uid).await {
         Ok(peers) => peers,
         Err(e) => {
             warn!(user_id = %uid, error = ?e, "failed to load presence peers");
@@ -571,11 +571,11 @@ async fn init_presence(state: &Arc<AppState>, sender: &Sink, uid: Uuid, is_first
     let _ = send_msg(sender, &ServerMsg::PresenceSnapshot { users }).await;
 }
 
-/// Notify every user who shares a server with `uid` that their status changed.
-/// The hub only delivers to peers with a live connection; offline peers are a
-/// no-op.
+/// Notify every presence peer of `uid` — shared-server members and accepted
+/// friends — that their status changed. The hub only delivers to peers with a
+/// live connection; offline peers are a no-op.
 async fn broadcast_status_change(state: &AppState, uid: Uuid, status: UserStatus) {
-    let peers = match db::list_shared_server_user_ids(&state.pool, uid).await {
+    let peers = match db::list_presence_peer_ids(&state.pool, uid).await {
         Ok(peers) => peers,
         Err(e) => {
             warn!(user_id = %uid, error = ?e, "failed to load presence peers for broadcast");

@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::types::UserStatus;
+use crate::types::{UserStatus, UserSummary};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Token(String);
@@ -141,6 +141,33 @@ pub enum ServerMsg {
         server_id: Uuid,
         name: String,
         owner_id: Uuid,
+    },
+
+    // Friends
+    //
+    // Pushed to the *other* party of a friend action so an online client updates
+    // its lists without polling. Offline clients miss the push and reconcile
+    // from `GET /api/friends` + `/api/friends/requests` on next load, so these
+    // are best-effort, not a source of truth.
+    /// A new incoming friend request: `from` is the sender, `request_id` the row
+    /// to accept/reject.
+    FriendRequestReceived {
+        request_id: Uuid,
+        from: UserSummary,
+    },
+    /// A request the recipient sent (or a reverse request) was accepted; `user`
+    /// is the new friend.
+    FriendRequestAccepted {
+        user: UserSummary,
+    },
+    /// A pending request was rejected or cancelled by the other party; drop
+    /// `request_id` from whichever pending list holds it.
+    FriendRequestCanceled {
+        request_id: Uuid,
+    },
+    /// The friendship with `user_id` was removed by them.
+    FriendRemoved {
+        user_id: Uuid,
     },
 }
 

@@ -292,3 +292,43 @@ pub struct MemberInfo {
     pub role: String,
     pub joined_at: DateTime<Utc>,
 }
+
+/// A confirmed friend, as returned by `GET /api/friends`. `status` is the
+/// friend's live presence at query time (`offline` when the presence store has
+/// nothing for them); `since` is when the friendship was established.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Friend {
+    pub user: UserSummary,
+    pub status: UserStatus,
+    pub since: DateTime<Utc>,
+}
+
+/// Which way a pending friend request points relative to the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FriendRequestDirection {
+    /// Someone sent the caller a request awaiting their accept/reject.
+    Incoming,
+    /// The caller sent a request awaiting the other user's accept.
+    Outgoing,
+}
+
+/// A pending friend request involving the caller. `user` is always the *other*
+/// party (the sender for an incoming request, the recipient for an outgoing
+/// one); `direction` says which. `id` is the friendship row, used to
+/// accept/reject/cancel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FriendRequest {
+    pub id: Uuid,
+    pub user: UserSummary,
+    pub direction: FriendRequestDirection,
+    pub created_at: DateTime<Utc>,
+}
+
+/// The caller's pending friend requests, split by direction, as returned by
+/// `GET /api/friends/requests`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FriendRequests {
+    pub incoming: Vec<FriendRequest>,
+    pub outgoing: Vec<FriendRequest>,
+}

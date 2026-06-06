@@ -3,8 +3,9 @@ use sqlx::{Executor, PgPool, Postgres};
 use uuid::Uuid;
 
 use concord_shared::types::{
-    Channel, DmChannel, DmChannelInfo, DmConversation, DmLastMessage, DmParticipant, MemberInfo,
-    MessageAuthor, MessageWithAuthor, Server, ServerInvite, User, UserSummary,
+    Channel, DmChannel, DmChannelInfo, DmConversation, DmLastMessage, DmParticipant, FriendRequest,
+    FriendRequestDirection, FriendRequests, MemberInfo, MessageAuthor, MessageWithAuthor, Server,
+    ServerInvite, User, UserSummary,
 };
 
 use crate::error::AppError;
@@ -565,19 +566,25 @@ pub async fn list_channel_ids_for_user(
     Ok(ids)
 }
 
-/// Distinct other users who share at least one server with `user_id`. These
-/// are the "relevant users" for presence: the people who should learn when
-/// `user_id` comes online, changes status, or goes offline. `user_id` itself
-/// is excluded.
-pub async fn list_shared_server_user_ids(
+/// Distinct other users relevant to `user_id`'s presence: the people who should
+/// learn when `user_id` comes online, changes status, or goes offline (and whose
+/// own status `user_id` should receive). That is everyone who shares at least one
+/// server, plus every accepted friend — friends matter even when they share no
+/// server. The two sets are `UNION`ed, so a user in both appears once; `user_id`
+/// itself is excluded.
+pub async fn list_presence_peer_ids(
     pool: &PgPool,
     user_id: Uuid,
 ) -> Result<Vec<Uuid>, AppError> {
     let ids = sqlx::query_scalar::<_, Uuid>(
-        "SELECT DISTINCT peer.user_id \
+        "SELECT peer.user_id \
          FROM server_members me \
          JOIN server_members peer ON peer.server_id = me.server_id \
-         WHERE me.user_id = $1 AND peer.user_id <> $1",
+         WHERE me.user_id = $1 AND peer.user_id <> $1 \
+         UNION \
+         SELECT CASE WHEN requester_id = $1 THEN addressee_id ELSE requester_id END \
+         FROM friendships \
+         WHERE status = 'accepted' AND (requester_id = $1 OR addressee_id = $1)",
     )
     .bind(user_id)
     .fetch_all(pool)
@@ -1126,6 +1133,21 @@ pub async fn user_exists(pool: &PgPool, user_id: Uuid) -> Result<bool, AppError>
     Ok(result)
 }
 
+/// The public summary of a single user, or `None` if no such user exists.
+pub async fn get_user_summary(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Option<UserSummary>, AppError> {
+    let row = sqlx::query_as::<_, UserSummaryRow>(
+        "SELECT id, username, avatar_url FROM users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(UserSummary::from))
+}
+
 #[derive(sqlx::FromRow)]
 struct UserSummaryRow {
     id: Uuid,
@@ -1171,6 +1193,28 @@ pub async fn search_users_by_username(
     .await?;
 
     Ok(rows.into_iter().map(UserSummary::from).collect())
+}
+
+/// Look up a single user by exact (case-insensitive) username, excluding the
+/// caller. "Add friend" needs an exact resolution, not the substring search's
+/// ranked, capped list — an exact name can sort past the search cap and be
+/// missed, which would read as "no such user".
+pub async fn get_user_summary_by_username(
+    pool: &PgPool,
+    username: &str,
+    exclude: Uuid,
+) -> Result<Option<UserSummary>, AppError> {
+    let row = sqlx::query_as::<_, UserSummaryRow>(
+        "SELECT id, username, avatar_url \
+         FROM users \
+         WHERE id <> $1 AND lower(username) = lower($2)",
+    )
+    .bind(exclude)
+    .bind(username)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(UserSummary::from))
 }
 
 /// Escape the `LIKE`/`ILIKE` metacharacters (`\`, `%`, `_`) in a user-supplied
@@ -1784,4 +1828,275 @@ pub async fn remove_dm_member(
 
     tx.commit().await.map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// Friendships
+// ---------------------------------------------------------------------------
+
+#[derive(sqlx::FromRow)]
+struct FriendshipStateRow {
+    id: Uuid,
+    requester_id: Uuid,
+    status: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct NewFriendshipRow {
+    id: Uuid,
+    created_at: DateTime<Utc>,
+}
+
+/// One accepted friend: the *other* user plus when the friendship was made.
+#[derive(sqlx::FromRow)]
+struct FriendListRow {
+    id: Uuid,
+    username: String,
+    avatar_url: Option<String>,
+    since: DateTime<Utc>,
+}
+
+/// One pending request: the friendship row id, the *other* user, and when it
+/// was sent.
+#[derive(sqlx::FromRow)]
+struct FriendRequestRow {
+    id: Uuid,
+    user_id: Uuid,
+    username: String,
+    avatar_url: Option<String>,
+    created_at: DateTime<Utc>,
+}
+
+impl FriendRequestRow {
+    fn into_request(self, direction: FriendRequestDirection) -> FriendRequest {
+        FriendRequest {
+            id: self.id,
+            user: UserSummary {
+                id: self.user_id,
+                username: self.username,
+                avatar_url: self.avatar_url,
+            },
+            direction,
+            created_at: self.created_at,
+        }
+    }
+}
+
+/// Outcome of sending a friend request, decided under the canonical pair lock so
+/// two concurrent sends can never both insert (or insert a mirror row).
+pub enum SendFriendOutcome {
+    /// A new pending request was created. Carries the row id and timestamp so
+    /// the handler can build the response and notify the addressee.
+    Sent { id: Uuid, created_at: DateTime<Utc> },
+    /// A reverse pending request already existed and was accepted instead, so
+    /// the two are now friends.
+    Accepted { id: Uuid },
+    /// The caller already has a pending request out to this user.
+    AlreadyRequested,
+    /// The two are already friends.
+    AlreadyFriends,
+}
+
+/// Send a friend request from `requester` to `addressee`, or — if `addressee`
+/// already has a pending request out to `requester` — accept that one instead.
+///
+/// Like [`find_or_create_dm_channel`], the check-then-write runs under a
+/// transaction-scoped advisory lock keyed on the *unordered* pair, so a
+/// simultaneous send in the opposite direction can't slip a duplicate (or the
+/// mirror row the unique index forbids) past the existence check.
+pub async fn send_friend_request(
+    pool: &PgPool,
+    requester: Uuid,
+    addressee: Uuid,
+) -> Result<SendFriendOutcome, AppError> {
+    let mut tx = pool.begin().await.map_err(|e| AppError::Internal(e.to_string()))?;
+
+    // Canonical (order-independent) key for the pair → one bigint lock id.
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(\
+             ('x' || substr(\
+                 md5(LEAST($1::text, $2::text) || '|' || GREATEST($1::text, $2::text)), \
+                 1, 16))::bit(64)::bigint)",
+    )
+    .bind(requester)
+    .bind(addressee)
+    .execute(&mut *tx)
+    .await?;
+
+    let existing = sqlx::query_as::<_, FriendshipStateRow>(
+        "SELECT id, requester_id, status FROM friendships \
+         WHERE (requester_id = $1 AND addressee_id = $2) \
+            OR (requester_id = $2 AND addressee_id = $1)",
+    )
+    .bind(requester)
+    .bind(addressee)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let outcome = match existing {
+        Some(row) if row.status == "accepted" => SendFriendOutcome::AlreadyFriends,
+        Some(row) if row.requester_id == requester => SendFriendOutcome::AlreadyRequested,
+        // A pending request from the other side: accepting it is the natural,
+        // friendlier resolution rather than rejecting the duplicate.
+        Some(row) => {
+            sqlx::query(
+                "UPDATE friendships SET status = 'accepted', updated_at = now() WHERE id = $1",
+            )
+            .bind(row.id)
+            .execute(&mut *tx)
+            .await?;
+            SendFriendOutcome::Accepted { id: row.id }
+        }
+        None => {
+            let row = sqlx::query_as::<_, NewFriendshipRow>(
+                "INSERT INTO friendships (requester_id, addressee_id) \
+                 VALUES ($1, $2) RETURNING id, created_at",
+            )
+            .bind(requester)
+            .bind(addressee)
+            .fetch_one(&mut *tx)
+            .await?;
+            SendFriendOutcome::Sent { id: row.id, created_at: row.created_at }
+        }
+    };
+
+    tx.commit().await.map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(outcome)
+}
+
+/// Accept the pending request `request_id`, but only if `caller` is its
+/// addressee. Returns the requester's id on success (so the handler can resolve
+/// the new friend and notify them), or `None` if the request doesn't exist,
+/// isn't pending, or isn't addressed to the caller.
+pub async fn accept_friend_request(
+    pool: &PgPool,
+    request_id: Uuid,
+    caller: Uuid,
+) -> Result<Option<Uuid>, AppError> {
+    let requester = sqlx::query_scalar::<_, Uuid>(
+        "UPDATE friendships SET status = 'accepted', updated_at = now() \
+         WHERE id = $1 AND addressee_id = $2 AND status = 'pending' \
+         RETURNING requester_id",
+    )
+    .bind(request_id)
+    .bind(caller)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(requester)
+}
+
+/// Delete a pending request `request_id` that `caller` is part of — rejecting it
+/// (caller is the addressee) or cancelling it (caller is the requester). Returns
+/// `(requester_id, addressee_id)` on success so the handler can notify the other
+/// party, or `None` if there is no such pending request involving the caller.
+pub async fn delete_friend_request(
+    pool: &PgPool,
+    request_id: Uuid,
+    caller: Uuid,
+) -> Result<Option<(Uuid, Uuid)>, AppError> {
+    let row = sqlx::query_as::<_, (Uuid, Uuid)>(
+        "DELETE FROM friendships \
+         WHERE id = $1 AND status = 'pending' AND $2 IN (requester_id, addressee_id) \
+         RETURNING requester_id, addressee_id",
+    )
+    .bind(request_id)
+    .bind(caller)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row)
+}
+
+/// Remove the accepted friendship between `caller` and `other` (either side may
+/// unfriend). Returns `true` if a friendship was removed, `false` if the two
+/// weren't friends.
+pub async fn remove_friend(
+    pool: &PgPool,
+    caller: Uuid,
+    other: Uuid,
+) -> Result<bool, AppError> {
+    let deleted = sqlx::query_scalar::<_, Uuid>(
+        "DELETE FROM friendships \
+         WHERE status = 'accepted' \
+           AND ((requester_id = $1 AND addressee_id = $2) \
+             OR (requester_id = $2 AND addressee_id = $1)) \
+         RETURNING id",
+    )
+    .bind(caller)
+    .bind(other)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(deleted.is_some())
+}
+
+/// The caller's accepted friends, alphabetically by username. Each row is the
+/// other user plus the timestamp the friendship was established; the handler
+/// overlays live presence.
+pub async fn list_friends(
+    pool: &PgPool,
+    caller: Uuid,
+) -> Result<Vec<(UserSummary, DateTime<Utc>)>, AppError> {
+    let rows = sqlx::query_as::<_, FriendListRow>(
+        "SELECT u.id, u.username, u.avatar_url, f.updated_at AS since \
+         FROM friendships f \
+         JOIN users u ON u.id = CASE WHEN f.requester_id = $1 \
+                                     THEN f.addressee_id ELSE f.requester_id END \
+         WHERE f.status = 'accepted' AND (f.requester_id = $1 OR f.addressee_id = $1) \
+         ORDER BY u.username, u.id",
+    )
+    .bind(caller)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            (
+                UserSummary { id: r.id, username: r.username, avatar_url: r.avatar_url },
+                r.since,
+            )
+        })
+        .collect())
+}
+
+/// The caller's pending requests, split into incoming (addressed to them) and
+/// outgoing (sent by them), each newest-first.
+pub async fn list_friend_requests(
+    pool: &PgPool,
+    caller: Uuid,
+) -> Result<FriendRequests, AppError> {
+    let incoming = sqlx::query_as::<_, FriendRequestRow>(
+        "SELECT f.id, u.id AS user_id, u.username, u.avatar_url, f.created_at \
+         FROM friendships f \
+         JOIN users u ON u.id = f.requester_id \
+         WHERE f.status = 'pending' AND f.addressee_id = $1 \
+         ORDER BY f.created_at DESC",
+    )
+    .bind(caller)
+    .fetch_all(pool)
+    .await?;
+
+    let outgoing = sqlx::query_as::<_, FriendRequestRow>(
+        "SELECT f.id, u.id AS user_id, u.username, u.avatar_url, f.created_at \
+         FROM friendships f \
+         JOIN users u ON u.id = f.addressee_id \
+         WHERE f.status = 'pending' AND f.requester_id = $1 \
+         ORDER BY f.created_at DESC",
+    )
+    .bind(caller)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(FriendRequests {
+        incoming: incoming
+            .into_iter()
+            .map(|r| r.into_request(FriendRequestDirection::Incoming))
+            .collect(),
+        outgoing: outgoing
+            .into_iter()
+            .map(|r| r.into_request(FriendRequestDirection::Outgoing))
+            .collect(),
+    })
 }
