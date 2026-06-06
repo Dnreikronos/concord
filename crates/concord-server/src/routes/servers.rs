@@ -50,7 +50,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{id}/members", get(list_members))
         .route("/{id}/members/@me", delete(leave_server))
         .route("/{id}/channels", post(channels::create_channel).get(channels::list_channels))
-        .route("/{id}/categories", post(categories::create_category))
+        .route("/{id}/categories", post(categories::create_category).get(categories::list_categories))
         .route("/{id}/channels/reorder", axum::routing::patch(categories::reorder))
 }
 

@@ -7,7 +7,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use concord_shared::types::DmChannelInfo;
+use concord_shared::types::{DmChannelInfo, DmConversation};
 use concord_shared::validation::{validate_dm_name, ValidationError, DM_GROUP_MAX, DM_GROUP_MIN};
 
 use crate::db;
@@ -36,21 +36,39 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", post(create_dm).get(list_dms))
         .route("/group", post(create_group_dm))
+        .route("/{id}/read", post(mark_read))
         .route("/{id}/members", post(add_member))
         .route("/{id}/members/{user_id}", delete(remove_member))
 }
 
-/// `GET /api/dms` — the caller's DM conversations, newest first.
+/// `GET /api/dms` — the caller's DM conversations, newest-activity-first.
 ///
-/// Each entry carries its participants (the same `DmChannelInfo` shape the
-/// create endpoints return), so the client can label a 1:1 by the other person
-/// and a group by its members without a follow-up request.
+/// Each entry carries its participants, member count, a last-message preview,
+/// and the caller's unread flag, so the client can render the conversation list
+/// (labels, previews, unread dots) without a follow-up request per row.
 async fn list_dms(
     State(state): State<Arc<AppState>>,
     auth: AuthUser,
-) -> Result<Json<Vec<DmChannelInfo>>, AppError> {
-    let dms = db::list_dm_channels_for_user(&state.pool, auth.user_id).await?;
+) -> Result<Json<Vec<DmConversation>>, AppError> {
+    let dms = db::list_dm_conversations_for_user(&state.pool, auth.user_id).await?;
     Ok(Json(dms))
+}
+
+/// `POST /api/dms/{id}/read` — mark the conversation read for the caller as of
+/// now, clearing its unread flag until another member posts again.
+///
+/// A non-member is reported as not found so the endpoint never confirms a
+/// conversation the caller can't see.
+async fn mark_read(
+    State(state): State<Arc<AppState>>,
+    auth: AuthUser,
+    Path(dm_channel_id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    if db::mark_dm_read(&state.pool, dm_channel_id, auth.user_id).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::NotFound)
+    }
 }
 
 /// `POST /api/dms` — open (or reuse) a 1:1 DM with `recipient_id`.

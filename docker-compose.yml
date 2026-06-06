@@ -38,6 +38,43 @@ services:
       retries: 5
       start_period: 5s
 
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Bind to all interfaces inside the container; the host mapping below
+      # decides what is actually reachable.
+      HOST: 0.0.0.0
+      PORT: 8080
+      MAX_CONNECTIONS: ${MAX_CONNECTIONS:-10}
+      # DATABASE_URL / REDIS_URL are assembled here from the POSTGRES_*/REDIS_*
+      # values and pointed at the compose service names (not localhost). The
+      # passwords are embedded into these URLs, so they must be URL-safe --
+      # percent-encode any reserved characters (@ : / ? #) if you change them.
+      DATABASE_URL: postgres://${POSTGRES_USER:-concord}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-concord}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      PRESENCE_TTL_SECONDS: ${PRESENCE_TTL_SECONDS:-60}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set}
+      GITHUB_OAUTH_CLIENT_ID: ${GITHUB_OAUTH_CLIENT_ID:-}
+      GITHUB_OAUTH_CLIENT_SECRET: ${GITHUB_OAUTH_CLIENT_SECRET:-}
+      GITHUB_OAUTH_REDIRECT_URL: ${GITHUB_OAUTH_REDIRECT_URL:-}
+      GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:-}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:-}
+      GOOGLE_OAUTH_REDIRECT_URL: ${GOOGLE_OAUTH_REDIRECT_URL:-}
+    ports:
+      # REST API + WebSocket. Loopback-only by default, matching postgres/redis.
+      - "127.0.0.1:${SERVER_PORT:-8080}:8080"
+    networks:
+      - concord-net
+    # The liveness check (GET /health) is baked into the image's HEALTHCHECK.
+
 volumes:
   postgres-data:
   redis-data:

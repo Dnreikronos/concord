@@ -239,6 +239,7 @@ async fn handle_authenticated(
                         channel_id,
                         author_id: Some(uid),
                         content,
+                        created_at: inserted.created_at,
                     },
                 );
             }
@@ -303,6 +304,7 @@ async fn handle_authenticated(
                     dm_channel_id,
                     author_id: Some(uid),
                     content,
+                    created_at: inserted.created_at,
                 };
                 for member in members {
                     state.hub.send_to_user(member, &msg);
@@ -350,7 +352,7 @@ async fn handle_authenticated(
                     continue;
                 }
 
-                match db::update_message_if_author(
+                let edited_at = match db::update_message_if_author(
                     &state.pool,
                     message_id,
                     uid,
@@ -358,7 +360,7 @@ async fn handle_authenticated(
                 )
                 .await
                 {
-                    Ok(Some(_)) => {}
+                    Ok(Some((_, edited_at))) => edited_at,
                     Ok(None) => {
                         let _ = send_error(
                             &sender,
@@ -377,13 +379,14 @@ async fn handle_authenticated(
                         .await;
                         continue;
                     }
-                }
+                };
 
                 state.hub.broadcast_to_channel(
                     channel_id,
                     &ServerMsg::MessageEdited {
                         message_id,
                         content,
+                        edited_at,
                     },
                 );
             }

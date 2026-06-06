@@ -3,8 +3,8 @@ use sqlx::{Executor, PgPool, Postgres};
 use uuid::Uuid;
 
 use concord_shared::types::{
-    Channel, DmChannel, DmChannelInfo, DmParticipant, MemberInfo, MessageAuthor, MessageWithAuthor,
-    Server, ServerInvite, User,
+    Channel, DmChannel, DmChannelInfo, DmConversation, DmLastMessage, DmParticipant, MemberInfo,
+    MessageAuthor, MessageWithAuthor, Server, ServerInvite, User, UserSummary,
 };
 
 use crate::error::AppError;
@@ -273,18 +273,18 @@ pub async fn get_message_channel(
 }
 
 /// Atomically update content only if author_id matches. Returns the
-/// channel_id on success, None if the message doesn't exist or the
-/// caller isn't the author.
+/// `(channel_id, edited_at)` on success, None if the message doesn't exist or
+/// the caller isn't the author.
 pub async fn update_message_if_author(
     pool: &PgPool,
     message_id: Uuid,
     author_id: Uuid,
     content: &str,
-) -> Result<Option<Uuid>, AppError> {
-    let row = sqlx::query_scalar::<_, Uuid>(
+) -> Result<Option<(Uuid, DateTime<Utc>)>, AppError> {
+    let row = sqlx::query_as::<_, (Uuid, DateTime<Utc>)>(
         "UPDATE messages SET content = $2, edited_at = now() \
          WHERE id = $1 AND author_id = $3 \
-         RETURNING channel_id",
+         RETURNING channel_id, edited_at",
     )
     .bind(message_id)
     .bind(content)
@@ -922,6 +922,23 @@ impl CategoryRow {
     }
 }
 
+pub async fn list_categories_for_server(
+    pool: &PgPool,
+    server_id: Uuid,
+) -> Result<Vec<concord_shared::types::ChannelCategory>, AppError> {
+    let rows = sqlx::query_as::<_, CategoryRow>(
+        "SELECT id, server_id, name, position, created_at \
+         FROM channel_categories \
+         WHERE server_id = $1 \
+         ORDER BY position, created_at",
+    )
+    .bind(server_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(CategoryRow::into_category).collect())
+}
+
 pub async fn insert_category(
     pool: &PgPool,
     server_id: Uuid,
@@ -1109,6 +1126,67 @@ pub async fn user_exists(pool: &PgPool, user_id: Uuid) -> Result<bool, AppError>
     Ok(result)
 }
 
+#[derive(sqlx::FromRow)]
+struct UserSummaryRow {
+    id: Uuid,
+    username: String,
+    avatar_url: Option<String>,
+}
+
+impl From<UserSummaryRow> for UserSummary {
+    fn from(row: UserSummaryRow) -> Self {
+        UserSummary {
+            id: row.id,
+            username: row.username,
+            avatar_url: row.avatar_url,
+        }
+    }
+}
+
+/// Find users whose username contains `query` (case-insensitive), excluding
+/// `exclude` (the caller, so a search never offers a DM with yourself), capped
+/// at `limit` and ordered username-first for a stable, alphabetical list.
+///
+/// `query` is matched as a substring with its LIKE metacharacters escaped, so a
+/// caller typing `%` or `_` searches for those literal characters rather than
+/// turning the pattern into a wildcard.
+pub async fn search_users_by_username(
+    pool: &PgPool,
+    query: &str,
+    exclude: Uuid,
+    limit: i64,
+) -> Result<Vec<UserSummary>, AppError> {
+    let pattern = format!("%{}%", escape_like(query));
+    let rows = sqlx::query_as::<_, UserSummaryRow>(
+        "SELECT id, username, avatar_url \
+         FROM users \
+         WHERE id <> $1 AND username ILIKE $2 ESCAPE '\\' \
+         ORDER BY username, id \
+         LIMIT $3",
+    )
+    .bind(exclude)
+    .bind(pattern)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(UserSummary::from).collect())
+}
+
+/// Escape the `LIKE`/`ILIKE` metacharacters (`\`, `%`, `_`) in a user-supplied
+/// search term so it is matched literally. The query uses `ESCAPE '\'`, so the
+/// backslash must be escaped first to avoid double-unescaping.
+fn escape_like(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Return the 1:1 DM channel between `user_a` and `user_b`, creating it (with
 /// both `dm_members` rows) if none exists. The `bool` is true when a new
 /// channel was inserted, false when an existing one was returned.
@@ -1270,6 +1348,165 @@ pub async fn list_dm_channels_for_user(
             created_at: ch.created_at,
         })
         .collect())
+}
+
+/// One DM channel `user_id` belongs to, enriched with its member count, a
+/// last-message preview, and the caller's unread flag. The flat shape is folded
+/// into a [`DmConversation`] by [`into_conversation`](Self::into_conversation).
+#[derive(sqlx::FromRow)]
+struct DmConversationRow {
+    id: Uuid,
+    name: Option<String>,
+    is_group: bool,
+    owner_id: Option<Uuid>,
+    created_at: DateTime<Utc>,
+    member_count: i64,
+    last_message_id: Option<Uuid>,
+    last_message_content: Option<String>,
+    last_message_created_at: Option<DateTime<Utc>>,
+    last_message_author_id: Option<Uuid>,
+    last_message_author_username: Option<String>,
+    last_message_author_avatar_url: Option<String>,
+    unread: bool,
+}
+
+impl DmConversationRow {
+    fn into_conversation(self, participants: Vec<DmParticipant>) -> DmConversation {
+        // The last-message columns travel together: all present when the LATERAL
+        // join found a row, all NULL when the conversation has no messages.
+        let last_message = match (
+            self.last_message_id,
+            self.last_message_content,
+            self.last_message_created_at,
+        ) {
+            (Some(id), Some(content), Some(created_at)) => {
+                // author is NULL once the sender's account is deleted
+                // (messages.author_id ON DELETE SET NULL), matching the
+                // MessageWithAuthor convention of whole-or-absent authors.
+                let author = match (self.last_message_author_id, self.last_message_author_username) {
+                    (Some(id), Some(username)) => Some(MessageAuthor {
+                        id,
+                        username,
+                        avatar_url: self.last_message_author_avatar_url,
+                    }),
+                    _ => None,
+                };
+                Some(DmLastMessage { id, author, content, created_at })
+            }
+            _ => None,
+        };
+
+        DmConversation {
+            id: self.id,
+            name: self.name,
+            is_group: self.is_group,
+            owner_id: self.owner_id,
+            created_at: self.created_at,
+            member_count: self.member_count,
+            participants,
+            last_message,
+            unread: self.unread,
+        }
+    }
+}
+
+/// Every DM conversation `user_id` belongs to, newest-activity-first, each with
+/// its members resolved plus a last-message preview and the caller's unread
+/// flag — the data the DM conversation list (`GET /api/dms`) renders.
+///
+/// Like [`list_dm_channels_for_user`], participants for all conversations are
+/// fetched in one batched query and grouped in memory, so the cost stays at two
+/// round-trips regardless of how many DMs the user has.
+pub async fn list_dm_conversations_for_user(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Vec<DmConversation>, AppError> {
+    // Order by last activity (newest message, falling back to channel creation
+    // for an empty conversation). The LATERAL join picks each channel's newest
+    // message; `unread` is true when any message from another member is newer
+    // than the caller's last read (or they have never read it).
+    let rows = sqlx::query_as::<_, DmConversationRow>(
+        "SELECT dc.id, dc.name, dc.is_group, dc.owner_id, dc.created_at, \
+                (SELECT count(*) FROM dm_members WHERE dm_channel_id = dc.id) AS member_count, \
+                lm.id AS last_message_id, \
+                lm.content AS last_message_content, \
+                lm.created_at AS last_message_created_at, \
+                lm.author_id AS last_message_author_id, \
+                au.username AS last_message_author_username, \
+                au.avatar_url AS last_message_author_avatar_url, \
+                EXISTS(\
+                    SELECT 1 FROM messages m \
+                    WHERE m.channel_id = dc.id \
+                      AND m.author_id IS DISTINCT FROM $1 \
+                      AND (dm.last_read_at IS NULL OR m.created_at > dm.last_read_at)\
+                ) AS unread \
+         FROM dm_channels dc \
+         JOIN dm_members dm ON dm.dm_channel_id = dc.id AND dm.user_id = $1 \
+         LEFT JOIN LATERAL (\
+             SELECT m.id, m.content, m.created_at, m.author_id \
+             FROM messages m \
+             WHERE m.channel_id = dc.id \
+             ORDER BY m.created_at DESC, m.id DESC \
+             LIMIT 1\
+         ) lm ON true \
+         LEFT JOIN users au ON au.id = lm.author_id \
+         ORDER BY COALESCE(lm.created_at, dc.created_at) DESC, dc.id",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let channel_ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+    let participant_rows = sqlx::query_as::<_, DmParticipantWithChannelRow>(
+        "SELECT dm.dm_channel_id, u.id AS user_id, u.username, u.avatar_url \
+         FROM dm_members dm \
+         JOIN users u ON u.id = dm.user_id \
+         WHERE dm.dm_channel_id = ANY($1) \
+         ORDER BY dm.joined_at, u.id",
+    )
+    .bind(&channel_ids)
+    .fetch_all(pool)
+    .await?;
+
+    let mut by_channel: std::collections::HashMap<Uuid, Vec<DmParticipant>> =
+        std::collections::HashMap::with_capacity(rows.len());
+    for row in participant_rows {
+        by_channel.entry(row.dm_channel_id).or_default().push(DmParticipant {
+            user_id: row.user_id,
+            username: row.username,
+            avatar_url: row.avatar_url,
+        });
+    }
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let participants = by_channel.remove(&row.id).unwrap_or_default();
+            row.into_conversation(participants)
+        })
+        .collect())
+}
+
+/// Mark `dm_channel_id` read for `user_id` as of now, clearing its unread flag
+/// until another member posts again. Returns `false` when no membership row was
+/// updated (the caller isn't a member), so the route can answer `404`.
+pub async fn mark_dm_read(
+    pool: &PgPool,
+    dm_channel_id: Uuid,
+    user_id: Uuid,
+) -> Result<bool, AppError> {
+    let result =
+        sqlx::query("UPDATE dm_members SET last_read_at = now() WHERE dm_channel_id = $1 AND user_id = $2")
+            .bind(dm_channel_id)
+            .bind(user_id)
+            .execute(pool)
+            .await?;
+
+    Ok(result.rows_affected() > 0)
 }
 
 impl UserRow {

@@ -19,6 +19,15 @@ async fn main() {
         .await
         .expect("failed to connect to database");
 
+    // Apply any pending migrations before serving. The files are embedded into
+    // the binary at compile time, so this works in the container without
+    // shipping the migrations directory. It is idempotent and takes a Postgres
+    // advisory lock, so concurrent boots of multiple instances are safe.
+    sqlx::migrate!("../../migrations")
+        .run(&pool)
+        .await
+        .expect("failed to run database migrations");
+
     let github_oauth = cfg.github_oauth.map(|gh| {
         use oauth2::{basic::BasicClient, AuthUrl, ClientId, ClientSecret, RedirectUrl, TokenUrl};
         use secrecy::ExposeSecret;

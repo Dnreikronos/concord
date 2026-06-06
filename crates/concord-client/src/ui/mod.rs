@@ -9,9 +9,11 @@ pub mod assets;
 #[cfg(feature = "gui")]
 pub mod auth_view;
 #[cfg(feature = "gui")]
-pub mod data;
+pub mod group_dm_dialog;
 #[cfg(feature = "gui")]
 pub mod root;
+#[cfg(feature = "gui")]
+pub mod selection;
 #[cfg(feature = "gui")]
 pub mod theme;
 
@@ -19,5 +21,7 @@ pub mod theme;
 pub use assets::ConcordAssets;
 #[cfg(feature = "gui")]
 pub use auth_view::{AuthEvent, AuthView};
+#[cfg(feature = "gui")]
+pub use group_dm_dialog::{GroupDmDialog, GroupDmEvent};
 #[cfg(feature = "gui")]
 pub use root::ConcordApp;

@@ -6,11 +6,22 @@ pub mod ws;
 #[cfg(any(feature = "gui", test))]
 pub mod auth;
 
-/// Authenticated reads against the REST API (servers, channels, messages, DMs).
-/// `gui`-only — these are `reqwest` callers like the auth HTTP round-trips.
-#[cfg(feature = "gui")]
-pub mod api;
-
 /// Desktop client UI. Navigation state is always available; the GPUI-backed
 /// views (theme, root layout) compile only with the `gui` feature.
 pub mod ui;
+
+/// Client application state (auth, servers, chat, connection). Pure data +
+/// logic, mirrored into GPUI entities by the desktop client; compiled for the
+/// desktop client and for tests, like [`auth`].
+#[cfg(any(feature = "gui", test))]
+pub mod state;
+
+/// REST client for loading the data the UI renders (servers, channels,
+/// members, message history). `gui`-only — like [`auth`], a user of `reqwest`.
+#[cfg(feature = "gui")]
+pub mod api;
+
+/// Native desktop notifications for incoming messages. `gui`-only — it pulls in
+/// the platform notification backends and is only driven by the desktop client.
+#[cfg(feature = "gui")]
+pub mod notifications;

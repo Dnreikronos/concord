@@ -5,7 +5,7 @@
 //! at startup and otherwise style our own surfaces directly from the palette
 //! below so the result stays consistent regardless of the component defaults.
 
-use gpui::{Hsla, rgb};
+use gpui::{rgb, rgba, Hsla};
 
 /// Color palette. Functions rather than constants because building an [`Hsla`]
 /// from a hex literal is not a `const` operation.
@@ -82,9 +82,20 @@ pub mod color {
         rgb(0x23a55a).into()
     }
 
-    /// Danger / destructive.
+    /// Idle presence (the amber "away" status dot).
+    pub fn idle() -> Hsla {
+        rgb(0xf0b232).into()
+    }
+
+    /// Danger / destructive — also the "do not disturb" presence dot.
     pub fn danger() -> Hsla {
         rgb(0xf23f43).into()
+    }
+
+    /// Text-selection highlight: a translucent blurple drawn behind selected
+    /// glyphs, Discord-style. The alpha lets the message text show through.
+    pub fn selection() -> Hsla {
+        rgba(0x5865f266).into()
     }
 }
 
@@ -105,15 +116,20 @@ pub mod space {
     pub const SERVER_RAIL: f32 = 72.0;
     /// Width of the channel / DM sidebar.
     pub const SIDEBAR: f32 = 240.0;
+    /// Width of the right-hand member list panel.
+    pub const MEMBER_PANEL: f32 = 240.0;
     /// Height of the top bar / channel header.
     pub const HEADER: f32 = 48.0;
     /// Side length of a circular rail button.
     pub const RAIL_BUTTON: f32 = 48.0;
-    /// Hairline divider between the server icons and the fixed rail buttons:
-    /// its width, thickness, and corner radius.
-    pub const RAIL_DIVIDER_W: f32 = 32.0;
-    pub const RAIL_DIVIDER_H: f32 = 2.0;
-    pub const RAIL_DIVIDER_RADIUS: f32 = 1.0;
+    /// Glyph size of an icon inside a rail button.
+    pub const RAIL_ICON: f32 = 20.0;
+    /// Width of the active-item indicator pill on the server rail.
+    pub const RAIL_PILL_WIDTH: f32 = 4.0;
+    /// Height of the active-item indicator pill.
+    pub const RAIL_PILL_HEIGHT: f32 = 40.0;
+    /// Width of the divider rule under the home / DM shortcut.
+    pub const RAIL_DIVIDER: f32 = 32.0;
 }
 
 /// Font settings in logical pixels.
