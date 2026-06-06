@@ -18,6 +18,7 @@ pub enum AppError {
     OAuthFailed(String),
     AlreadyMember,
     AlreadyDmMember,
+    FriendshipExists,
     InviteCodeCollision,
     InvalidInviteCode,
     NotFound,
@@ -65,6 +66,9 @@ impl IntoResponse for AppError {
             Self::AlreadyDmMember => {
                 (StatusCode::CONFLICT, "already a member of this DM".into())
             }
+            Self::FriendshipExists => {
+                (StatusCode::CONFLICT, "a friend request or friendship already exists".into())
+            }
             Self::InviteCodeCollision => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".into())
             }
@@ -111,6 +115,9 @@ impl From<sqlx::Error> for AppError {
                 }
                 if constraint.contains("dm_members_pkey") {
                     return Self::AlreadyDmMember;
+                }
+                if constraint.contains("friendships_pair") {
+                    return Self::FriendshipExists;
                 }
                 if constraint.contains("server_invites_code_key") {
                     return Self::InviteCodeCollision;
