@@ -1171,10 +1171,10 @@ impl ConcordApp {
                 let users = api::search_users(&base, &token, &q, 20).await?;
                 let Some(user) = users.into_iter().find(|u| u.username.eq_ignore_ascii_case(&q))
                 else {
-                    return Ok::<Option<()>, api::ApiError>(None);
+                    return Ok::<Option<api::FriendRequestOutcome>, api::ApiError>(None);
                 };
-                api::send_friend_request(&base, &token, user.id).await?;
-                Ok(Some(()))
+                let outcome = api::send_friend_request(&base, &token, user.id).await?;
+                Ok(Some(outcome))
             }
             .await;
             let _ = tx.send(result);
@@ -1183,10 +1183,20 @@ impl ConcordApp {
             let outcome = rx.await;
             let _ = this.update(cx, |this, cx| {
                 match outcome {
-                    Ok(Ok(Some(()))) => {
-                        this.add_friend_feedback =
-                            Some(SharedString::from(format!("Friend request sent to {query}.")));
-                        this.load_friend_requests(cx);
+                    Ok(Ok(Some(sent))) => {
+                        // A send can resolve to an immediate accept when the
+                        // target had already requested us, so message and refresh
+                        // for the actual outcome. `load_friends` refetches both
+                        // friends and requests, covering either case.
+                        this.add_friend_feedback = Some(SharedString::from(match sent {
+                            api::FriendRequestOutcome::Requested => {
+                                format!("Friend request sent to {query}.")
+                            }
+                            api::FriendRequestOutcome::Accepted => {
+                                format!("You and {query} are now friends.")
+                            }
+                        }));
+                        this.load_friends(cx);
                     }
                     Ok(Ok(None)) => {
                         this.add_friend_feedback = Some(SharedString::from(format!(

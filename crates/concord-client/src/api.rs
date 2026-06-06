@@ -307,18 +307,43 @@ pub async fn list_friend_requests(
     get_json(base_url, token, "api/friends/requests").await
 }
 
-/// `POST /api/friends/requests` — send a friend request to `user_id` (or accept
-/// their pending one to the caller, server-side). Body is discarded; the client
-/// reconciles via a refetch and live events.
-pub async fn send_friend_request(base_url: &str, token: &str, user_id: Uuid) -> Result<(), ApiError> {
+/// Which way `POST /api/friends/requests` resolved: a new pending request, or an
+/// immediate accept because the target had already requested the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FriendRequestOutcome {
+    Requested,
+    Accepted,
+}
+
+/// `POST /api/friends/requests` — send a friend request to `user_id`, or accept
+/// their pending one to the caller (server-side). The outcome tells the caller
+/// which happened, so it can refresh the right lists and show an honest message;
+/// the rest of the body is reconciled via a refetch and live events.
+pub async fn send_friend_request(
+    base_url: &str,
+    token: &str,
+    user_id: Uuid,
+) -> Result<FriendRequestOutcome, ApiError> {
+    #[derive(Deserialize)]
+    struct Resp {
+        outcome: String,
+    }
     let url = format!("{}/api/friends/requests", base_url.trim_end_matches('/'));
-    expect_success(
-        http_client()
-            .post(url)
-            .bearer_auth(token)
-            .json(&serde_json::json!({ "user_id": user_id })),
-    )
-    .await
+    let resp = http_client()
+        .post(url)
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "user_id": user_id }))
+        .send()
+        .await
+        .map_err(|e| ApiError::Network(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(server_error(resp).await);
+    }
+    let body: Resp = resp.json().await.map_err(|e| ApiError::Unexpected(e.to_string()))?;
+    Ok(match body.outcome.as_str() {
+        "accepted" => FriendRequestOutcome::Accepted,
+        _ => FriendRequestOutcome::Requested,
+    })
 }
 
 /// `POST /api/friends/requests/{id}/accept` — accept an incoming request.
