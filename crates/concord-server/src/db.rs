@@ -2031,22 +2031,6 @@ pub async fn remove_friend(
     Ok(deleted.is_some())
 }
 
-/// Whether `a` and `b` are accepted friends, in either direction.
-pub async fn are_friends(pool: &PgPool, a: Uuid, b: Uuid) -> Result<bool, AppError> {
-    let exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM friendships \
-         WHERE status = 'accepted' \
-           AND ((requester_id = $1 AND addressee_id = $2) \
-             OR (requester_id = $2 AND addressee_id = $1)))",
-    )
-    .bind(a)
-    .bind(b)
-    .fetch_one(pool)
-    .await?;
-
-    Ok(exists)
-}
-
 /// The caller's accepted friends, alphabetically by username. Each row is the
 /// other user plus the timestamp the friendship was established; the handler
 /// overlays live presence.
