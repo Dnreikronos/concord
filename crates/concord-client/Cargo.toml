@@ -31,6 +31,9 @@ gui = [
     "dep:gpui-component",
     "dep:gpui-component-assets",
     "dep:reqwest",
+    "dep:notify-rust",
+    "dep:mac-notification-sys",
+    "dep:tauri-winrt-notification",
 ]
 
 [dependencies]
@@ -41,6 +44,7 @@ serde.workspace = true
 serde_json.workspace = true
 futures-util.workspace = true
 uuid.workspace = true
+chrono.workspace = true
 tracing.workspace = true
 rand.workspace = true
 
@@ -59,6 +63,20 @@ gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", 
 
 # HTTP client for the auth REST calls. Optional, enabled by `gui`.
 reqwest = { workspace = true, optional = true }
+
+# Native desktop notifications, enabled by `gui`. Each platform has a distinct
+# backend with its own click-callback API, so the crate differs per target: the
+# freedesktop (D-Bus) backend on Linux/BSD, `NSUserNotification` on macOS, and
+# WinRT toasts on Windows. `notify-rust`'s default `z` feature is its pure-Rust
+# zbus backend, which dedups with the zbus gpui already pulls in.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+notify-rust = { version = "4", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mac-notification-sys = { version = "0.6", optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+tauri-winrt-notification = { version = "0.7", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros", "sync", "time"] }

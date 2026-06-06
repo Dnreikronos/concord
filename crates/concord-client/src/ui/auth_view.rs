@@ -7,8 +7,8 @@
 //! for that and swaps to the main app.
 //!
 //! GPUI runs its own (non-tokio) executor, so the blocking-free `reqwest` calls
-//! are driven on a dedicated tokio runtime and their results handed back over a
-//! oneshot channel that the GPUI task awaits.
+//! are driven on the shared tokio runtime ([`crate::api::runtime`]) and their
+//! results handed back over a oneshot channel that the GPUI task awaits.
 
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
@@ -18,8 +18,8 @@ use gpui_component::{h_flex, v_flex, Disableable, Icon, IconName, Sizable};
 use concord_shared::types::OAuthProvider;
 use concord_shared::validation::{validate_email, validate_password, validate_username};
 
+use crate::api;
 use crate::auth::{self, Session};
-use crate::ui::data;
 use crate::ui::theme::{color, font, space};
 
 /// Open `url` in the user's default browser, best effort.
@@ -158,7 +158,7 @@ impl AuthView {
 
         let base = auth::api_base_url();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        data::runtime().spawn(async move {
+        api::runtime().spawn(async move {
             let result = match mode {
                 Mode::Login => auth::login(&base, &email, &password).await,
                 Mode::Register => auth::register(&base, &username, &email, &password).await,
