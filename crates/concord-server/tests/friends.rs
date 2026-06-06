@@ -169,13 +169,12 @@ async fn accept_makes_them_friends() {
     let b_reqs = get_requests(&app, b).await;
     let request_id = b_reqs["incoming"][0]["id"].as_str().unwrap();
 
-    let (status, body) = send_json(
+    let (status, _) = send_json(
         &app,
         authed_post(&format!("/api/friends/requests/{request_id}/accept"), b, ""),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["user"]["id"].as_str().unwrap().parse::<Uuid>().unwrap(), a);
+    assert_eq!(status, StatusCode::NO_CONTENT);
 
     assert_eq!(user_ids(&get_friends(&app, a).await), vec![b]);
     assert_eq!(user_ids(&get_friends(&app, b).await), vec![a]);

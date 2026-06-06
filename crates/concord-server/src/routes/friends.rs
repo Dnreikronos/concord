@@ -5,7 +5,6 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -129,17 +128,14 @@ async fn send_request(
 
 /// `POST /api/friends/requests/{id}/accept` — accept an incoming request. Only
 /// the addressee may accept; anything else (missing, already resolved, or not
-/// addressed to the caller) is reported as not found. Returns the new friend.
+/// addressed to the caller) is reported as not found. Returns `204`: the caller
+/// refetches its friends list, so there's no body to consume.
 async fn accept_request(
     State(state): State<Arc<AppState>>,
     auth: AuthUser,
     Path(request_id): Path<Uuid>,
-) -> Result<Json<Friend>, AppError> {
+) -> Result<StatusCode, AppError> {
     let requester_id = db::accept_friend_request(&state.pool, request_id, auth.user_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-
-    let user = db::get_user_summary(&state.pool, requester_id)
         .await?
         .ok_or(AppError::NotFound)?;
 
@@ -152,16 +148,7 @@ async fn accept_request(
         .hub
         .send_to_user(requester_id, &ServerMsg::FriendRequestAccepted { user: me });
 
-    let status = state
-        .presence
-        .get_many(&[requester_id])
-        .await
-        .into_iter()
-        .next()
-        .map(|p| p.status)
-        .unwrap_or(UserStatus::Offline);
-
-    Ok(Json(Friend { user, status, since: Utc::now() }))
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `DELETE /api/friends/requests/{id}` — reject an incoming request or cancel an
