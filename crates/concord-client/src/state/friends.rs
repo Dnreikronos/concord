@@ -10,10 +10,9 @@
 //! Mirrors [`crate::state::dms`] in shape: a plain data + logic struct that
 //! names no GPUI types, so it unit-tests in the default build.
 
-use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use concord_shared::types::{Friend, FriendRequest, FriendRequests, UserStatus, UserSummary};
+use concord_shared::types::{Friend, FriendRequest, FriendRequests, UserStatus};
 
 /// The friends list, the incoming/outgoing request lists, and load status.
 #[derive(Default)]
@@ -77,51 +76,15 @@ impl FriendsState {
         self.outgoing = requests.outgoing;
     }
 
-    /// Add or replace a friend (by user id), then re-sort. Used when a request
-    /// is accepted live.
-    pub fn upsert_friend(&mut self, friend: Friend) {
-        // A new friendship clears any pending request with that user.
-        self.remove_requests_with(friend.user.id);
-        if let Some(slot) = self.friends.iter_mut().find(|f| f.user.id == friend.user.id) {
-            *slot = friend;
-        } else {
-            self.friends.push(friend);
-        }
-        self.sort_friends();
-    }
-
     /// Drop a friend by user id (they unfriended us, or we unfriended them).
     pub fn remove_friend(&mut self, user_id: Uuid) {
         self.friends.retain(|f| f.user.id != user_id);
-    }
-
-    /// Add an incoming request if not already present (a live
-    /// `FriendRequestReceived`), newest first.
-    pub fn add_incoming(&mut self, id: Uuid, from: UserSummary, created_at: DateTime<Utc>) {
-        if self.incoming.iter().any(|r| r.id == id) {
-            return;
-        }
-        self.incoming.insert(
-            0,
-            FriendRequest {
-                id,
-                user: from,
-                direction: concord_shared::types::FriendRequestDirection::Incoming,
-                created_at,
-            },
-        );
     }
 
     /// Drop a pending request by its friendship-row id, from either list.
     pub fn remove_request(&mut self, request_id: Uuid) {
         self.incoming.retain(|r| r.id != request_id);
         self.outgoing.retain(|r| r.id != request_id);
-    }
-
-    /// Drop any pending request (either direction) involving `user_id`.
-    pub fn remove_requests_with(&mut self, user_id: Uuid) {
-        self.incoming.retain(|r| r.user.id != user_id);
-        self.outgoing.retain(|r| r.user.id != user_id);
     }
 
     /// Update a friend's presence in place (from a live `UserStatusChanged`).
@@ -146,7 +109,8 @@ impl FriendsState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use concord_shared::types::FriendRequestDirection;
+    use chrono::Utc;
+    use concord_shared::types::{FriendRequestDirection, UserSummary};
 
     fn summary(name: &str) -> UserSummary {
         UserSummary { id: Uuid::new_v4(), username: name.into(), avatar_url: None }
@@ -168,31 +132,6 @@ mod tests {
         assert_eq!(order, vec!["alice", "Bob", "Charlie"]);
         assert!(s.is_loaded());
         assert!(!s.is_loading());
-    }
-
-    #[test]
-    fn upsert_friend_replaces_and_clears_pending() {
-        let mut s = FriendsState::new();
-        let mut f = friend("dana", UserStatus::Offline);
-        let id = f.user.id;
-        // A pending outgoing request to the same user.
-        s.outgoing.push(FriendRequest {
-            id: Uuid::new_v4(),
-            user: f.user.clone(),
-            direction: FriendRequestDirection::Outgoing,
-            created_at: Utc::now(),
-        });
-
-        s.upsert_friend(f.clone());
-        assert_eq!(s.friends().len(), 1);
-        assert!(s.outgoing().is_empty(), "accepting clears the pending request");
-
-        // Same id replaces in place rather than duplicating.
-        f.status = UserStatus::Online;
-        s.upsert_friend(f);
-        assert_eq!(s.friends().len(), 1);
-        assert_eq!(s.friends()[0].status, UserStatus::Online);
-        assert_eq!(s.friends()[0].user.id, id);
     }
 
     #[test]
@@ -218,18 +157,6 @@ mod tests {
         assert_eq!(s.outgoing().len(), 1);
         s.remove_request(out_id);
         assert!(s.outgoing().is_empty());
-    }
-
-    #[test]
-    fn add_incoming_is_idempotent_and_newest_first() {
-        let mut s = FriendsState::new();
-        let id = Uuid::new_v4();
-        s.add_incoming(id, summary("gus"), Utc::now());
-        s.add_incoming(Uuid::new_v4(), summary("hank"), Utc::now());
-        s.add_incoming(id, summary("gus"), Utc::now()); // duplicate id ignored
-        assert_eq!(s.incoming_count(), 2);
-        // The most recently added (hank) leads.
-        assert_eq!(s.incoming()[0].user.username, "hank");
     }
 
     #[test]
