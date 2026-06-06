@@ -15,11 +15,13 @@
 //! - [`ConnectionState`] — the WebSocket link's status.
 //! - [`PresenceState`] — the online status of the users we can see.
 //! - [`DmsState`] — the DM conversation list and the open conversation.
+//! - [`FriendsState`] — the friends list and pending friend requests.
 
 pub mod auth;
 pub mod chat;
 pub mod connection;
 pub mod dms;
+pub mod friends;
 pub mod presence;
 pub mod servers;
 
@@ -27,5 +29,6 @@ pub use auth::AuthState;
 pub use chat::ChatState;
 pub use connection::{ConnectionState, ConnectionStatus};
 pub use dms::DmsState;
+pub use friends::FriendsState;
 pub use presence::PresenceState;
 pub use servers::ServersState;

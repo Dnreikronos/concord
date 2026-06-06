@@ -16,8 +16,8 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use concord_shared::types::{
-    Channel, ChannelCategory, DmChannelInfo, DmConversation, MemberInfo, MessageWithAuthor, Server,
-    UserSummary,
+    Channel, ChannelCategory, DmChannelInfo, DmConversation, Friend, FriendRequests, MemberInfo,
+    MessageWithAuthor, Server, UserSummary,
 };
 
 use crate::auth::{api_base_url, http_client};
@@ -111,6 +111,16 @@ async fn server_error(resp: reqwest::Response) -> ApiError {
         Ok(body) => ApiError::Server(body.error),
         Err(_) => ApiError::Server(format!("request failed ({status})")),
     }
+}
+
+/// Send a prepared request and discard the body, mapping a non-2xx status to an
+/// `ApiError`. For mutating calls (POST/DELETE) whose response we don't need.
+async fn expect_success(req: reqwest::RequestBuilder) -> Result<(), ApiError> {
+    let resp = req.send().await.map_err(|e| ApiError::Network(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(server_error(resp).await);
+    }
+    Ok(())
 }
 
 /// `GET /api/servers` — the servers the authenticated user belongs to.
@@ -258,6 +268,84 @@ pub async fn create_group_dm(
     resp.json()
         .await
         .map_err(|e| ApiError::Unexpected(e.to_string()))
+}
+
+/// `POST /api/dms` — open (or reuse) a 1:1 DM with `recipient_id`. Returns the
+/// channel with both participants resolved, whether freshly created or reused.
+pub async fn create_dm(
+    base_url: &str,
+    token: &str,
+    recipient_id: Uuid,
+) -> Result<DmChannelInfo, ApiError> {
+    let url = format!("{}/api/dms", base_url.trim_end_matches('/'));
+    let body = serde_json::json!({ "recipient_id": recipient_id });
+    let resp = http_client()
+        .post(url)
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| ApiError::Network(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(server_error(resp).await);
+    }
+    resp.json()
+        .await
+        .map_err(|e| ApiError::Unexpected(e.to_string()))
+}
+
+/// `GET /api/friends` — the caller's accepted friends, each with live presence.
+pub async fn list_friends(base_url: &str, token: &str) -> Result<Vec<Friend>, ApiError> {
+    get_json(base_url, token, "api/friends").await
+}
+
+/// `GET /api/friends/requests` — the caller's pending requests, both directions.
+pub async fn list_friend_requests(
+    base_url: &str,
+    token: &str,
+) -> Result<FriendRequests, ApiError> {
+    get_json(base_url, token, "api/friends/requests").await
+}
+
+/// `POST /api/friends/requests` — send a friend request to `user_id` (or accept
+/// their pending one to the caller, server-side). Body is discarded; the client
+/// reconciles via a refetch and live events.
+pub async fn send_friend_request(base_url: &str, token: &str, user_id: Uuid) -> Result<(), ApiError> {
+    let url = format!("{}/api/friends/requests", base_url.trim_end_matches('/'));
+    expect_success(
+        http_client()
+            .post(url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({ "user_id": user_id })),
+    )
+    .await
+}
+
+/// `POST /api/friends/requests/{id}/accept` — accept an incoming request.
+pub async fn accept_friend_request(
+    base_url: &str,
+    token: &str,
+    request_id: Uuid,
+) -> Result<(), ApiError> {
+    let url = format!("{}/api/friends/requests/{request_id}/accept", base_url.trim_end_matches('/'));
+    expect_success(http_client().post(url).bearer_auth(token)).await
+}
+
+/// `DELETE /api/friends/requests/{id}` — reject an incoming request or cancel an
+/// outgoing one.
+pub async fn delete_friend_request(
+    base_url: &str,
+    token: &str,
+    request_id: Uuid,
+) -> Result<(), ApiError> {
+    let url = format!("{}/api/friends/requests/{request_id}", base_url.trim_end_matches('/'));
+    expect_success(http_client().delete(url).bearer_auth(token)).await
+}
+
+/// `DELETE /api/friends/{user_id}` — unfriend `user_id`.
+pub async fn remove_friend(base_url: &str, token: &str, user_id: Uuid) -> Result<(), ApiError> {
+    let url = format!("{}/api/friends/{user_id}", base_url.trim_end_matches('/'));
+    expect_success(http_client().delete(url).bearer_auth(token)).await
 }
 
 #[cfg(test)]
