@@ -86,6 +86,13 @@ impl GroupDmDialog {
             cx.subscribe_in(&name_input, window, Self::on_name_event),
         ];
 
+        // Offer people to choose from before the user types: once the entity is
+        // live, run an initial blank-query search to populate the results list.
+        cx.spawn(async move |this, cx| {
+            let _ = this.update(cx, |this, cx| this.on_search_change(cx));
+        })
+        .detach();
+
         Self {
             token,
             name_input,
@@ -131,20 +138,15 @@ impl GroupDmDialog {
         }
     }
 
-    /// React to a keystroke in the search box: clear results on an empty box,
-    /// otherwise (re)arm the debounce timer and, once it elapses unsuperseded,
-    /// run the search.
+    /// React to a keystroke in the search box (and the initial open): (re)arm
+    /// the debounce timer and, once it elapses unsuperseded, run the query. A
+    /// blank box lists candidates rather than clearing, so the picker is useful
+    /// before anything is typed.
     fn on_search_change(&mut self, cx: &mut Context<Self>) {
         let query = self.search_input.read(cx).value().trim().to_string();
         self.search_seq = self.search_seq.wrapping_add(1);
         let seq = self.search_seq;
 
-        if query.is_empty() {
-            self.results.clear();
-            self.searching = false;
-            cx.notify();
-            return;
-        }
         self.searching = true;
         cx.notify();
 
@@ -335,7 +337,7 @@ impl GroupDmDialog {
             let notice = if self.searching {
                 "Searching…"
             } else if self.search_input.read(cx).value().trim().is_empty() {
-                "Type a username to find people."
+                "No people to add yet."
             } else {
                 "No matches."
             };

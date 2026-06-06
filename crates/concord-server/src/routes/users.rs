@@ -36,17 +36,15 @@ pub fn router() -> Router<Arc<AppState>> {
 /// group-DM participant pickers.
 ///
 /// Matches `q` as a case-insensitive substring of the username and never
-/// returns the caller themselves. A blank `q` yields an empty list rather than
-/// the whole user table, so an empty search box stays empty.
+/// returns the caller themselves. A blank `q` lists users (still
+/// caller-excluded and `limit`-capped) so the picker can offer candidates
+/// before anything is typed — the empty string is a substring of every name.
 async fn search_users(
     State(state): State<Arc<AppState>>,
     auth: AuthUser,
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<Vec<UserSummary>>, AppError> {
     let term = query.q.trim();
-    if term.is_empty() {
-        return Ok(Json(Vec::new()));
-    }
 
     let limit = query
         .limit

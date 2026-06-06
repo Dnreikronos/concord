@@ -141,15 +141,25 @@ async fn orders_alphabetically() {
 }
 
 #[tokio::test]
-async fn blank_query_returns_empty() {
+async fn blank_query_lists_users() {
     let pool = setup_pool().await;
     let app = app_with_pool(pool.clone());
-    let caller = seed_named(&pool, &format!("{}x", tag())).await;
+    let tag = tag();
 
+    // At least one selectable user besides the caller exists.
+    let _other = seed_named(&pool, &format!("{tag}other")).await;
+    let caller = seed_named(&pool, &format!("{tag}caller")).await;
+
+    // A blank or whitespace-only query now lists people to pick from, rather
+    // than returning nothing, so the picker is useful before you type. It stays
+    // caller-excluded and limit-capped.
     for query in ["", "%20%20"] {
         let (status, body) = send_json(&app, authed_get(&search_uri(query), caller)).await;
         assert_eq!(status, StatusCode::OK, "query {query:?}");
-        assert!(body.as_array().unwrap().is_empty(), "query {query:?}");
+        let list = body.as_array().unwrap();
+        assert!(!list.is_empty(), "query {query:?} should list users");
+        assert!(list.len() <= 20, "query {query:?} respects the default limit");
+        assert!(!ids(&body).contains(&caller), "query {query:?} excludes the caller");
     }
 }
 
