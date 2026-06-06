@@ -243,6 +243,35 @@ pub async fn search_users(
         .map_err(|e| ApiError::Unexpected(e.to_string()))
 }
 
+/// `GET /api/users/by-username?username=` — resolve an exact (case-insensitive)
+/// username to a single user. `Ok(None)` when there's no such user (HTTP 404),
+/// which "add friend" reports as "no user named …". Unlike [`search_users`], this
+/// can't miss a real user past the search cap.
+pub async fn get_user_by_username(
+    base_url: &str,
+    token: &str,
+    username: &str,
+) -> Result<Option<UserSummary>, ApiError> {
+    let url = format!("{}/api/users/by-username", base_url.trim_end_matches('/'));
+    let resp = http_client()
+        .get(url)
+        .query(&[("username", username)])
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| ApiError::Network(e.to_string()))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        return Err(server_error(resp).await);
+    }
+    resp.json()
+        .await
+        .map(Some)
+        .map_err(|e| ApiError::Unexpected(e.to_string()))
+}
+
 /// `POST /api/dms/group` — create a group DM owned by the caller, with the given
 /// recipients and an optional name. The caller is always a participant, so
 /// `recipient_ids` lists only the others; the server bounds the total at 2–10.

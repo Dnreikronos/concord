@@ -1195,6 +1195,28 @@ pub async fn search_users_by_username(
     Ok(rows.into_iter().map(UserSummary::from).collect())
 }
 
+/// Look up a single user by exact (case-insensitive) username, excluding the
+/// caller. "Add friend" needs an exact resolution, not the substring search's
+/// ranked, capped list — an exact name can sort past the search cap and be
+/// missed, which would read as "no such user".
+pub async fn get_user_summary_by_username(
+    pool: &PgPool,
+    username: &str,
+    exclude: Uuid,
+) -> Result<Option<UserSummary>, AppError> {
+    let row = sqlx::query_as::<_, UserSummaryRow>(
+        "SELECT id, username, avatar_url \
+         FROM users \
+         WHERE id <> $1 AND lower(username) = lower($2)",
+    )
+    .bind(exclude)
+    .bind(username)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(UserSummary::from))
+}
+
 /// Escape the `LIKE`/`ILIKE` metacharacters (`\`, `%`, `_`) in a user-supplied
 /// search term so it is matched literally. The query uses `ESCAPE '\'`, so the
 /// backslash must be escaped first to avoid double-unescaping.

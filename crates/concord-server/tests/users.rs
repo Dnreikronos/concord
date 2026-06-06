@@ -1,4 +1,5 @@
-//! Integration tests for user search (`GET /api/users/search`, issue #36).
+//! Integration tests for user search (`GET /api/users/search`, issue #36) and
+//! the exact-username lookup (`GET /api/users/by-username`).
 //!
 //! Exercises the real router against Postgres. The integration suite shares one
 //! database across tests, so every case tags its seeded usernames with a unique
@@ -35,6 +36,10 @@ async fn seed_named(pool: &PgPool, username: &str) -> Uuid {
 
 fn search_uri(query: &str) -> String {
     format!("/api/users/search?q={query}")
+}
+
+fn by_username_uri(username: &str) -> String {
+    format!("/api/users/by-username?username={username}")
 }
 
 /// The usernames in a search response, in returned order.
@@ -177,4 +182,56 @@ async fn like_wildcards_are_matched_literally() {
     let (status, body) = send_json(&app, authed_get(&search_uri(&format!("{tag}a_b")), caller)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(ids(&body), HashSet::from([literal]));
+}
+
+#[tokio::test]
+async fn by_username_finds_exact_match_past_the_search_cap() {
+    let pool = setup_pool().await;
+    let app = app_with_pool(pool.clone());
+    let tag = tag();
+
+    // The exact target, plus a swarm of users that contain it as a substring and
+    // sort *before* it alphabetically — more than the default search cap, so the
+    // substring search would never surface the exact name. The exact lookup must
+    // still find it (and case-insensitively).
+    let target = seed_named(&pool, &format!("{tag}bob")).await;
+    for i in 0..22 {
+        seed_named(&pool, &format!("{tag}a{i:02}bob")).await;
+    }
+    let caller = seed_named(&pool, &format!("{tag}caller")).await;
+
+    let (status, body) =
+        send_json(&app, authed_get(&by_username_uri(&format!("{tag}BOB")), caller)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["id"].as_str().unwrap().parse::<Uuid>().unwrap(), target);
+}
+
+#[tokio::test]
+async fn by_username_is_404_without_an_exact_match() {
+    let pool = setup_pool().await;
+    let app = app_with_pool(pool.clone());
+    let tag = tag();
+
+    // Only a substring match exists; the exact name does not.
+    let _near = seed_named(&pool, &format!("{tag}alice123")).await;
+    let caller = seed_named(&pool, &format!("{tag}caller")).await;
+
+    let (status, _) =
+        send_json(&app, authed_get(&by_username_uri(&format!("{tag}alice")), caller)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn by_username_excludes_the_caller() {
+    let pool = setup_pool().await;
+    let app = app_with_pool(pool.clone());
+    let tag = tag();
+
+    // The only user with this exact name is the caller, so the lookup finds no
+    // one else and returns 404 rather than the caller themselves.
+    let me = seed_named(&pool, &format!("{tag}solo")).await;
+
+    let (status, _) =
+        send_json(&app, authed_get(&by_username_uri(&format!("{tag}solo")), me)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }

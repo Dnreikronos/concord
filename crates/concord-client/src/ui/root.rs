@@ -1149,8 +1149,9 @@ impl ConcordApp {
     }
 
     /// Resolve the typed username to a user and send them a friend request. The
-    /// search endpoint matches substrings, so an exact (case-folded) username
-    /// match is required before sending; the result lands beneath the box.
+    /// lookup is an exact (case-insensitive) match, so a typo or unknown name
+    /// resolves to nothing rather than the wrong person; the result lands beneath
+    /// the box.
     fn add_friend(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let query = self.add_friend_input.read(cx).value().trim().to_string();
         if query.is_empty() {
@@ -1168,9 +1169,7 @@ impl ConcordApp {
         let (tx, rx) = tokio::sync::oneshot::channel();
         api::runtime().spawn(async move {
             let result = async {
-                let users = api::search_users(&base, &token, &q, 20).await?;
-                let Some(user) = users.into_iter().find(|u| u.username.eq_ignore_ascii_case(&q))
-                else {
+                let Some(user) = api::get_user_by_username(&base, &token, &q).await? else {
                     return Ok::<Option<api::FriendRequestOutcome>, api::ApiError>(None);
                 };
                 let outcome = api::send_friend_request(&base, &token, user.id).await?;
